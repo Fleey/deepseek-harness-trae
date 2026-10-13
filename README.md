@@ -151,7 +151,7 @@ dsh plugin --profile desktop add ./dsh-trae2api-0.3.0.tgz
 TRAE_PAT=… TRAE_CONSOLE_EMAIL=… TRAE_CONSOLE_PASSWORD=… python3 -I tools/probe_quota.py
 ```
 
-（仓库根目录；把 IDE 两条路径在各个地址、两套请求头下的原始响应，以及控制台的两条接口全打出来。）
+（把 IDE 两条路径在各个地址、两套请求头下的原始响应，以及控制台的两条接口全打出来。）
 
 ## 已知限制
 
