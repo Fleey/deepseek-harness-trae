@@ -1,0 +1,7 @@
+# dsh-trae2api bundle layer: mount the Trae provider route.
+# The only setting a user needs is the PAT, filled from the Models page — no
+# config here. Advanced overrides (host, identity headers, timeouts) live on
+# the plugin's schema and can be set per profile by restating this row.
+- insert:
+    - id: trae2api
+      name: dsh-trae2api
