@@ -10,13 +10,20 @@
  * The card edits the host plugin's volatile config fields through the settings
  * service, writes the Trae PAT to the credential store (never into config),
  * and shows whether Trae accepts it and which models it serves — the same
- * models the composer's model picker offers.
+ * models the composer's model picker offers — plus the remaining quota.
+ *
+ * The remaining quota also shows as a small chip next to the composer's model
+ * picker (slot `conversation.input.right`) while a Trae model is selected.
  */
 window.__ModuleLoader__.load({
   id: 'dsh-trae2api',
   factory: (require) => {
     const React = require('react')
     const P = require('@deepseek-ai/dsh-client-ui-primitives')
+    // Optional: the collapsed status line goes up into the row's own header
+    // when portals are available, and stays in the card body when they are not.
+    let createPortal
+    try { createPortal = require('react-dom').createPortal } catch { createPortal = undefined }
     const h = React.createElement
 
     /** Settings namespace = the row id the bundle patch inserts. */
@@ -29,6 +36,15 @@ window.__ModuleLoader__.load({
     const PROVIDER = 'trae'
     const DEFAULT_TOKEN_REF = 'TRAE_PAT'
     const TOKEN_FIELD = 'pat'
+    /** Enterprise console login, only shown for a ToB seat (see src/trae/tob.ts). */
+    const DEFAULT_CONSOLE_PASSWORD_REF = 'TRAE_CONSOLE_PASSWORD'
+    const CONSOLE_PASSWORD_FIELD = 'consolePassword'
+    const EMAIL_FIELD = 'consoleEmail'
+    const DEFAULT_CONSOLE_EMAIL_REF = 'TRAE_CONSOLE_EMAIL'
+    /** Host route serving the remaining quota (see QUOTA_ROUTE in src/index.ts). */
+    const QUOTA_ROUTE = '/api/dsh-trae2api/quota'
+    /** How often a visible chip re-reads the quota. */
+    const QUOTA_POLL_MS = 5 * 60_000
 
     const zh = {
       title: 'Trae',
@@ -44,11 +60,42 @@ window.__ModuleLoader__.load({
       saveFailed: '保存失败，修改已保留，请检查后重试。',
       status: '连接状态',
       checking: '正在连接 Trae…',
-      ready: '已连接，{n} 个模型可用。在对话输入框右下角的模型菜单里选「Trae」分组下的模型，思考档位在同一菜单里切换。',
+      ready: '已连接，{n} 个模型可用。在输入框的模型菜单里选「Trae」分组，思考档位在同一菜单。',
       failed: '连接失败',
       empty: 'Trae 没有返回任何模型。',
       refresh: '重新检测',
-      models: '可用模型',
+      models: '可用模型（{n}）',
+      quota: '剩余额度',
+      quotaRefresh: '刷新',
+      quotaLoading: '正在查询额度…',
+      quotaRemaining: '剩余 {remaining} / {limit}（{percent}）',
+      quotaPackUsed: '已用 {used} / {limit}',
+      quotaUsed: '已用 {used}',
+      quotaUnlimited: '不限量',
+      quotaEnds: '{date} 到期',
+      quotaNone: '当前账号没有额度包。',
+      quotaEnterprise: '你是企业版账号，填一下控制台账号就能看到额度。',
+      quotaEnterpriseHint: '企业版的额度记在公司账户下（租户 {tenant}），Trae 给 IDE 的那个接口查不到，只有企业控制台知道。在下面填一次登录控制台用的邮箱和密码就好。',
+      console: '企业控制台账号',
+      consoleHint: '就是你登录 console.enterprise.trae.cn 用的那个账号。密码只存在 dsh 的凭据库里，不会写进配置文件。用 SSO 登录的公司暂时用不了这个。',
+      consoleEmail: '邮箱',
+      consolePassword: '密码',
+      consoleSet: '已保存',
+      consoleUnset: '未填写',
+      consoleSaveFailed: '没保存上：',
+      consoleSettled: '已连上控制台，额度正常读取中。要换账号就点右边的「修改」。',
+      consoleEdit: '修改',
+      credentialsEdit: '编辑',
+      cancel: '取消',
+      collapsedReady: '已连接 · {n} 个模型',
+      collapsedQuota: '剩余 {percent}',
+      consoleCollapse: '收起',
+      quotaModels: '按模型用量（{n}）',
+      quotaNoneHint: '查了 {source}，这个账号名下没有任何额度包。如果你在 Trae 官网能看到额度，说明接口对不上，欢迎把这行反馈回来。',
+      quotaUnknown: 'Trae 返回了无法识别的额度格式。原始响应如下，可用于反馈：',
+      quotaFailed: '额度查询失败：',
+      quotaChip: 'Trae 剩余 {percent}',
+      quotaChipHint: '点击刷新',
     }
     const en = {
       title: 'Trae',
@@ -64,25 +111,144 @@ window.__ModuleLoader__.load({
       saveFailed: 'Save failed; your edits were kept.',
       status: 'Connection',
       checking: 'Connecting to Trae…',
-      ready: 'Connected, {n} models available. Pick one under "Trae" in the composer model menu; the thinking level is in the same menu.',
+      ready: 'Connected, {n} models available. Pick one under "Trae" in the composer model menu; thinking level is in the same menu.',
       failed: 'Connection failed',
       empty: 'Trae returned no models.',
       refresh: 'Check again',
-      models: 'Models',
+      models: 'Models ({n})',
+      quota: 'Remaining quota',
+      quotaRefresh: 'Refresh',
+      quotaLoading: 'Checking quota…',
+      quotaRemaining: '{remaining} of {limit} left ({percent})',
+      quotaPackUsed: '{used} of {limit} used',
+      quotaUsed: '{used} used',
+      quotaUnlimited: 'Unlimited',
+      quotaEnds: 'ends {date}',
+      quotaNone: 'This account has no quota packs.',
+      quotaEnterprise: 'This is an enterprise account — add the console login below to see your quota.',
+      quotaEnterpriseHint: 'Your quota is metered on the company account (tenant {tenant}), which the IDE-facing API cannot see; only the enterprise console knows it. Just add the e-mail and password you sign in to the console with.',
+      console: 'Enterprise console account',
+      consoleHint: 'The account you sign in to console.enterprise.trae.cn with. The password is kept in dsh\'s credential store, never in a config file. SSO-only companies cannot use this yet.',
+      consoleEmail: 'E-mail',
+      consolePassword: 'Password',
+      consoleSet: 'Saved',
+      consoleUnset: 'Not set',
+      consoleSaveFailed: 'Not saved: ',
+      consoleSettled: 'Connected to the console; quota is reading fine. Use Change on the right to switch accounts.',
+      consoleEdit: 'Change',
+      credentialsEdit: 'Edit',
+      cancel: 'Cancel',
+      collapsedReady: 'Connected · {n} models',
+      collapsedQuota: '{percent} left',
+      consoleCollapse: 'Collapse',
+      quotaModels: 'Usage by model ({n})',
+      quotaNoneHint: 'Asked {source}: this account has no quota packs at all. If the Trae site does show quota for you, the plugin is asking the wrong place — worth reporting.',
+      quotaUnknown: 'Trae answered in a quota format this plugin does not recognise. The raw answer, for a bug report:',
+      quotaFailed: 'Quota check failed: ',
+      quotaChip: 'Trae {percent} left',
+      quotaChipHint: 'Click to refresh',
+    }
+
+    /** Minimal uSES-compatible snapshot store — the shape slot `hooks` bind to. */
+    function createStore(initial) {
+      let snapshot = initial
+      const listeners = new Set()
+      return {
+        getSnapshot: () => snapshot,
+        subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener) } },
+        set: (next) => { snapshot = next; for (const listener of [...listeners]) listener() },
+      }
+    }
+
+    /** Remaining quota, shared by the settings card and the composer chip. */
+    class QuotaController {
+      constructor() {
+        this.store = createStore({ phase: 'idle', value: null, error: '', at: 0 })
+        this.generation = 0
+      }
+
+      /**
+       * Read the quota from the host. Without `force` a read younger than a
+       * minute (or one in flight) is reused; `force` also skips the host's cache.
+       */
+      async load(force) {
+        const current = this.store.getSnapshot()
+        if (!force && (current.phase === 'loading' || Date.now() - current.at < 60_000)) return
+        const generation = ++this.generation
+        this.store.set({ ...current, phase: 'loading' })
+        let next
+        try {
+          // Page-relative, like the official clients' `api/...` routes, so a
+          // prefixed mount and the Desktop page both resolve it.
+          const response = await fetch(`${QUOTA_ROUTE.slice(1)}${force ? '?refresh=1' : ''}`, { headers: { accept: 'application/json' } })
+          if (!response.ok) throw new Error(`HTTP ${response.status}`)
+          const body = await response.json()
+          next = body && body.ok === true
+            ? { phase: 'ready', value: body.value, error: '', at: Date.now() }
+            : { phase: 'error', value: current.value, error: String(body?.error ?? 'unknown error'), at: Date.now() }
+        } catch (error) {
+          next = { phase: 'error', value: current.value, error: error instanceof Error ? error.message : String(error), at: Date.now() }
+        }
+        if (generation === this.generation) this.store.set(next)
+      }
+    }
+
+    function formatAmount(n, dollars) {
+      const text = new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(n)
+      return dollars ? `$${text}` : text
+    }
+
+    /** Remaining share of the limit in percent, or null when there is no finite limit. */
+    function remainingPercent(value) {
+      if (!value || value.limit === null || value.remaining === null || !(value.limit > 0)) return null
+      return Math.max(0, Math.min(100, (value.remaining / value.limit) * 100))
+    }
+
+    /** 17114388 -> "17.1M", so a model row stays one line. */
+    function formatTokens(n) {
+      if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`
+      if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`
+      if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`
+      return String(n)
+    }
+
+    function formatPercent(p) {
+      return `${p >= 10 ? Math.round(p) : Math.round(p * 10) / 10}%`
+    }
+
+    function formatDate(ms) {
+      return new Date(ms).toLocaleDateString()
+    }
+
+    /** "1,234 / 2,000 left (62%)" for a quota with a finite limit. */
+    function remainingLine(t, value) {
+      return t('quotaRemaining')
+        .replace('{remaining}', formatAmount(value.remaining, value.dollars))
+        .replace('{limit}', formatAmount(value.limit, value.dollars))
+        .replace('{percent}', formatPercent(remainingPercent(value) ?? 0))
     }
 
     /** Settings form + credential + connection status for one card. */
     class TraeCardController {
-      constructor(scope, ctx) {
+      constructor(scope, ctx, quota) {
         this.scope = scope
         this.ctx = ctx
+        this.quota = quota
         this.credential = { ref: '', configured: false, writable: true }
+        this.consoleCredential = { ref: '', configured: false, writable: true }
+        this.consoleEmailCredential = { ref: '', configured: false, writable: true }
+        /** Last credential-write failure, shown under the fields. */
+        this.credentialError = ''
         this.status = { phase: 'idle', models: [], message: '' }
         this.statusGeneration = 0
         this.form = new P.SettingsFormModel(
           scope,
           [],
-          [{ field: TOKEN_FIELD, write: text => this.writeToken(text) }],
+          [
+            { field: TOKEN_FIELD, write: text => this.writeToken(text) },
+            { field: EMAIL_FIELD, write: text => this.writeSecret('consoleEmailCredential', this.consoleEmailRef(), text) },
+            { field: CONSOLE_PASSWORD_FIELD, write: text => this.writeSecret('consoleCredential', this.consoleRef(), text) },
+          ],
         )
         this.store = this.form.bind(() => this.projection())
         this.unsubscribe = scope.subscribe(() => { void this.readCredential() })
@@ -95,6 +261,13 @@ window.__ModuleLoader__.load({
           token: this.form.field(TOKEN_FIELD),
           tokenConfigured: this.credential.configured,
           tokenWritable: this.credential.writable,
+          email: this.form.field(EMAIL_FIELD),
+          emailConfigured: this.consoleEmailCredential.configured,
+          emailWritable: this.consoleEmailCredential.writable,
+          consolePassword: this.form.field(CONSOLE_PASSWORD_FIELD),
+          consoleConfigured: this.consoleCredential.configured,
+          consoleWritable: this.consoleCredential.writable,
+          credentialError: this.credentialError,
           status: this.status,
         }
       }
@@ -104,32 +277,82 @@ window.__ModuleLoader__.load({
         return typeof declared === 'string' && declared.length > 0 ? declared : DEFAULT_TOKEN_REF
       }
 
+      consoleRef() {
+        const declared = this.scope.getSnapshot().value?.consolePasswordEnv
+        return typeof declared === 'string' && declared.length > 0 ? declared : DEFAULT_CONSOLE_PASSWORD_REF
+      }
+
+      consoleEmailRef() {
+        const declared = this.scope.getSnapshot().value?.consoleEmailEnv
+        return typeof declared === 'string' && declared.length > 0 ? declared : DEFAULT_CONSOLE_EMAIL_REF
+      }
+
+      /** The three credential slots this card owns: [state key, reference]. */
+      slots() {
+        return [
+          ['credential', this.tokenRef()],
+          ['consoleEmailCredential', this.consoleEmailRef()],
+          ['consoleCredential', this.consoleRef()],
+        ]
+      }
+
       async readCredential() {
-        const ref = this.tokenRef()
-        if (ref !== this.credential.ref) {
-          this.credential = { ref, configured: false, writable: true }
-          this.store.set(this.projection())
+        const slots = this.slots()
+        let changed = false
+        for (const [key, ref] of slots) {
+          if (ref === this[key].ref) continue
+          this[key] = { ref, configured: false, writable: true }
+          changed = true
         }
+        if (changed) this.store.set(this.projection())
         let response
-        try { response = await this.ctx.remote.credentials.describe([ref]) } catch { return }
-        if (!response.ok || ref !== this.tokenRef()) return
-        const view = response.value[ref]
-        const next = { ref, configured: view?.configured ?? false, writable: view?.writable ?? true }
-        if (next.configured === this.credential.configured && next.writable === this.credential.writable) return
-        this.credential = next
-        this.store.set(this.projection())
+        try { response = await this.ctx.remote.credentials.describe(slots.map(([, ref]) => ref)) } catch { return }
+        const current = this.slots()
+        if (!response.ok || current.some(([key, ref], i) => key !== slots[i][0] || ref !== slots[i][1])) return
+        changed = false
+        for (const [key, ref] of slots) {
+          const view = response.value[ref]
+          const next = { ref, configured: view?.configured ?? false, writable: view?.writable ?? true }
+          if (next.configured === this[key].configured && next.writable === this[key].writable) continue
+          this[key] = next
+          changed = true
+        }
+        if (changed) this.store.set(this.projection())
       }
 
       refreshCredential(ref) {
-        if (ref === this.credential.ref) void this.readCredential()
+        if (this.slots().some(([, name]) => name === ref)) void this.readCredential()
       }
 
       async writeToken(value) {
-        await this.ctx.remote.credentials.set(this.tokenRef(), value)
-        await this.readCredential()
+        const ok = await this.writeSecret('credential', this.tokenRef(), value)
         // The host drops its cached JWT when the PAT changes; check right away.
-        setTimeout(() => { void this.checkStatus() }, 300)
-        return this.credential.configured
+        if (ok) setTimeout(() => { void this.checkStatus() }, 300)
+        return ok
+      }
+
+      /**
+       * Write one credential and report whether it landed. The form only knows
+       * "saved" or "failed", so the reason is kept here and shown by the card —
+       * otherwise a rejected write reads as an unexplained failure.
+       */
+      async writeSecret(key, ref, value) {
+        try {
+          const response = await this.ctx.remote.credentials.set(ref, value)
+          if (response && response.ok === false) {
+            this.credentialError = `${ref}: ${response.error?.message ?? String(response.error)}`
+            this.store.set(this.projection())
+            return false
+          }
+        } catch (error) {
+          this.credentialError = `${ref}: ${error instanceof Error ? error.message : String(error)}`
+          this.store.set(this.projection())
+          return false
+        }
+        this.credentialError = ''
+        await this.readCredential()
+        setTimeout(() => { void this.quota.load(true) }, 300)
+        return this[key].configured
       }
 
       /** Ask the host's model catalog — the same source as the composer picker. */
@@ -161,13 +384,14 @@ window.__ModuleLoader__.load({
       inject() {
         const actions = this.form.actions()
         return {
-          hooks: { traeCard: this.store },
+          hooks: { traeCard: this.store, traeQuota: this.quota.store },
           ...actions,
           save: () => {
             actions.save()
             setTimeout(() => { void this.checkStatus() }, 800)
           },
           checkStatus: () => { void this.checkStatus() },
+          refreshQuota: (force) => { void this.quota.load(force) },
         }
       }
 
@@ -203,84 +427,519 @@ window.__ModuleLoader__.load({
             },
           }, status.message)
           : null,
+        // 24 names is a wall of text in a settings card: keep it one line,
+        // openable when someone actually wants to read it.
         status.phase === 'ready' && status.models.length > 0
-          ? h('div', { style: muted }, `${t('models')}：${status.models.join('、')}`)
+          ? h('details', { style: muted },
+            h('summary', { style: { cursor: 'pointer' } }, t('models').replace('{n}', String(status.models.length))),
+            h('div', { style: { marginTop: 4 } }, status.models.join('、')),
+          )
           : null,
+      )
+    }
+
+    /**
+     * How much of an allowance is spent, as a colour: comfortable, getting
+     * tight, nearly gone. The bands are on the spent share, so a bar that
+     * grows to the right also warms up as it goes.
+     */
+    const TONE_COLOR = {
+      ok: 'var(--dsw-alias-state-success-primary)',
+      warn: 'var(--dsw-alias-state-warn-primary)',
+      low: 'var(--dsw-alias-state-error-primary)',
+    }
+
+    function meterTone(spent) {
+      if (spent >= 85) return 'low'
+      if (spent >= 60) return 'warn'
+      return 'ok'
+    }
+
+    /**
+     * One allowance: its name, what is left of it, and a bar that fills from
+     * the left with what has been spent.
+     */
+    function QuotaMeter(props) {
+      const { t, pack, dollars } = props
+      const muted = { color: 'var(--dsw-alias-label-secondary)', fontSize: 'var(--dsw-font-xs-13, 13px)' }
+      const unlimited = pack.limit === null
+      const spent = unlimited || !(pack.limit > 0) ? 0 : Math.max(0, Math.min(100, (pack.used / pack.limit) * 100))
+      const tone = meterTone(spent)
+      return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
+        h('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8, fontSize: 'var(--dsw-font-xs-13, 13px)' } },
+          h('span', { style: { color: 'var(--dsw-alias-label-primary)', flex: 1, minWidth: 0 } }, pack.name),
+          h('span', {
+            style: {
+              ...muted, fontVariantNumeric: 'tabular-nums',
+              // The figure picks up the bar's colour once it starts to matter.
+              ...tone === 'ok' || unlimited ? {} : { color: TONE_COLOR[tone] },
+            },
+          }, unlimited ? t('quotaUnlimited')
+            : t('quotaPackUsed')
+              .replace('{used}', formatAmount(pack.used, dollars))
+              .replace('{limit}', formatAmount(pack.limit, dollars))),
+        ),
+        unlimited ? null : h('div', {
+          style: {
+            height: 6, borderRadius: 999, overflow: 'hidden',
+            background: 'var(--dsw-alias-bg-layer-2)',
+          },
+        }, h('div', {
+          style: {
+            width: `${spent}%`, height: '100%', borderRadius: 999,
+            transition: 'width 240ms ease, background-color 240ms ease',
+            background: TONE_COLOR[tone],
+          },
+        })),
+        pack.endsAt === undefined ? null
+          : h('div', { style: muted }, t('quotaEnds').replace('{date}', formatDate(pack.endsAt))),
+      )
+    }
+
+    function QuotaBlock(props) {
+      const { t, quota } = props
+      React.useEffect(() => { props.refresh(false) }, [])
+      const value = quota.value
+      const muted = { color: 'var(--dsw-alias-label-secondary)', fontSize: 'var(--dsw-font-xs-13, 13px)' }
+      const pre = text => h('pre', {
+        style: {
+          ...muted, margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: 180, overflow: 'auto',
+          padding: 8, borderRadius: 'var(--dsw-radius-sm, 6px)', background: 'var(--dsw-alias-bg-layer-1)',
+        },
+      }, text)
+      // Prose, not a code block: the mono `pre` is for raw upstream answers.
+      const note = text => h('p', { style: { ...muted, margin: 0, lineHeight: 1.5 } }, text)
+      const percent = remainingPercent(value)
+
+      let state, line, extra = []
+      if (quota.phase === 'error') {
+        state = 'error'; line = t('quotaFailed'); extra = [pre(quota.error)]
+      } else if (!value) {
+        state = 'ongoing'; line = t('quotaLoading')
+      } else if (value.raw !== undefined) {
+        state = 'warning'; line = t('quotaUnknown'); extra = [pre(value.raw)]
+      } else if (value.packs.length === 0 && value.seat === 'enterprise') {
+        // A ToB seat's quota sits on the enterprise tenant, which this personal
+        // entitlement API never carries: saying "no quota packs" would be wrong.
+        state = 'warning'; line = t('quotaEnterprise')
+        extra = [note(t('quotaEnterpriseHint').replace('{tenant}', value.tenant || '—'))]
+      } else if (value.packs.length === 0) {
+        // Name the endpoint: an account that really has nothing reads the same
+        // as one whose quota lives somewhere this plugin does not ask.
+        state = 'warning'; line = t('quotaNone')
+        if (value.source) extra = [note(t('quotaNoneHint').replace('{source}', value.source))]
+      } else {
+        state = percent !== null && percent < 10 ? 'warning' : 'done'
+        line = value.limit === null ? t('quotaUnlimited') : remainingLine(t, value)
+        if (value.endsAt !== undefined) {
+          extra.push(h('div', { key: 'ends', style: muted }, t('quotaEnds').replace('{date}', formatDate(value.endsAt))))
+        }
+        // One meter per pack, each filling left to right with what is spent —
+        // a seat allowance and a pay-as-you-go allowance run down separately,
+        // and a single combined bar hides which one is nearly gone.
+        extra.push(h('div', {
+          key: 'meters',
+          style: { display: 'flex', flexDirection: 'column', gap: 10, marginTop: 2 },
+        }, value.packs.map(pack => h(QuotaMeter, { key: pack.name, t, pack, dollars: value.dollars }))))
+        // Only the enterprise console reports per-model figures; fold them away.
+        if (value.models && value.models.length > 0) {
+          extra.push(h('details', { key: 'models', style: { ...muted, marginTop: 2 } },
+            h('summary', { style: { cursor: 'pointer' } }, t('quotaModels').replace('{n}', String(value.models.length))),
+            h('div', { style: { marginTop: 6, display: 'flex', flexDirection: 'column', gap: 4 } },
+              value.models.map(model => h('div', {
+                key: model.name,
+                style: { display: 'flex', alignItems: 'baseline', gap: 8 },
+              },
+              h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, model.name),
+              h('span', { style: { fontVariantNumeric: 'tabular-nums' } }, `${formatTokens(model.tokens)} tokens`),
+              h('span', { style: { fontVariantNumeric: 'tabular-nums', minWidth: 64, textAlign: 'right' } }, formatAmount(model.cost, value.dollars)),
+              )),
+            ),
+          ))
+        }
+      }
+
+      return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10, marginTop: 16 } },
+        h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, fontWeight: 600 } },
+          t('quota'),
+          h('span', { style: { flex: 1 } }),
+          h(P.Button, { variant: 'ghost', size: 'sm', type: 'button', disabled: quota.phase === 'loading', onClick: () => props.refresh(true) }, t('quotaRefresh')),
+        ),
+        h('div', { style: { display: 'flex', alignItems: 'flex-start', gap: 8 } },
+          h('span', { style: { paddingTop: 5 } }, h(P.StateDot, { state })),
+          h('span', {
+            style: { color: 'var(--dsw-alias-label-primary)', fontVariantNumeric: 'tabular-nums' },
+          }, line),
+        ),
+        ...extra,
+      )
+    }
+
+    /**
+     * Composer chip beside the model picker: "Trae 62% left" while the
+     * session's model is a Trae one and the quota has a finite limit; nothing
+     * otherwise (no error noise in the composer — the card shows those).
+     * Clicking re-reads the quota past every cache.
+     */
+    function QuotaChip(props) {
+      const { t } = props
+      const provider = props.useTraeModel(snapshot => snapshot?.current?.provider)
+      const quota = props.useTraeQuota(snapshot => snapshot)
+      const active = provider === PROVIDER
+      React.useEffect(() => {
+        if (!active) return undefined
+        props.refresh(false)
+        const timer = setInterval(() => { props.refresh(false) }, QUOTA_POLL_MS)
+        return () => { clearInterval(timer) }
+      }, [active])
+      const value = quota.value
+      const percent = remainingPercent(value)
+      if (!active || quota.phase === 'error' || !value || value.raw !== undefined || percent === null) return null
+      const details = [remainingLine(t, value), t('quotaUsed').replace('{used}', formatAmount(value.used, value.dollars))]
+      if (value.endsAt !== undefined) details.push(t('quotaEnds').replace('{date}', formatDate(value.endsAt)))
+      details.push(t('quotaChipHint'))
+      // Same bands as the card's meters, read off what is left rather than spent;
+      // a comfortable chip stays quiet grey instead of shouting green.
+      const tone = meterTone(100 - percent)
+      const color = tone === 'ok' ? 'var(--dsw-alias-label-secondary)' : TONE_COLOR[tone]
+      return h(P.Tooltip, { label: h('div', { style: { whiteSpace: 'pre-line' } }, details.join('\n')), side: 'top' },
+        h('button', {
+          type: 'button',
+          onClick: () => { props.refresh(true) },
+          style: {
+            border: 'none', background: 'transparent', cursor: 'pointer', padding: '2px 6px', borderRadius: 6,
+            color, fontSize: 12, lineHeight: '20px', whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums',
+            opacity: quota.phase === 'loading' ? 0.6 : 1,
+          },
+        }, t('quotaChip').replace('{percent}', formatPercent(percent))),
+      )
+    }
+
+    /**
+     * The enterprise console login. Once it is saved and the quota is actually
+     * coming back, this is settled business: it folds away to one line, and
+     * opens again on demand (or on its own when something is missing or a
+     * write failed).
+     */
+    function ConsoleAccount(props) {
+      const { t, state } = props
+      const settled = props.working && state.emailConfigured && state.consoleConfigured && !state.credentialError
+      const [open, setOpen] = React.useState(!settled)
+      // Collapse the moment it starts working; reopen if it stops.
+      React.useEffect(() => { setOpen(!settled) }, [settled])
+      const muted = { color: 'var(--dsw-alias-label-secondary)', fontSize: 'var(--dsw-font-xs-13, 13px)' }
+      return h('div', { style: { display: 'flex', flexDirection: 'column', gap: open ? 12 : 4, marginTop: 4 } },
+        h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+          h('span', { style: { fontWeight: 600 } }, t('console')),
+          settled ? h(P.Tag, { tone: 'neutral' }, t('consoleSet')) : null,
+          h('span', { style: { flex: 1 } }),
+          settled
+            ? h(P.Button, {
+              variant: 'ghost', size: 'sm', type: 'button',
+              onClick: () => { setOpen(!open) },
+            }, open ? t('consoleCollapse') : t('consoleEdit'))
+            : null,
+        ),
+        !open
+          ? h('p', { style: { ...muted, margin: 0 } }, t('consoleSettled'))
+          : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 12 } },
+            h(P.SettingsValueField, {
+              id: 'dsh-trae2api-console-email',
+              label: t('consoleEmail'),
+              hint: t('consoleHint'),
+              // Write-only like the password, so it reads back blank: say so in
+              // the placeholder instead of looking like it was not saved.
+              placeholder: state.emailConfigured ? t('consoleSet') : 'you@example.com',
+              disabled: !state.emailWritable,
+              text: state.email.text,
+              onEdit: (text) => { props.edit(EMAIL_FIELD, text) },
+            }),
+            h(P.SettingsSecretField, {
+              id: 'dsh-trae2api-console-password',
+              label: t('consolePassword'),
+              disabled: !state.consoleWritable,
+              text: state.consolePassword.text,
+              configured: state.consoleConfigured,
+              stateLabel: state.consoleConfigured ? t('consoleSet') : t('consoleUnset'),
+              onEdit: (text) => { props.edit(CONSOLE_PASSWORD_FIELD, text) },
+            }),
+            state.credentialError
+              ? h('p', {
+                style: {
+                  margin: 0, fontSize: 'var(--dsw-font-xs-13, 13px)', whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word', color: 'var(--dsw-alias-state-error-primary)',
+                },
+              }, `${t('consoleSaveFailed')}${state.credentialError}`)
+              : null,
+          ),
       )
     }
 
     function TraeCard(props) {
       const { t } = props
       const state = props.useTraeCard(snapshot => snapshot)
+      const quota = props.useTraeQuota(snapshot => snapshot)
+      // Credentials are set-and-forget: once they are in, the card folds down to
+      // one status line. The row's own "edit" button opens it (props.editorOpen);
+      // the line's own button overrides that either way, for the case where the
+      // page's structure moved and that signal never arrives.
+      const [override, setOverride] = React.useState(undefined)
+      const lastEditorOpen = React.useRef(props.editorOpen)
+      React.useEffect(() => {
+        if (lastEditorOpen.current === props.editorOpen) return
+        lastEditorOpen.current = props.editorOpen
+        setOverride(undefined)
+      }, [props.editorOpen])
+      // An enterprise seat is not set up until its console account is in, so it
+      // stays open until then — folding away the fields it still needs would
+      // hide the only thing left to do.
+      const needsConsole = quota.value?.seat === 'enterprise'
+        && !(state.emailConfigured && state.consoleConfigured)
+      const settled = state.tokenConfigured && !state.credentialError && !needsConsole
+      const open = !settled || (override ?? props.editorOpen === true)
+      // Folded, neither the status block nor the quota block is mounted to ask
+      // for its own data, and the one line shows both: ask here.
+      React.useEffect(() => {
+        if (state.status.phase === 'idle') props.checkStatus()
+        props.refreshQuota(false)
+      }, [])
+      const headerSlot = useRowHeaderSlot(props.hostRef, !open && props.view !== 'summary')
       if (props.view === 'summary') return t('description')
-      return h('div', null,
-        h(P.SettingsForm, {
-          labels: { unavailable: t('unavailable'), readOnly: t('readOnly'), saveFailed: t('saveFailed'), save: t('save'), saving: t('saving') },
-          state,
-          onSave: props.save,
-          onDiscard: props.discard,
+      // Folded away, the whole card is one line: is it working, and how much is
+      // left. The line itself opens the editor, the way the row's own "edit"
+      // button does — one affordance, not two.
+      if (!open) {
+        const percent = remainingPercent(quota.value)
+        const parts = []
+        if (state.status.phase === 'ready') parts.push(t('collapsedReady').replace('{n}', String(state.status.models.length)))
+        else if (state.status.phase === 'error' || state.status.phase === 'empty') parts.push(t('failed'))
+        else parts.push(t('checking'))
+        if (percent !== null) parts.push(t('collapsedQuota').replace('{percent}', formatPercent(percent)))
+        else if (quota.value?.limit === null && (quota.value?.packs.length ?? 0) > 0) parts.push(t('quotaUnlimited'))
+        const dotState = state.status.phase === 'ready' ? (percent !== null && percent < 15 ? 'warning' : 'done')
+          : state.status.phase === 'checking' || state.status.phase === 'idle' ? 'ongoing' : 'error'
+        const line = h('div', {
+          role: 'button',
+          tabIndex: 0,
+          'aria-expanded': false,
+          title: t('credentialsEdit'),
+          onClick: () => { setOverride(true) },
+          onKeyDown: (event) => {
+            if (event.key !== 'Enter' && event.key !== ' ') return
+            event.preventDefault()
+            setOverride(true)
+          },
+          style: {
+            display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer',
+            fontSize: 'var(--dsw-font-xs-13, 13px)', color: 'var(--dsw-alias-label-secondary)',
+            ...headerSlot ? {} : { marginTop: 4 },
+          },
         },
-        h(P.SettingsSecretField, {
-          id: 'dsh-trae2api-token',
-          label: t('token'),
-          hint: t('tokenHint'),
-          disabled: !state.tokenWritable,
-          text: state.token.text,
-          configured: state.tokenConfigured,
-          stateLabel: state.tokenConfigured ? t('tokenSet') : t('tokenUnset'),
-          onEdit: (text) => { props.edit(TOKEN_FIELD, text) },
-        }),
+        h(P.StateDot, { state: dotState }),
+        h('span', { style: { fontVariantNumeric: 'tabular-nums' } }, parts.join(' · ')),
+        )
+        // On the row's own header line when the page lets us, in the card body
+        // otherwise.
+        return headerSlot ? createPortal(line, headerSlot) : line
+      }
+      // Open: one inset panel in the shape of the page's own provider editor —
+      // title, fields, then cancel/save at the bottom right. SettingsForm is not
+      // used here because its footer sits on the left, out of step with the rest
+      // of the page; the save it would run is this card's own `props.save`.
+      const blocked = !state.dirty || state.invalid || state.saving
+      return h('div', {
+        style: {
+          display: 'flex', flexDirection: 'column', gap: 16, marginTop: 8,
+          padding: 16, borderRadius: 'var(--dsw-radius-md, 10px)',
+          background: 'var(--dsw-alias-bg-layer-1)',
+        },
+      },
+      h('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8 } },
+        h('span', { style: { fontWeight: 600 } }, t('title')),
+        h('span', {
+          style: { color: 'var(--dsw-alias-label-secondary)', fontSize: 'var(--dsw-font-xs-13, 13px)' },
+        }, PROVIDER),
+      ),
+      !state.available
+        ? h('p', { style: { margin: 0, color: 'var(--dsw-alias-label-secondary)' } }, t('unavailable'))
+        : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 } },
+          !state.writable
+            ? h('p', {
+              style: { margin: 0, color: 'var(--dsw-alias-label-secondary)', fontSize: 'var(--dsw-font-xs-13, 13px)' },
+            }, t('readOnly'))
+            : null,
+          h(P.SettingsSecretField, {
+            id: 'dsh-trae2api-token',
+            label: t('token'),
+            hint: t('tokenHint'),
+            disabled: !state.tokenWritable,
+            text: state.token.text,
+            configured: state.tokenConfigured,
+            stateLabel: state.tokenConfigured ? t('tokenSet') : t('tokenUnset'),
+            onEdit: (text) => { props.edit(TOKEN_FIELD, text) },
+          }),
+          // Only a ToB seat needs these: a consumer account's quota comes off
+          // the IDE API, and the console login would be meaningless for it.
+          quota.value?.seat === 'enterprise'
+            ? h(ConsoleAccount, { t, state, edit: props.edit, working: (quota.value?.packs.length ?? 0) > 0 })
+            : null,
+          h(StatusBlock, { t, status: state.status, checkStatus: props.checkStatus }),
+          h(QuotaBlock, { t, quota, refresh: props.refreshQuota }),
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'flex-end' } },
+            state.failed
+              ? h('p', {
+                style: { margin: 0, flex: 1, color: 'var(--dsw-alias-state-error-primary)', fontSize: 'var(--dsw-font-xs-13, 13px)' },
+              }, t('saveFailed'))
+              : null,
+            h(P.Button, {
+              variant: 'outline',
+              size: 'md',
+              type: 'button',
+              onClick: () => { props.discard(); if (settled) setOverride(false) },
+            }, t('cancel')),
+            h(P.Button, {
+              variant: 'primary',
+              size: 'md',
+              type: 'button',
+              disabled: blocked,
+              onClick: () => { props.save() },
+            }, state.saving ? t('saving') : t('save')),
+          ),
         ),
-        h(StatusBlock, { t, status: state.status, checkStatus: props.checkStatus }),
       )
     }
 
     /**
-     * The Models page renders its generic editor above this slot; for a
-     * namespace it does not know, that editor shows only a "edit cordis.patch.yml"
-     * hint and a disabled Save, which reads as a broken second form. Hide that
-     * hint and its footer (keeping the card's title). Guarded: if the page's
-     * structure ever differs, nothing is touched.
+     * The Models page renders its generic editor beside this slot while the
+     * row's own "edit" button is on; for a namespace it does not know, that
+     * editor is nothing but a title, a "edit cordis.patch.yml" hint and a
+     * disabled Save — a broken-looking second form next to this card's real
+     * one. Hide the whole thing, and report whether it was there at all: that
+     * is the only signal this slot gets for "the row is being edited", since
+     * the page passes it no such prop.
+     *
+     * Guarded: if the page's structure ever differs, nothing is touched and the
+     * card falls back to its own disclosure.
      */
-    function useHideGenericEditorChrome(ref) {
+    function useGenericEditorChrome(ref) {
+      const [open, setOpen] = React.useState(false)
       React.useLayoutEffect(() => {
         const hidden = []
         let node = ref.current
-        for (let depth = 0; node && depth < 6; depth++, node = node.parentElement) {
-          const editor = node.previousElementSibling
-          if (!editor) continue
-          const hint = Array.from(editor.querySelectorAll('p'))
-            .find(p => (p.textContent || '').trim().endsWith(`(${SETTINGS_NS})`))
-          if (!hint) continue
-          for (let el = hint; el; el = el.nextElementSibling) {
-            hidden.push([el, el.style.display])
-            el.style.display = 'none'
+        for (let depth = 0; node && hidden.length === 0 && depth < 6; depth++, node = node.parentElement) {
+          // The editor sits before this slot on the setup card and after it on
+          // a normal row, so look both ways.
+          for (const editor of [node.previousElementSibling, node.nextElementSibling]) {
+            if (!editor || editor.contains(ref.current)) continue
+            const ours = Array.from(editor.querySelectorAll('p'))
+              .some(p => (p.textContent || '').trim().endsWith(`(${SETTINGS_NS})`))
+            if (!ours) continue
+            hidden.push([editor, editor.style.display])
+            editor.style.display = 'none'
           }
-          break
         }
+        // Same value is a no-op in React, so this cannot loop.
+        setOpen(hidden.length > 0)
         return () => { for (const [el, display] of hidden) el.style.display = display }
       })
+      return open
+    }
+
+    /**
+     * The row's own header — the strip with the provider name and its buttons —
+     * so the collapsed status line can sit on that line instead of starting a
+     * second one. Recognised structurally (the row's first child, which holds
+     * buttons and does not contain this card), so a page that looks different
+     * simply yields nothing.
+     */
+    function findRowHeader(el) {
+      for (let node = el, depth = 0; node && depth < 6; depth++, node = node.parentElement) {
+        const head = node.parentElement?.firstElementChild
+        if (!head || head === node || head.contains(el)) continue
+        if (!head.querySelector('button')) continue
+        return head
+      }
+      return undefined
+    }
+
+    /**
+     * A span parked in the row header to portal into, while `enabled`.
+     *
+     * Checked on every render rather than once: on the first mount this effect
+     * runs before the owner's ref is attached (a child's layout effect is
+     * processed before its parent's ref), so the header is not reachable yet,
+     * and the page may also re-render the row out from under the span.
+     */
+    function useRowHeaderSlot(ref, enabled) {
+      const [slot, setSlot] = React.useState(null)
+      const parked = React.useRef(null)
+      const detach = () => {
+        if (!parked.current) return
+        parked.current.remove()
+        parked.current = null
+        setSlot(null)
+      }
+      React.useLayoutEffect(() => {
+        if (!enabled || !createPortal) { detach(); return }
+        if (parked.current?.isConnected) return
+        const header = ref?.current ? findRowHeader(ref.current) : undefined
+        if (!header) return
+        const host = document.createElement('span')
+        host.style.cssText = 'display:flex;align-items:center;gap:8px;margin-right:auto'
+        // After the name, before the row's buttons.
+        header.insertBefore(host, header.firstElementChild?.nextElementSibling ?? null)
+        parked.current = host
+        setSlot(host)
+      })
+      React.useEffect(() => () => { detach() }, [])
+      return slot
     }
 
     /** The Models page passes provider-card owner props instead of a view; always render the full card. */
     function ProviderCardExtras(props) {
       const ref = React.useRef(null)
-      useHideGenericEditorChrome(ref)
-      return h('div', { ref }, h(TraeCard, { ...props, view: 'page' }))
+      const editorOpen = useGenericEditorChrome(ref)
+      // `display: contents` so this wrapper generates no box of its own: folded
+      // away, the card renders nothing in place (its one line lives in the row
+      // header), and an empty flex item would still take the row's gap and
+      // leave this row taller than the others.
+      return h('div', { ref, style: { display: 'contents' } },
+        h(TraeCard, { ...props, view: 'page', editorOpen, hostRef: ref }))
     }
 
     return {
       inject: ['slots', 'locale', 'remote', 'remote.credentials', 'remote.session', 'configForms'],
       apply(ctx) {
         ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'dsh-trae2api: dictionaries')
-        const card = new TraeCardController(ctx.configForms.get(SETTINGS_NS), ctx)
+        const quota = new QuotaController()
+        const card = new TraeCardController(ctx.configForms.get(SETTINGS_NS), ctx, quota)
         ctx.effect(() => () => { card.dispose() }, 'dsh-trae2api: form')
+        // The chip needs each session's model selection; without the model
+        // picker's service there is nothing to sit beside, so no chip.
+        const noModel = createStore({ current: null })
+        ctx.inject(['slots', 'modelDirectories'], (scope) => {
+          scope.slots.inject('conversation.input.right', () => scope.slots.register({
+            name: 'conversation.input.right',
+            locale: NS,
+            inject: (sessionId) => {
+              let directory = noModel
+              try { directory = scope.modelDirectories.directoryFor(sessionId).store } catch { /* no binding yet */ }
+              return {
+                hooks: { traeModel: directory, traeQuota: quota.store },
+                refresh: (force) => { void quota.load(force) },
+              }
+            },
+          }, QuotaChip))
+        })
         ctx.effect(
           () => ctx.remote.$on('credentials/reference-updated', (ref) => { card.refreshCredential(ref) }),
           'dsh-trae2api: credential updates',
         )
         ctx.effect(
-          () => ctx.remote.$on('llm/adapters-updated', () => { void card.checkStatus() }),
+          () => ctx.remote.$on('llm/adapters-updated', () => {
+            void card.checkStatus()
+            if (quota.store.getSnapshot().phase !== 'idle') void quota.load(true)
+          }),
           'dsh-trae2api: provider updates',
         )
         ctx.effect(() => ctx.configForms.whileServed([SETTINGS_NS], () => {

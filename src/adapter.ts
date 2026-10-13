@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto'
 import {
   LlmAdapter,
   LlmError,
+  type ContentBlock,
   type FinishReason,
   type GenerateOptions,
   type LlmModelInfo,
@@ -29,7 +30,9 @@ import {
   toTraeTools,
   traeEvents,
   upstreamMessage,
+  wireContent,
   type TraeEvent,
+  type TraeImages,
 } from './trae/wire.ts'
 
 export const CHAT_PATH = '/api/ide/v2/llm_raw_chat'
@@ -55,10 +58,68 @@ export interface AdapterOptions {
   emptyRetries: number
   /** Repetition guard span in characters; 0 disables. */
   loopGuardChars: number
+  /**
+   * Mounted harness attachment store, resolved per request; absent (or a
+   * provider that cannot project images) degrades images to their
+   * `[image omitted]` note instead of failing the turn.
+   */
+  resolveAttachments?: () => AttachmentStoreLike | undefined
   logger: { info(...a: unknown[]): void; warn(...a: unknown[]): void }
 }
 
+/**
+ * The slice of `@deepseek-ai/dsh-attachment`'s AttachmentStore used here:
+ * `readImageRequest(ref, target)` returns deterministic request bytes for one
+ * durable normalized image reference (the same seam dsh-llm-deepseek uses).
+ * `ImageBlock` is imported structurally so the plugin keeps only dsh-llm as a
+ * declared dependency.
+ */
+export interface AttachmentStoreLike {
+  readImageRequest(
+    ref: ImageBlock['attachment'],
+    target: { width: number; height: number; maxBytes: number },
+    signal?: AbortSignal,
+  ): Promise<{ data: Uint8Array; mediaType: string; bytes: number; width: number; height: number }>
+}
+
 const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms))
+
+type ImageBlock = Extract<ContentBlock, { type: 'image' }>
+
+/** Every image occurrence in the request, in message order (deduplicated by caller). */
+function* imageRefs(options: GenerateOptions): Generator<ImageBlock['attachment']> {
+  for (const message of options.messages) {
+    const content = (message as { content?: readonly ContentBlock[] }).content ?? []
+    for (const block of content) if (block.type === 'image') yield (block as ImageBlock).attachment
+  }
+}
+
+/**
+ * Byte budget per request image. Trae's endpoint is the OpenAI-style wire, and
+ * the enterprise gateway has shown no published grid, so images are sent at
+ * their normalized size up to 1024px per side (README's tested 64×64 PNG passes
+ * untouched; huge screenshots get scaled by the attachment provider's ladder
+ * rather than refused by upstream).
+ */
+const REQUEST_IMAGE_LONG_EDGE = 1024
+const REQUEST_IMAGE_MAX_BYTES = 2 * 1024 * 1024
+
+/** The identity headers every Trae API call carries (chat and quota alike). */
+export function traeHeaders(id: TraeIdentity, token: string, accept: string): Record<string, string> {
+  return {
+    'content-type': 'application/json',
+    accept,
+    originator: id.originator,
+    'user-agent': id.userAgent,
+    'x-request-id': randomUUID(),
+    authorization: `Cloud-IDE-JWT ${token}`,
+    'x-app-id': id.appId,
+    'x-ide-function': id.ideFunction,
+    'x-ide-version': id.ideVersion,
+    'x-ide-version-code': id.ideVersionCode,
+    version: id.clientVersion,
+  }
+}
 
 function effortFor(route: TraeRoute, requested: string | undefined): TraeEffort | undefined {
   if (!requested || route.efforts.length === 0) return undefined
@@ -108,7 +169,7 @@ export class TraeAdapter extends LlmAdapter {
     return TRAE_ROUTES.map(r => ({
       provider, id: r.id, name: r.id,
       description: r.maxMode ? '1M 上下文（Max）' : `${Math.round(r.contextWindow / 1000)}K 上下文`,
-      inputModalities: ['text'] as const,
+      inputModalities: (r.multimodal ? ['text', 'image'] : ['text']) as readonly ('text' | 'image')[],
     }))
   }
 
@@ -118,7 +179,7 @@ export class TraeAdapter extends LlmAdapter {
       provider,
       id: model,
       name: known?.id ?? model,
-      inputModalities: ['text'],
+      inputModalities: (known?.multimodal ? ['text', 'image'] : ['text']) as readonly ('text' | 'image')[],
       // Hard-coded per model from the IDE capability table, so the loop plans
       // compaction against the window the backend actually enforces.
       context: { contextWindow: known?.contextWindow ?? 200_000 },
@@ -133,20 +194,7 @@ export class TraeAdapter extends LlmAdapter {
   }
 
   private headers(token: string): Record<string, string> {
-    const id = this.opts.identity
-    return {
-      'content-type': 'application/json',
-      accept: 'text/event-stream',
-      originator: id.originator,
-      'user-agent': id.userAgent,
-      'x-request-id': randomUUID(),
-      authorization: `Cloud-IDE-JWT ${token}`,
-      'x-app-id': id.appId,
-      'x-ide-function': id.ideFunction,
-      'x-ide-version': id.ideVersion,
-      'x-ide-version-code': id.ideVersionCode,
-      version: id.clientVersion,
-    }
+    return traeHeaders(this.opts.identity, token, 'text/event-stream')
   }
 
   /** One POST; yields decoded events. Retries once with a fresh JWT on 401/403. */
@@ -176,6 +224,30 @@ export class TraeAdapter extends LlmAdapter {
     }
   }
 
+  /**
+   * Resolve request bytes for every image occurrence on a multimodal route.
+   * Failure to read one image degrades that image to its `[image omitted]`
+   * note rather than failing the whole turn: a screenshot the model cannot
+   * see is still more useful than a refused request.
+   */
+  private async prepareImages(options: GenerateOptions, signal?: AbortSignal): Promise<TraeImages> {
+    const attachments = this.opts.resolveAttachments?.()
+    const map = new Map<string, string>()
+    if (!attachments) return map
+    for (const ref of imageRefs(options)) {
+      if (map.has(ref.attachmentId)) continue
+      try {
+        const target = { width: REQUEST_IMAGE_LONG_EDGE, height: REQUEST_IMAGE_LONG_EDGE, maxBytes: REQUEST_IMAGE_MAX_BYTES }
+        const version = await attachments.readImageRequest(ref, target, signal)
+        map.set(ref.attachmentId, `data:${version.mediaType};base64,${Buffer.from(version.data).toString('base64')}`)
+      } catch (error) {
+        if (signal?.aborted) throw error
+        this.opts.logger.warn(`dsh-trae2api: 读取图片失败，本轮该图以占位文本发送（${error instanceof Error ? error.message : String(error)}）`)
+      }
+    }
+    return map
+  }
+
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     const route = findModel(options.model)
     if (!route) {
@@ -183,11 +255,20 @@ export class TraeAdapter extends LlmAdapter {
     }
     const effort = effortFor(route, options.reasoningEffort ? String(options.reasoningEffort) : undefined)
     const session = sessionUuid(options.sessionId ? String(options.sessionId) : undefined)
+    // Text-only routes keep the [image omitted] note even if an image slipped
+    // through: upstream answers a text-only model handed an image with
+    // `1210:messages.content.type 参数非法` wrapped in a fake rate-limit error.
+    const images = route.multimodal ? await this.prepareImages(options, options.signal) : undefined
     const body: Record<string, unknown> = {
       config_name: route.configName,
       model_name: route.key,
       user_input: '',
-      messages: toTraeMessages(options),
+      messages: toTraeMessages(options, images).map(m => ({
+        role: m.role,
+        content: wireContent(m),
+        ...m.tool_calls?.length ? { tool_calls: m.tool_calls } : {},
+        ...m.tool_call_id ? { tool_call_id: m.tool_call_id } : {},
+      })),
       session_id: session,
       conversation_id: session,
       tools: toTraeTools(options.tools),

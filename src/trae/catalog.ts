@@ -9,7 +9,8 @@
  *    `__max` suffix is paired with `x-ide-version-code: 20260908`.
  *  - The client's own capability table (`AI.agent.model.model_list_map` in its
  *    globalStorage state DB) is the authority on **context windows, which
- *    models have Max, and the thinking-level vocabulary**.
+ *    models have Max, the thinking-level vocabulary, and which models take
+ *    images**.
  *
  * Captured 2026-10-13 from **TRAE SOLO CN** (31 entries) — the table belonging
  * to the TraeWork CN client actually in use. Note that trae2api's
@@ -56,6 +57,16 @@ export interface TraeModel {
    * absent means Max rides on the strategy marker with the standard key.
    */
   max?: { key?: string; contextWindow: number }
+  /**
+   * Whether the model accepts images, from the client capability table's
+   * `multimodal` flag — the only source that says *false* for a text-only
+   * model (traecli's `debug models` reports `input_modalities:
+   * ["text","image"]` for every model; it is a constant inherited from the
+   * Codex fork, not a per-model capability). Sending an image to a text-only
+   * model fails upstream with `1210:messages.content.type 参数非法` wrapped
+   * in a misleading "rate limited" envelope (see trae2api/direct.py).
+   */
+  multimodal?: boolean
 }
 
 const LIGHT_HIGH: readonly TraeEffort[] = ['light', 'high']
@@ -67,33 +78,33 @@ const MAX_1M = 1_000_000
 
 export const TRAE_MODELS: readonly TraeModel[] = [
   // Max without a catalog max_key: strategy marker only.
-  { id: 'Doubao-Seed-Evolving', configName: 'Doubao-Seed-Evolving', key: 'Doubao-Seed-Evolving__dev', contextWindow: 184_000, efforts: LIGHT_HIGH, defaultEffort: 'high', max: { contextWindow: MAX_1M } },
-  { id: 'Doubao-Seed-2.1-Pro-0915', configName: 'Doubao-Seed-2.1-pro', key: 'Doubao-Seed-2.1-pro__dev', contextWindow: 184_000, efforts: LIGHT_HIGH, defaultEffort: 'high', max: { contextWindow: MAX_1M } },
+  { id: 'Doubao-Seed-Evolving', configName: 'Doubao-Seed-Evolving', key: 'Doubao-Seed-Evolving__dev', contextWindow: 184_000, efforts: LIGHT_HIGH, defaultEffort: 'high', max: { contextWindow: MAX_1M }, multimodal: true },
+  { id: 'Doubao-Seed-2.1-Pro-0915', configName: 'Doubao-Seed-2.1-pro', key: 'Doubao-Seed-2.1-pro__dev', contextWindow: 184_000, efforts: LIGHT_HIGH, defaultEffort: 'high', max: { contextWindow: MAX_1M }, multimodal: true },
   // The client table reports 256K for this one, above the catalog's 200K.
-  { id: 'Doubao-Seed-2.1-Turbo', configName: 'Doubao-Seed-2.1-turbo', key: 'Doubao-Seed-2.1-turbo__dev', contextWindow: 256_000, efforts: LOW_HIGH, defaultEffort: 'high' },
-  { id: 'Doubao-Seed-2.0-Code', configName: 'Doubao-Seed-2.0-Code', key: 'Doubao-Seed-2.0-Code__dev', contextWindow: 184_000, efforts: LIGHT_HIGH, defaultEffort: 'high' },
-  { id: 'Doubao-Seed-Code', configName: 'Doubao_1_6', key: 'Doubao_1_6__dev', contextWindow: 184_000, efforts: NONE },
-  { id: 'GLM-5.3-FlashX', configName: 'glm-5.3-flashx', key: 'glm-5.3-flashx__dev', contextWindow: 200_000, efforts: LIGHT_HIGH_EXTRA, defaultEffort: 'high', max: { key: 'glm-5.3-flashx__max', contextWindow: MAX_1M } },
-  { id: 'Step-5-Preview', configName: 'step-5-preview', key: 'step-5-preview__dev', contextWindow: 200_000, efforts: LIGHT_HIGH, defaultEffort: 'high', max: { key: 'step-5-preview__max', contextWindow: MAX_1M } },
-  { id: 'GLM-5.3-Flash', configName: 'glm-5.3-flash', key: 'glm-5.3-flash__dev', contextWindow: 200_000, efforts: LIGHT_HIGH_EXTRA, defaultEffort: 'high', max: { key: 'glm-5.3-flash__max', contextWindow: MAX_1M } },
-  { id: 'GLM-5.3', configName: 'glm-5.3', key: 'glm-5.3__dev', contextWindow: 200_000, efforts: LIGHT_HIGH_EXTRA, defaultEffort: 'high', max: { key: 'glm-5.3__max', contextWindow: MAX_1M } },
+  { id: 'Doubao-Seed-2.1-Turbo', configName: 'Doubao-Seed-2.1-turbo', key: 'Doubao-Seed-2.1-turbo__dev', contextWindow: 256_000, efforts: LOW_HIGH, defaultEffort: 'high', multimodal: true },
+  { id: 'Doubao-Seed-2.0-Code', configName: 'Doubao-Seed-2.0-Code', key: 'Doubao-Seed-2.0-Code__dev', contextWindow: 184_000, efforts: LIGHT_HIGH, defaultEffort: 'high', multimodal: true },
+  { id: 'Doubao-Seed-Code', configName: 'Doubao_1_6', key: 'Doubao_1_6__dev', contextWindow: 184_000, efforts: NONE, multimodal: true },
+  { id: 'GLM-5.3-FlashX', configName: 'glm-5.3-flashx', key: 'glm-5.3-flashx__dev', contextWindow: 200_000, efforts: LIGHT_HIGH_EXTRA, defaultEffort: 'high', max: { key: 'glm-5.3-flashx__max', contextWindow: MAX_1M }, multimodal: true },
+  { id: 'Step-5-Preview', configName: 'step-5-preview', key: 'step-5-preview__dev', contextWindow: 200_000, efforts: LIGHT_HIGH, defaultEffort: 'high', max: { key: 'step-5-preview__max', contextWindow: MAX_1M }, multimodal: true },
+  { id: 'GLM-5.3-Flash', configName: 'glm-5.3-flash', key: 'glm-5.3-flash__dev', contextWindow: 200_000, efforts: LIGHT_HIGH_EXTRA, defaultEffort: 'high', max: { key: 'glm-5.3-flash__max', contextWindow: MAX_1M }, multimodal: true },
+  { id: 'GLM-5.3', configName: 'glm-5.3', key: 'glm-5.3__dev', contextWindow: 200_000, efforts: LIGHT_HIGH_EXTRA, defaultEffort: 'high', max: { key: 'glm-5.3__max', contextWindow: MAX_1M }, multimodal: false },
   // Catalog ships a max_key, but the client table says this model has no Max.
-  { id: 'GLM-5.2', configName: 'glm-5.2', key: 'glm-5.2__dev', contextWindow: 200_000, efforts: HIGH_XHIGH, defaultEffort: 'high' },
-  { id: 'GLM-5V-Turbo', configName: 'glm-5v-turbo', key: 'glm-5v-turbo__dev', contextWindow: 200_000, efforts: NONE },
-  { id: 'MiniMax-M3', configName: 'minimax-m3', key: 'minimax-m3__dev', contextWindow: 200_000, efforts: NONE, max: { key: 'minimax-m3__max', contextWindow: MAX_1M } },
-  { id: 'MiniMax-M2.7', configName: 'minimax-m2.7', key: 'minimax-m2.7__dev', contextWindow: 200_000, efforts: NONE },
-  { id: 'Qwen3.8-Max', configName: 'qwen3.8-max', key: 'qwen3.8-max__dev', contextWindow: 200_000, efforts: LIGHT_HIGH_EXTRA, defaultEffort: 'high', max: { key: 'qwen3.8-max__max', contextWindow: MAX_1M } },
-  { id: 'Qwen3.7-Plus', configName: 'qwen-3.7-plus', key: 'qwen-3.7-plus__dev', contextWindow: 200_000, efforts: NONE, max: { key: 'qwen-3.7-plus__max', contextWindow: MAX_1M } },
-  { id: 'Kimi-K2.8-Preview', configName: 'kimi-k2.8-preview', key: 'kimi-k2.8-preview__dev', contextWindow: 200_000, efforts: LIGHT_HIGH_EXTRA, defaultEffort: 'extra_high', max: { key: 'kimi-k2.8-preview__max', contextWindow: MAX_1M } },
-  { id: 'Kimi-K3', configName: 'kimi-k3', key: 'kimi-k3__dev', contextWindow: 200_000, efforts: LIGHT_HIGH_EXTRA, defaultEffort: 'extra_high', max: { key: 'kimi-k3__max', contextWindow: MAX_1M } },
-  { id: 'Kimi-K2.7-Code', configName: 'kimi-k2.7-code', key: 'kimi-k2.7-code__dev', contextWindow: 200_000, efforts: NONE },
-  { id: 'MiMo-V2.6-Pro', configName: 'mimo-v2.6-pro', key: 'mimo-v2.6-pro__dev', contextWindow: 200_000, efforts: NONE, max: { key: 'mimo-v2.6-pro__max', contextWindow: MAX_1M } },
-  { id: 'MiMo-V2.6-Flash', configName: 'mimo-v2.6-flash', key: 'mimo-v2.6-flash__dev', contextWindow: 200_000, efforts: NONE, max: { key: 'mimo-v2.6-flash__max', contextWindow: MAX_1M } },
-  { id: 'DeepSeek-V4.1-Flash', configName: 'DeepSeek-V4.1-Flash', key: 'DeepSeek-V4.1-Flash__dev', contextWindow: 200_000, efforts: LIGHT_HIGH_EXTRA, defaultEffort: 'high', max: { key: 'DeepSeek-V4.1-Flash__max', contextWindow: MAX_1M } },
-  { id: 'DeepSeek-V4-Pro 正式版', configName: 'DeepSeek-V4-Pro-Official', key: 'DeepSeek-V4-Pro-Official__dev', contextWindow: 200_000, efforts: LIGHT_HIGH_EXTRA, defaultEffort: 'high', max: { key: 'DeepSeek-V4-Pro-Official__max', contextWindow: MAX_1M } },
+  { id: 'GLM-5.2', configName: 'glm-5.2', key: 'glm-5.2__dev', contextWindow: 200_000, efforts: HIGH_XHIGH, defaultEffort: 'high', multimodal: false },
+  { id: 'GLM-5V-Turbo', configName: 'glm-5v-turbo', key: 'glm-5v-turbo__dev', contextWindow: 200_000, efforts: NONE, multimodal: true },
+  { id: 'MiniMax-M3', configName: 'minimax-m3', key: 'minimax-m3__dev', contextWindow: 200_000, efforts: NONE, max: { key: 'minimax-m3__max', contextWindow: MAX_1M }, multimodal: true },
+  { id: 'MiniMax-M2.7', configName: 'minimax-m2.7', key: 'minimax-m2.7__dev', contextWindow: 200_000, efforts: NONE, multimodal: false },
+  { id: 'Qwen3.8-Max', configName: 'qwen3.8-max', key: 'qwen3.8-max__dev', contextWindow: 200_000, efforts: LIGHT_HIGH_EXTRA, defaultEffort: 'high', max: { key: 'qwen3.8-max__max', contextWindow: MAX_1M }, multimodal: true },
+  { id: 'Qwen3.7-Plus', configName: 'qwen-3.7-plus', key: 'qwen-3.7-plus__dev', contextWindow: 200_000, efforts: NONE, max: { key: 'qwen-3.7-plus__max', contextWindow: MAX_1M }, multimodal: true },
+  { id: 'Kimi-K2.8-Preview', configName: 'kimi-k2.8-preview', key: 'kimi-k2.8-preview__dev', contextWindow: 200_000, efforts: LIGHT_HIGH_EXTRA, defaultEffort: 'extra_high', max: { key: 'kimi-k2.8-preview__max', contextWindow: MAX_1M }, multimodal: true },
+  { id: 'Kimi-K3', configName: 'kimi-k3', key: 'kimi-k3__dev', contextWindow: 200_000, efforts: LIGHT_HIGH_EXTRA, defaultEffort: 'extra_high', max: { key: 'kimi-k3__max', contextWindow: MAX_1M }, multimodal: true },
+  { id: 'Kimi-K2.7-Code', configName: 'kimi-k2.7-code', key: 'kimi-k2.7-code__dev', contextWindow: 200_000, efforts: NONE, multimodal: true },
+  { id: 'MiMo-V2.6-Pro', configName: 'mimo-v2.6-pro', key: 'mimo-v2.6-pro__dev', contextWindow: 200_000, efforts: NONE, max: { key: 'mimo-v2.6-pro__max', contextWindow: MAX_1M }, multimodal: true },
+  { id: 'MiMo-V2.6-Flash', configName: 'mimo-v2.6-flash', key: 'mimo-v2.6-flash__dev', contextWindow: 200_000, efforts: NONE, max: { key: 'mimo-v2.6-flash__max', contextWindow: MAX_1M }, multimodal: true },
+  { id: 'DeepSeek-V4.1-Flash', configName: 'DeepSeek-V4.1-Flash', key: 'DeepSeek-V4.1-Flash__dev', contextWindow: 200_000, efforts: LIGHT_HIGH_EXTRA, defaultEffort: 'high', max: { key: 'DeepSeek-V4.1-Flash__max', contextWindow: MAX_1M }, multimodal: true },
+  { id: 'DeepSeek-V4-Pro 正式版', configName: 'DeepSeek-V4-Pro-Official', key: 'DeepSeek-V4-Pro-Official__dev', contextWindow: 200_000, efforts: LIGHT_HIGH_EXTRA, defaultEffort: 'high', max: { key: 'DeepSeek-V4-Pro-Official__max', contextWindow: MAX_1M }, multimodal: false },
   // Catalog ships a max_key, but the client table says this model has no Max.
-  { id: 'DeepSeek-V4-Pro', configName: 'deepseek-V4-Pro', key: 'deepseek-V4-Pro__dev', contextWindow: 200_000, efforts: HIGH_XHIGH, defaultEffort: 'high' },
-  { id: 'DeepSeek-V4-Flash 正式版', configName: 'DeepSeek-V4-Flash-Official', key: 'deepseek_v4_flash_official__dev', contextWindow: 200_000, efforts: LIGHT_HIGH_EXTRA, defaultEffort: 'high', max: { key: 'deepseek_v4_flash_official__max', contextWindow: MAX_1M } },
+  { id: 'DeepSeek-V4-Pro', configName: 'deepseek-V4-Pro', key: 'deepseek-V4-Pro__dev', contextWindow: 200_000, efforts: HIGH_XHIGH, defaultEffort: 'high', multimodal: false },
+  { id: 'DeepSeek-V4-Flash 正式版', configName: 'DeepSeek-V4-Flash-Official', key: 'deepseek_v4_flash_official__dev', contextWindow: 200_000, efforts: LIGHT_HIGH_EXTRA, defaultEffort: 'high', max: { key: 'deepseek_v4_flash_official__max', contextWindow: MAX_1M }, multimodal: false },
 ]
 
 /** Display names for the picker's thinking-level menu (the 轻/高/极高 buttons). */
@@ -117,6 +128,8 @@ export interface TraeRoute {
   defaultEffort?: TraeEffort
   /** True when this is the Max variant: the request also carries the `max` strategy marker. */
   maxMode: boolean
+  /** True when this model accepts images on user messages (upstream `image_url`). */
+  multimodal: boolean
 }
 
 /**
@@ -136,6 +149,7 @@ export const TRAE_ROUTES: readonly TraeRoute[] = TRAE_MODELS.map((model) => {
     efforts: model.efforts,
     ...model.defaultEffort ? { defaultEffort: model.defaultEffort } : {},
     maxMode: max !== undefined,
+    multimodal: model.multimodal ?? false,
   }
 })
 

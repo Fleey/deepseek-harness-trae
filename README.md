@@ -47,6 +47,7 @@ v0.3 起插件自己直连 Trae 的 `llm_raw_chat` 接口（和 trae2api 的 dir
    卡片底部的 **连接状态** 会显示是否连上、有哪些模型。
 
 然后在对话框右下角的模型菜单里选 **Trae** 分组下的模型，思考档位在同一个菜单里切换。
+选中 Trae 模型时，模型选择器旁边还会出现一个剩余额度小徽标（详见下文「额度显示」）。
 
 卸载：`dsh plugin --profile desktop remove dsh-trae2api`。
 
@@ -79,6 +80,10 @@ dsh plugin --profile desktop add ./dsh-trae2api-0.3.0.tgz
 | `host` | `https://api.enterprise.trae.cn` | Trae 接口地址 |
 | `clientId` | `app_EMoamEEZ73f0CkXaXp7hrann` | PAT 兑换用的 OAuth client id（traecli 的） |
 | `appId` / `ideVersionCode` / `clientVersion` | 20260908 那一代 | 身份头，和内置模型目录的后缀（`__dev`）配对 |
+| `consoleEmailEnv` | `TRAE_CONSOLE_EMAIL` | 控制台邮箱在凭据库里的引用名（卡片写这里） |
+| `consoleEmail` | 空 | 控制台邮箱的配置兜底（凭据库里没有时才用） |
+| `consolePasswordEnv` | `TRAE_CONSOLE_PASSWORD` | 控制台密码在凭据库里的引用名 |
+| `consoleHost` | `https://console.enterprise.trae.cn` | 企业控制台地址 |
 | `readTimeoutMs` | `300000` | 上游两次数据之间的最长间隔 |
 | `emptyRetries` | `1` | 空回合/瞬时故障的额外重试次数 |
 | `loopGuardChars` | `600` | 重复塌缩截断的触发长度；0 关闭 |
@@ -86,9 +91,75 @@ dsh plugin --profile desktop add ./dsh-trae2api-0.3.0.tgz
 > ⚠️ 模型名后缀（`__dev`）和 `ideVersionCode`（`20260908`）是一对，必须同代。Trae 升级后若
 > 大量模型报 `4023` / `4001`，说明内置目录和身份头过时了，需要更新插件（或临时改这几个字段）。
 
+## 额度显示
+
+插件会向 Trae 查询剩余额度，显示在两处：
+
+- **设置 → 模型 → Trae 卡片**里有一块「剩余额度」：显示每个额度包的已用/剩余/到期，
+  总量、美元计费标记，以及一个「刷新」按钮。
+- **对话框右下角**（模型选择器旁边）有一个小徽标，选中的是 Trae 模型时显示剩余百分比，
+  点击即刷新；其它来源的模型选中时不显示。
+
+实现方式：插件在宿主端通过登录态隔离开的 `/api/dsh-trae2api/quota` 路由供 UI 查询，
+带一分钟缓存，`?refresh` 强制刷新。后端流程是先向企业 API 的
+`/cloudide/api/v3/trae/CheckLogin` 问 `GetAIPayHost:true` 拿到真正的支付网关地址，
+再查 `v1`（企业，`basic_usage_limit`）→ `v2`（个人，`credits_limit`）两条
+`/pay/ide_user_ent_usage` 路径，哪条先通用哪条，两边字段都兼容。`limit: -1` 按不限量处理；
+额度包 `basic_usage_limit: 0`（免费档）显示为「当前账号没有额度包」。
+
+空额度包列表不再当成结论：某个地址返回 0 个额度包时会继续问剩下的地址，只有全都没有额度包
+才显示「当前账号没有额度包」，并附上回答这句话的 `host + path`。
+
+### 企业版（ToB）席位：走控制台账号
+
+用企业版 PAT 实测过（2026-10-13）：**IDE 那套额度接口是 CN 个人版的，拿不到企业席位的额度。**
+
+- `CheckLogin` 不给 `AIPayHost`（`Host: ""`），所以一定走兜底 `api.trae.cn`；
+- `api.enterprise.trae.cn` 上两条路径都是 openresty 的裸 404，网关层就没这条路由；
+- `api.trae.cn` 两条都 200，但只返回这个 user_id 的**个人免费档**：`product_type: 0`、
+  `display_desc: "免费"`、`entitlement_id: "free_utc…"`，所有数字额度字段都是 0
+  （`v2` 连数字字段都不返回，只剩 `enable_solo_*` 布尔开关）。
+
+席位的真实用量记在企业租户上（JWT 里的 `tob_tenant_id`、`tenant_id: "tob_online"`），
+只有**企业控制台**的接口给得出来（`src/trae/tob.ts`）：
+
+| 接口 | 给什么 |
+|---|---|
+| `POST /trae/gtm/tob/api/v1/config/get_personal_quota` | `user_model_quota.seat_pool_currency_quota`（席位额度）、`paygo_currency_quota`（超额/按量） |
+| `POST /trae/gtm/tob/api/v1/config/get_user_model_usage` | `user_usage_list[].in_seat_detail.chat_usage_details[]`：每个模型的 `total_token_usage` 与 `total_cost_currency`；`model_usage_detail_list[]` 是按量那侧 |
+
+`seat_total_cost_currency` / `extra_total_cost_currency` 实测恒为 `null`，所以已用量是把
+每个模型的 `total_cost_currency` 相加得出的。
+
+**认证只有一条路**：这两个接口只认控制台的会话 cookie `X-Cloudide-Tob-Session`。Cloud-IDE JWT
+一律回 `30011 请先登录`，`account/check_token` 换不到会话，在控制台域名上做 `ExchangeToken`
+也不 `Set-Cookie`。所以插件用控制台自己的密码登录（`POST /trae/gtm/tob/api/v1/account/login`，
+`{Email, Password}`）拿会话，会话过期自动重登一次。**SSO 登录的租户用不了这条路。**
+
+界面上因此分两种账号：
+
+- **JWT 带企业租户**（`tob_tenant_id`）→ Trae 卡片多出「企业控制台账号」一栏（邮箱 + 密码）。
+  邮箱和密码都写进 dsh 凭据库（默认引用名 `TRAE_CONSOLE_EMAIL` / `TRAE_CONSOLE_PASSWORD`），
+  配置文件一个字都不碰——保存这对账号因此不依赖配置可写；`consoleEmail` 配置项只作兜底。
+  凭据写失败时，卡片直接把宿主返回的原因显示在字段下面，而不是只说「保存失败」。填好后额度块显示「席位额度 / 超额（按量）」两个包、总剩余百分比，外加一个可展开的
+  **按模型用量**（花费 + token 数）。没填时显示「企业版席位：填下面的控制台账号才能看到额度」。
+- **个人版账号** → 完全走原来的 `ide_user_ent_usage`，不显示控制台登录栏。
+
+要重新验证或找新接口：
+
+```sh
+TRAE_PAT=… TRAE_CONSOLE_EMAIL=… TRAE_CONSOLE_PASSWORD=… python3 -I tools/probe_quota.py
+```
+
+（仓库根目录；把 IDE 两条路径在各个地址、两套请求头下的原始响应，以及控制台的两条接口全打出来。）
+
 ## 已知限制
 
-- **图片暂不透传**：所有模型按纯文本声明，消息里的图片会替换成一行说明文字。
+- **图片仅限多模态模型与 user 消息**：图片以 `data:` URI 内联发给能力表标记
+  `multimodal: true` 的模型（24 个里 18 个，GLM-5.3/GLM-5.2/DeepSeek 全系/MiniMax-M2.7
+  除外）；纯文本模型与 tool 结果里的图片仍是占位文本（上游接口只在 user 消息接受
+  `image_url`，发给纯文本模型会被 `1210` 拒绝还伪装成限流）。读取失败的单张图片降级为
+  占位文本而不是让整轮失败。图片按每边 1024px / 2MiB 预算由附件服务缩放。
 - 这是 Trae 未公开的内部接口，后端改协议插件就会断——和 trae2api 的 direct 模式同样的前提。
 - **Max 的实际效果未经证实**：trae2api 实测这条私有接口对 `context_window_size` 和 `__max` key
   没有可观测差异（两者 `extra_info.model` 相同）。路由是真的（15 个模型的 `4023` 就是靠它修好的），
@@ -111,8 +182,11 @@ npm test           # 目录、消息转换、SSE 解码、重复检测、文本�
 - `src/trae/auth.ts` —— PAT → Cloud-IDE JWT 兑换与缓存。
 - `src/trae/catalog.ts` —— 写死的 24 个模型（key / 上下文 / 思考档位），其中 16 个默认走 Max。
 - `src/trae/wire.ts` —— 消息转换、SSE、错误分类、重复检测、文本工具调用嗅探。
-- `client/client.js` —— 浏览器端：Models 页和插件页里的 PAT 卡片。
+- `src/trae/quota.ts` —— 额度查询：CheckLogin 发现支付网关、v1/v2 兜底、宽容解析、企业席位判定。
+- `src/trae/tob.ts` —— 企业版额度：控制台密码登录 + 个人配额/按模型用量两条接口。
+- `client/client.js` —— 浏览器端：Models 页和插件页里的 PAT 卡片、额度块、输入框额度徽标。
 
 已在 `@deepseek-ai/dsh@0.2.0-rc.2` 的 Web 界面里验证：Trae 卡片只有 PAT 一个字段，未填时
-连接状态显示明确提示。15 项单元测试覆盖协议转换、各项兜底，以及**出货 bundle 里每个模型的上下文窗口和思考档位**。真实的 PAT 兑换与模型调用需要能访问
-`api.enterprise.trae.cn` 的环境，请在你自己的机器上用真实 PAT 验证。
+连接状态显示明确提示。24 项单元测试覆盖协议转换、各项兜底、额度解析与路由注册，以及**出货
+bundle 里每个模型的上下文窗口和思考档位**。真实 PAT 兑换、模型调用与额度查询已在
+`api.enterprise.trae.cn` 环境用真实 PAT 验证通过。

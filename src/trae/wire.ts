@@ -9,6 +9,13 @@ import type { ContentBlock, GenerateOptions, RequestMessage, ToolSchema } from '
 // ----------------------------------------------------------------- request
 
 export interface TraePart { type: 'text'; text: string }
+/**
+ * An image part on a user message, the one shape upstream accepts (the same
+ * `{"type":"image_url","image_url":{"url": ...}}` trae2api forwards, direct_routes.py).
+ * Only `data:` URIs are used: remote http(s) links would make upstream fetch
+ * arbitrary URLs, and the harness hands us bytes, not links.
+ */
+export interface TraeImagePart { type: 'image_url'; image_url: { url: string } }
 export interface TraeToolCall {
   id: string
   index: number
@@ -18,9 +25,24 @@ export interface TraeToolCall {
 export interface TraeMessage {
   role: 'system' | 'user' | 'assistant' | 'tool'
   content: TraePart[]
+  /** Image parts of this user message, appended to `content` on the wire. */
+  images?: TraeImagePart[]
   tool_calls?: TraeToolCall[]
   tool_call_id?: string
 }
+
+/** The wire shape of one message: text parts with image parts interleaved at the end. */
+export function wireContent(message: TraeMessage): (TraePart | TraeImagePart)[] {
+  return message.images?.length ? [...message.content, ...message.images] : message.content
+}
+
+/**
+ * Resolved request bytes for every image the request retains, keyed by the
+ * durable attachment id, as a `data:` URI ready for the wire. Built by the
+ * adapter from the harness attachment store; an image whose id is missing
+ * from this map degrades to the `[image omitted]` note.
+ */
+export type TraeImages = ReadonlyMap<string, string>
 
 function textOf(content: readonly ContentBlock[], imageNote: boolean): string {
   const parts: string[] = []
@@ -31,10 +53,22 @@ function textOf(content: readonly ContentBlock[], imageNote: boolean): string {
   return parts.join('\n\n')
 }
 
+/** The image parts of one user message, in block order; unknown ids are skipped. */
+function imagePartsOf(content: readonly ContentBlock[], images: TraeImages | undefined): TraeImagePart[] {
+  if (!images || images.size === 0) return []
+  const out: TraeImagePart[] = []
+  for (const block of content) {
+    if (block.type !== 'image') continue
+    const url = images.get(block.attachment.attachmentId)
+    if (url) out.push({ type: 'image_url', image_url: { url } })
+  }
+  return out
+}
+
 const parts = (text: string): TraePart[] => [{ type: 'text', text }]
 
 /** Harness history -> Trae messages (before repair). */
-function rawMessages(options: GenerateOptions): TraeMessage[] {
+function rawMessages(options: GenerateOptions, images: TraeImages | undefined): TraeMessage[] {
   const out: TraeMessage[] = []
   if (options.system) out.push({ role: 'system', content: parts(options.system) })
   for (const message of options.messages as readonly RequestMessage[]) {
@@ -46,9 +80,15 @@ function rawMessages(options: GenerateOptions): TraeMessage[] {
         if (text) out.push({ role: 'system', content: parts(text) })
         break
       }
-      case 'user':
-        out.push({ role: 'user', content: parts(textOf(message.content, true)) })
+      case 'user': {
+        const imageParts = imagePartsOf(message.content, images)
+        out.push({
+          role: 'user',
+          content: parts(textOf(message.content, imageParts.length === 0)),
+          ...imageParts.length ? { images: imageParts } : {},
+        })
         break
+      }
       case 'assistant': {
         const text = textOf(message.content, false)
         const calls = message.content
@@ -65,6 +105,7 @@ function rawMessages(options: GenerateOptions): TraeMessage[] {
         out.push({
           role: 'tool',
           tool_call_id: String(message.toolCallId),
+          // Upstream takes images on user turns only, never on a tool result.
           content: parts(textOf(message.content, true) || (message.isError ? 'error' : '')),
         })
         break
@@ -123,8 +164,8 @@ export function repairToolHistory(messages: TraeMessage[]): TraeMessage[] {
   return out.map(m => (m.content.length === 0 && !m.tool_calls?.length) ? { ...m, content: parts('') } : m)
 }
 
-export function toTraeMessages(options: GenerateOptions): TraeMessage[] {
-  return repairToolHistory(rawMessages(options))
+export function toTraeMessages(options: GenerateOptions, images: TraeImages | undefined = undefined): TraeMessage[] {
+  return repairToolHistory(rawMessages(options, images))
 }
 
 /** Upstream wants the nested function shape with `parameters` as a JSON *string*. */
