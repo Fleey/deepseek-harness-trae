@@ -8,7 +8,10 @@
  * produced it and is replaced (or dropped) by the next one.
  */
 
+import { randomUUID } from 'node:crypto'
 import type { ContentBlock, GenerateOptions, RequestMessage } from '@deepseek-ai/dsh-llm'
+import type { CueEvent } from './cue.ts'
+import { sessionUuid } from './wire.ts'
 
 /** One finished turn, as the adapter saw it. */
 export interface FinishedTurn {
@@ -27,21 +30,34 @@ export interface SuggestionsOptions {
   /** Model to ask instead of the one that answered; empty = the same one. */
   model: string
   timeoutMs: number
+  /** Report shown/accepted suggestions as Cue events (false = skipped); absent = no reporting. */
+  report?: (events: CueEvent[]) => Promise<boolean>
   logger: { warn(...a: unknown[]): void }
 }
+
+/** What the composer did with a suggestion. */
+export type SuggestionAction = 'shown' | 'accept'
 
 export interface Suggestion {
   /** The suggested next user message; empty when the model had none. */
   text: string
   /** When the turn it follows ended (ms epoch). */
   at: number
+  /** Stable id of this suggestion: the `resp_id` its shown/accept events share. */
+  id: string
 }
 
 interface Entry {
+  id: string
   at: number
+  /** Upstream conversation id of the session (the chat's own `session_id`). */
+  conversationId: string
   pending: Promise<void>
   text: string
   abort: AbortController
+  /** When the composer first showed it; undefined until then. */
+  shownAt?: number
+  accepted: boolean
 }
 
 /** Sessions remembered at once; the oldest is forgotten first. */
@@ -104,7 +120,10 @@ export class TraeSuggestions {
     if (!turn.answer.trim()) return
     this.drop(turn.sessionId)
     const abort = new AbortController()
-    const entry: Entry = { at: Date.now(), text: '', abort, pending: Promise.resolve() }
+    const entry: Entry = {
+      id: randomUUID(), at: Date.now(), conversationId: sessionUuid(turn.sessionId),
+      text: '', abort, pending: Promise.resolve(), accepted: false,
+    }
     entry.pending = this.generate(turn, abort.signal).then(
       (text) => { entry.text = text },
       (error) => {
@@ -134,7 +153,47 @@ export class TraeSuggestions {
     }
     // Replaced or dropped while waiting.
     if (this.entries.get(sessionId) !== entry) return null
-    return { text: entry.text, at: entry.at }
+    return { text: entry.text, at: entry.at, id: entry.id }
+  }
+
+  /**
+   * The composer showed or accepted suggestion `id`. Each happens at most once
+   * per suggestion, and only for the session's current, non-empty one; the
+   * visible time is measured here, not taken from the browser. Resolves to
+   * whether an event went out.
+   */
+  async record(sessionId: string, id: string, action: SuggestionAction): Promise<boolean> {
+    const entry = this.entries.get(sessionId)
+    if (!entry || entry.id !== id || !entry.text || entry.accepted) return false
+    const now = Date.now()
+    const base = { resp_id: entry.id, type: '', conversation_id: entry.conversationId }
+    let event: CueEvent
+    if (action === 'shown') {
+      if (entry.shownAt !== undefined) return false
+      entry.shownAt = now
+      event = { event: 'code_gen_shown', payload: base }
+    } else {
+      entry.accepted = true
+      entry.shownAt ??= now
+      event = {
+        event: 'code_gen_accept',
+        payload: {
+          ...base,
+          accept_content: entry.text,
+          accept_prefix: '',
+          accept_suffix: '',
+          suggestion_visible_duration: now - entry.shownAt,
+          tab_mode: '',
+        },
+      }
+    }
+    if (!this.opts.report) return false
+    try {
+      return await this.opts.report([event])
+    } catch (error) {
+      this.opts.logger.warn(`dsh-trae2api: Cue report failed (${error instanceof Error ? error.message : String(error)})`)
+      return false
+    }
   }
 
   private drop(sessionId: string): void {

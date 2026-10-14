@@ -686,3 +686,99 @@ test('adapter: only a main-loop turn that ends in prose reports itself; complete
   assert.notEqual(body.session_id, 's1')
   assert.deepEqual(body.messages.map(m => m.role), ['system', 'user'])
 })
+
+test('cue: report/clients gets multipart `body` with env_metadata and stringified payloads', async () => {
+  const { TraeCueReporter, REPORT_PATH } = await import('../lib/testing.mjs')
+  const auth = stubAuth()
+  const reporter = new TraeCueReporter({
+    host: 'https://h', auth, appId: 'app-1', ideVersion: '99.99.99', ideVersionCode: '20260908', userAgent: 'ua',
+    user: async () => ({ userId: '42', privacyMode: false }),
+  })
+  const stub = stubFetch((url, n) => n === 1 ? new Response('no', { status: 401 }) : Response.json({ code: 0 }))
+  try {
+    await reporter.report([{ event: 'code_gen_accept', payload: { resp_id: 'r1', accept_content: '好' } }])
+  } finally { stub.restore() }
+  assert.deepEqual(auth.seen, [false, true], 'a rejected JWT is exchanged once')
+  assert.equal(stub.calls.length, 2)
+  const call = stub.calls[1]
+  assert.equal(call.url, `https://h${REPORT_PATH}`)
+  assert.equal(call.headers.authorization, 'Cloud-IDE-JWT jwt')
+  assert.equal(call.headers['x-app-id'], 'app-1')
+  assert.ok(call.body instanceof FormData)
+  const body = JSON.parse(call.body.get('body'))
+  assert.deepEqual(body.env_metadata, {
+    ide_version: '99.99.99', environment: '', extension_version: '', version_code: 20260908,
+    region: 'cn', channel: 'unknown', app_id: 'app-1', user_id: '42', ab_version: '',
+  })
+  assert.equal(body.events.length, 1)
+  assert.equal(body.events[0].event, 'code_gen_accept')
+  assert.equal(typeof body.events[0].payload, 'string')
+  assert.deepEqual(JSON.parse(body.events[0].payload), { resp_id: 'r1', accept_content: '好' })
+
+  const failing = stubFetch(() => new Response('boom', { status: 500 }))
+  try {
+    await assert.rejects(reporter.report([{ event: 'code_gen_shown', payload: {} }]), /HTTP 500/)
+  } finally { failing.restore() }
+
+  // Privacy mode: like the IDE, report nothing at all.
+  const privateReporter = new TraeCueReporter({
+    host: 'https://h', auth: stubAuth(), appId: 'a', ideVersion: 'v', ideVersionCode: '1', userAgent: 'ua',
+    user: async () => ({ userId: '42', privacyMode: true }),
+  })
+  const silent = stubFetch(() => Response.json({}))
+  try {
+    assert.equal(await privateReporter.report([{ event: 'code_gen_accept', payload: {} }]), false)
+  } finally { silent.restore() }
+  assert.equal(silent.calls.length, 0)
+})
+
+test('user info: GetUserInfo with x-cloudide-token, UserID as a string, PrivacyMode gate, once per JWT', async () => {
+  const { parseUserInfo, TraeUserInfo, USER_INFO_PATH } = await import('../lib/testing.mjs')
+  assert.deepEqual(parseUserInfo({ code: 0, message: '', Data: { UserInfo: { UserID: '312308224', TenantID: '9' }, PrivacyMode: false } }), { userId: '312308224', privacyMode: false })
+  assert.deepEqual(parseUserInfo({ code: 0, Data: { UserInfo: { UserID: 7 }, PrivacyMode: 1 } }), { userId: '7', privacyMode: true })
+  assert.throws(() => parseUserInfo({ code: 401, message: 'not login' }), /401 not login/)
+  assert.throws(() => parseUserInfo({ code: 0, Data: { UserInfo: {} } }), /no UserInfo\.UserID/)
+
+  const users = new TraeUserInfo({ host: 'https://console.example/', auth: stubAuth(), userAgent: 'ua' })
+  const stub = stubFetch(() => Response.json({ code: 0, Data: { UserInfo: { UserID: '312308224' }, PrivacyMode: false } }))
+  try {
+    assert.equal((await users.get()).userId, '312308224')
+    assert.equal((await users.get()).userId, '312308224')
+  } finally { stub.restore() }
+  assert.equal(stub.calls.length, 1, 'cached for the same JWT')
+  assert.equal(stub.calls[0].url, `https://console.example${USER_INFO_PATH}`)
+  assert.equal(stub.calls[0].headers['x-cloudide-token'], 'jwt')
+  assert.equal(stub.calls[0].headers.authorization, undefined)
+  assert.equal(stub.calls[0].body, '{}')
+})
+
+test('suggestions: shown then accept, once each, sharing one resp_id; stale ids count for nothing', async () => {
+  const { TraeSuggestions, sessionUuid } = await import('../lib/testing.mjs')
+  const reported = []
+  const store = new TraeSuggestions({
+    complete: async () => 'run the tests',
+    model: '', timeoutMs: 5000, logger: { warn() {} },
+    report: async (events) => { reported.push(...events); return true },
+  })
+  store.turnEnded({ sessionId: 's1', model: 'GLM-5.3', options: turnOptions(), answer: 'ok' })
+  const { id } = await store.get('s1', 1000)
+
+  assert.equal(await store.record('s1', 'other-id', 'shown'), false)
+  assert.equal(await store.record('s1', id, 'shown'), true)
+  assert.equal(await store.record('s1', id, 'shown'), false, 'shown counts once')
+  assert.equal(await store.record('s1', id, 'accept'), true)
+  assert.equal(await store.record('s1', id, 'accept'), false, 'accept counts once')
+
+  assert.deepEqual(reported.map(e => e.event), ['code_gen_shown', 'code_gen_accept'])
+  const [shown, accept] = reported.map(e => e.payload)
+  assert.equal(shown.resp_id, id)
+  assert.equal(accept.resp_id, id)
+  assert.equal(accept.conversation_id, sessionUuid('s1'))
+  assert.equal(accept.accept_content, 'run the tests')
+  assert.equal(typeof accept.suggestion_visible_duration, 'number')
+
+  // A new turn retires the old id.
+  store.turnStarted('s1')
+  assert.equal(await store.record('s1', id, 'accept'), false)
+  assert.equal(reported.length, 2)
+})
