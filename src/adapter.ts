@@ -315,7 +315,7 @@ export class TraeAdapter extends LlmAdapter {
     const session = sessionUuid(options.sessionId ? String(options.sessionId) : undefined)
     // Only the agent loop's own requests carry tools; title, compaction and
     // other side requests in the same session neither start nor end a turn.
-    const mainLoop = options.sessionId !== undefined && (options.tools?.length ?? 0) > 0
+    const mainLoop = options.sessionId !== undefined && options.purpose === undefined && (options.tools?.length ?? 0) > 0
     if (mainLoop) this.opts.onTurnStart?.(String(options.sessionId))
     // Text-only routes keep the [image omitted] note even if an image slipped
     // through: upstream answers a text-only model handed an image with
