@@ -43,7 +43,7 @@
   "scripts": {
     "build": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node20 --outfile=lib/index.js --external:@deepseek-ai/cordis --external:@deepseek-ai/dsh-llm --external:@deepseek-ai/schemastery && node -e \"require('fs').copyFileSync('client/client.js','lib/client.js')\"",
     "typecheck": "tsc -p tsconfig.json",
-    "test": "node --test test/internals.test.mjs test/plugin.test.mjs",
+    "test": "node --test test/internals.test.mjs test/plugin.test.mjs test/client.test.mjs",
     "build:test": "esbuild test/_internals.ts --bundle --platform=node --format=esm --target=node20 --outfile=lib/testing.mjs --external:@deepseek-ai/dsh-llm"
   },
   "peerDependencies": {
