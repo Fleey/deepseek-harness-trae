@@ -18,7 +18,10 @@ import type {} from '@deepseek-ai/dsh-llm'
 import Schema from '@deepseek-ai/schemastery'
 import { TraeAdapter, traeHeaders, type TraeIdentity } from './adapter.ts'
 import { CLI_CLIENT_ID, TRAE_HOST, TraeAuth } from './trae/auth.ts'
+import { TraeCueReporter } from './trae/cue.ts'
+import { TraeUserInfo } from './trae/user.ts'
 import { TraeQuota } from './trae/quota.ts'
+import { TraeSuggestions } from './trae/suggest.ts'
 import { TOB_CONSOLE_HOST, TobConsole } from './trae/tob.ts'
 
 export const name = 'dsh-trae2api'
@@ -27,6 +30,14 @@ export const inject = ['llm']
 const CLIENT_VERSION = '0.206.1-tob'
 /** Host route the browser half reads the remaining quota from. */
 export const QUOTA_ROUTE = '/api/dsh-trae2api/quota'
+/** Host route the browser half reads a session's next-input suggestion from. */
+export const SUGGESTION_ROUTE = '/api/dsh-trae2api/suggestion'
+/** Longest a suggestion request may wait for one still being generated. */
+const SUGGESTION_MAX_WAIT_MS = 30_000
+/** Host route the browser half reports a suggestion being shown / accepted to. */
+export const SUGGESTION_EVENT_ROUTE = '/api/dsh-trae2api/suggestion/event'
+/** Environment fallback for `cueUserId`. */
+const CUE_USER_ID_ENV = 'TRAE_USER_ID'
 
 export interface Config {
   provider: string
@@ -51,6 +62,15 @@ export interface Config {
   readTimeoutMs: number
   emptyRetries: number
   loopGuardChars: number
+  /** Suggest the next input in the composer after each answer (Tab accepts). */
+  suggestions: boolean
+  /** Model asked for suggestions; empty = the model that answered. */
+  suggestModel: string
+  suggestTimeoutMs: number
+  /** Report shown / accepted suggestions to Trae's Cue statistics (report/clients). */
+  reportCue: boolean
+  /** Trae account user id for those reports; empty = GetUserInfo ($TRAE_USER_ID wins if set). */
+  cueUserId: string
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -73,6 +93,11 @@ export const Config: Schema<Config> = Schema.object({
   readTimeoutMs: Schema.natural().default(300_000),
   emptyRetries: Schema.natural().default(1),
   loopGuardChars: Schema.natural().default(600),
+  suggestions: Schema.boolean().default(true),
+  suggestModel: Schema.string().default(''),
+  suggestTimeoutMs: Schema.natural().default(20_000),
+  reportCue: Schema.boolean().default(true),
+  cueUserId: Schema.string().default(''),
 }) as unknown as Schema<Config>
 
 type CredentialsService = { resolve(ref: string): Promise<{ value?: string } | undefined> }
@@ -139,7 +164,36 @@ export function apply(ctx: Context, config: Config): void {
     userAgent,
   }
 
-  const adapter = new TraeAdapter({
+  // The account as the IDE login sees it: user id for reports, privacy gate.
+  const userInfo = new TraeUserInfo({ host: config.consoleHost, auth, userAgent })
+  // On by default, like the IDE's own reporting. The user id comes from
+  // GetUserInfo (the JWT does not carry it); a configured one only overrides
+  // the id, never the account's privacy mode.
+  const cueUserId = (config.cueUserId || process.env[CUE_USER_ID_ENV] || '').trim()
+  const cue = config.suggestions && config.reportCue
+    ? new TraeCueReporter({
+      host, auth, appId: identity.appId, ideVersion: identity.ideVersion,
+      ideVersionCode: identity.ideVersionCode, userAgent,
+      user: async () => {
+        const user = await userInfo.get()
+        return cueUserId ? { ...user, userId: cueUserId } : user
+      },
+    })
+    : undefined
+
+  // Next-input suggestions ride on the adapter: it reports finished turns and
+  // runs the side completion. `adapter` is assigned right below.
+  const suggestions = config.suggestions
+    ? new TraeSuggestions({
+      complete: (model, system, user, signal) => adapter.complete(model, system, user, signal),
+      model: config.suggestModel,
+      timeoutMs: config.suggestTimeoutMs,
+      ...cue ? { report: (events) => cue.report(events) } : {},
+      logger,
+    })
+    : undefined
+
+  const adapter: TraeAdapter = new TraeAdapter({
     displayName: config.displayName,
     host,
     identity,
@@ -154,6 +208,12 @@ export function apply(ctx: Context, config: Config): void {
     resolveAttachments: () => {
       try { return anyCtx.get('attachments') as import('./adapter.ts').AttachmentStoreLike | undefined } catch { return undefined }
     },
+    ...suggestions
+      ? {
+        onTurnStart: (sessionId: string) => { suggestions.turnStarted(sessionId) },
+        onTurnEnd: turn => { suggestions.turnEnded(turn) },
+      }
+      : {},
     logger,
   })
 
@@ -168,12 +228,12 @@ export function apply(ctx: Context, config: Config): void {
 
   // A PAT saved from the UI changes no config field; drop the cached JWT.
   ctx.on('credentials/reference-updated' as never, ((ref: string) => {
-    if (ref === config.patEnv.get()) { auth.reset(); quota.reset() }
+    if (ref === config.patEnv.get()) { auth.reset(); quota.reset(); userInfo.reset() }
     // The console password is its own credential; a new one invalidates the
     // cached console session, not the JWT.
     if (ref === config.consolePasswordEnv.get() || ref === config.consoleEmailEnv.get()) { tob.reset(); quota.reset() }
   }) as never)
-  ctx.on('loader/volatile-update' as never, (() => { auth.reset(); quota.reset() }) as never)
+  ctx.on('loader/volatile-update' as never, (() => { auth.reset(); quota.reset(); userInfo.reset() }) as never)
 
   // Remaining quota for the card and the composer chip. A Connection route
   // rather than a bare webServer one: it sits behind the same Host/Origin
@@ -195,6 +255,42 @@ export function apply(ctx: Context, config: Config): void {
         },
       })
     } catch (error) { logger.warn('dsh-trae2api: quota route unavailable', error) }
+    // `?session=<id>&wait=<ms>`: the session's suggestion, waiting for one
+    // still in flight. `{ ok: true, value: null }` = nothing to suggest.
+    try {
+      child.connection.fetch.register({
+        path: SUGGESTION_ROUTE,
+        methods: ['GET'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          const params = new URL(request.url).searchParams
+          const sessionId = params.get('session') ?? ''
+          const wait = Math.min(SUGGESTION_MAX_WAIT_MS, Math.max(0, Number(params.get('wait')) || 0))
+          const value = suggestions && sessionId ? await suggestions.get(sessionId, wait) : null
+          return Response.json({ ok: true, value })
+        },
+      })
+    } catch (error) { logger.warn('dsh-trae2api: suggestion route unavailable', error) }
+    // `{ session, id, action: 'shown' | 'accept' }`: what the composer did with
+    // a suggestion. The store decides whether it counts (once each, current
+    // suggestion only) and whether it is reported at all.
+    try {
+      child.connection.fetch.register({
+        path: SUGGESTION_EVENT_ROUTE,
+        methods: ['POST'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          let input: { session?: unknown; id?: unknown; action?: unknown }
+          try { input = await request.json() as typeof input } catch { return Response.json({ ok: false, error: 'invalid JSON' }, { status: 400 }) }
+          const { session, id, action } = input
+          if (typeof session !== 'string' || typeof id !== 'string' || (action !== 'shown' && action !== 'accept')) {
+            return Response.json({ ok: false, error: 'expected { session, id, action: "shown" | "accept" }' }, { status: 400 })
+          }
+          const reported = suggestions ? await suggestions.record(session, id, action) : false
+          return Response.json({ ok: true, reported })
+        },
+      })
+    } catch (error) { logger.warn('dsh-trae2api: suggestion event route unavailable', error) }
   })
 
   // Released automatically on unload.

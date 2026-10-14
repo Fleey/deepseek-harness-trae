@@ -87,6 +87,11 @@ dsh plugin --profile desktop add ./dsh-trae2api-0.3.0.tgz
 | `readTimeoutMs` | `300000` | 上游两次数据之间的最长间隔 |
 | `emptyRetries` | `1` | 空回合/瞬时故障的额外重试次数 |
 | `loopGuardChars` | `600` | 重复塌缩截断的触发长度；0 关闭 |
+| `suggestions` | `true` | 回答完后在输入框里给出下一句建议（Tab 填入）；`false` 关闭 |
+| `suggestModel` | 空 | 生成建议用的模型；空 = 用刚回答的那个模型 |
+| `suggestTimeoutMs` | `20000` | 生成一条建议的最长等待 |
+| `reportCue` | `true` | 把建议的「显示 / 采纳」上报到 Trae 的 Cue 统计（见下文）；`false` 关闭 |
+| `cueUserId` | 空 | 覆盖上报用的 Trae user id；空 = 环境变量 `TRAE_USER_ID`，再空 = 自动从 `GetUserInfo` 取 |
 
 > ⚠️ 模型名后缀（`__dev`）和 `ideVersionCode`（`20260908`）是一对，必须同代。Trae 升级后若
 > 大量模型报 `4023` / `4001`，说明内置目录和身份头过时了，需要更新插件（或临时改这几个字段）。
@@ -152,6 +157,63 @@ TRAE_PAT=… TRAE_CONSOLE_EMAIL=… TRAE_CONSOLE_PASSWORD=… python3 -I tools/p
 ```
 
 （把 IDE 两条路径在各个地址、两套请求头下的原始响应，以及控制台的两条接口全打出来。）
+
+## 输入建议（Tab 填入）
+
+Trae 模型回答完一轮后，输入框为空时会用灰字显示一条**猜你下一句要说的话**（取代原来的占位提示），
+右边带一个 `Tab` 小标记：
+
+- 按 **Tab**：把建议填进输入框（可撤销），可以接着改，再回车发送。
+- 直接打字：建议消失，这一轮不再出现。
+- 发送新消息 / 模型开始工作：建议清掉，等下一轮回答完再出。
+
+实现方式：宿主端的 adapter 在一轮主循环请求（带工具的那种）以纯文本回答收尾时，用**同一个模型、
+最低思考档位、不带工具、独立的上游 session** 发一个很小的补全请求——只喂最近 3 条用户消息和这轮
+的最终回答——让它以用户口吻写一句话。结果按会话存在内存里，经 `/api/dsh-trae2api/suggestion`
+（同样走登录态隔离的 Connection 路由）给浏览器端；浏览器端在会话由运行转为空闲时去取，
+生成还没完成时最多等 20 秒。标题生成、上下文压缩这类不带工具的旁路请求不会触发建议。
+
+> 每轮回答会多花一次很小的请求额度。不想要可以在 `cordis.patch.yml` 里给 `id: trae2api`
+> 设 `suggestions: false`，或用 `suggestModel` 指定一个更便宜的模型。
+>
+> 输入框目前没有给插件留「灰字建议」的接口，这里是借 `conversation.input.overlay` 插槽找到
+> 输入卡片、藏起原占位文字、在同一位置放一个同样式的元素，并在卡片上以捕获阶段拦截 Tab。
+> 以后 DSH 改了输入框结构，找不到占位元素时这个功能只会静默不显示，不影响正常输入。
+
+### 计入 Trae 的 Cue 统计（默认开启）
+
+默认无需任何配置：建议**真的显示出来**时报一条 `code_gen_shown`，**真的按了 Tab**
+时报一条 `code_gen_accept`，走 Trae 补全客户端用的同一个业务上报接口：
+
+```
+POST {host}/api/ide/v1/report/clients        (multipart，字段 body = JSON 字符串)
+Authorization: Cloud-IDE-JWT <和 llm_raw_chat 同一个 token>
+X-App-Id: <appId>
+```
+
+- 同一条建议的 shown / accept 共用一个 `resp_id`（每条建议生成时的 UUID），`conversation_id`
+  是这条会话发给 `llm_raw_chat` 的 `session_id`。
+- 每条建议 shown、accept 各最多一次，去重和「显示了多久」（`suggestion_visible_duration`）都在
+  宿主端算，浏览器只说「显示了 / 采纳了哪一条」；过期的建议 id 一律不报。
+- `user_id` 是 IDE 登录态里的账号 id（客户端 `User.idOrDefault`），**JWT 里没有**。插件和 IDE 登录时
+  一样调 `POST {consoleHost}/cloudide/api/v3/trae/GetUserInfo`（请求头 `x-cloudide-token`，空 body），
+  取 `Data.UserInfo.UserID`，每个 JWT 只问一次。`cueUserId` / `TRAE_USER_ID` 只是覆盖这个 id；
+  不要填租户 id（`TenantID`）或 TEA 的 device id / 匿名 uuid。
+- 同一个回答里的 `Data.PrivacyMode` 打开时，**什么都不报**（和 IDE 的隐私模式闸门一致），配了 `cueUserId`
+  也一样。GetUserInfo 失败时这一条不报，只在日志里记一行。
+- `code_gen_shown` 的 payload 只带 `resp_id` / `type` / `conversation_id`，字段是按 accept 的结构推的，
+  未对照真实客户端抓包。
+
+不想上报（例如把 tgz 发给别人、对方不希望计入）时，在 profile 的 `cordis.patch.yml` 里关掉：
+
+```yaml
+- id: trae2api
+  config:
+    reportCue: false
+```
+
+> 注意：这些是聊天里的「下一句建议」，按 `code_gen_*` 报上去后会和真正的代码补全混在一起计数，
+> 企业控制台里的 Cue 用量 / 采纳率会因此变化。
 
 ## 已知限制
 

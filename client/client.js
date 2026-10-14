@@ -14,6 +14,9 @@
  *
  * The remaining quota also shows as a small chip next to the composer's model
  * picker (slot `conversation.input.right`) while a Trae model is selected.
+ *
+ * After each Trae answer the empty composer shows a suggested next message as
+ * ghost text (slot `conversation.input.overlay`); Tab takes it.
  */
 window.__ModuleLoader__.load({
   id: 'dsh-trae2api',
@@ -45,6 +48,33 @@ window.__ModuleLoader__.load({
     const QUOTA_ROUTE = '/api/dsh-trae2api/quota'
     /** How often a visible chip re-reads the quota. */
     const QUOTA_POLL_MS = 5 * 60_000
+    /** Host route serving next-input suggestions (see SUGGESTION_ROUTE in src/index.ts). */
+    const SUGGESTION_ROUTE = '/api/dsh-trae2api/suggestion'
+    /** How long a just-ended turn waits for its suggestion. */
+    const SUGGESTION_WAIT_MS = 20_000
+    /** On the composer card while a suggestion shows: hides the real placeholder. */
+    const SUGGEST_ATTR = 'data-trae-suggest'
+    const SUGGEST_GHOST_ATTR = 'data-trae-suggest-ghost'
+    /** Host route the composer reports shown / accepted suggestions to (SUGGESTION_EVENT_ROUTE). */
+    const SUGGESTION_EVENT_ROUTE = '/api/dsh-trae2api/suggestion/event'
+    /** Per session, the `at` of the suggestion the user accepted or typed past. */
+    const dismissedSuggestions = new Map()
+    /**
+     * Fire-and-forget: the host dedupes, times and decides whether anything is
+     * reported (Cue reporting is off unless configured).
+     */
+    function reportSuggestion(session, id, action) {
+      fetch(SUGGESTION_EVENT_ROUTE.slice(1), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify({ session, id, action }),
+      }).catch(() => {})
+    }
+    const SUGGEST_CSS = [
+      `[data-composer-card][${SUGGEST_ATTR}] [data-composer-placeholder]{display:none!important}`,
+      // The real placeholder hides during IME composition; so does ours.
+      `[data-composer-composing]~[${SUGGEST_GHOST_ATTR}]{visibility:hidden}`,
+    ].join('\n')
 
     const zh = {
       title: 'Trae',
@@ -96,6 +126,7 @@ window.__ModuleLoader__.load({
       quotaFailed: '额度查询失败：',
       quotaChip: 'Trae 剩余 {percent}',
       quotaChipHint: '点击刷新',
+      suggestHint: '按 Tab 填入这条建议',
     }
     const en = {
       title: 'Trae',
@@ -147,6 +178,7 @@ window.__ModuleLoader__.load({
       quotaFailed: 'Quota check failed: ',
       quotaChip: 'Trae {percent} left',
       quotaChipHint: 'Click to refresh',
+      suggestHint: 'Press Tab to use this suggestion',
     }
 
     /** Minimal uSES-compatible snapshot store — the shape slot `hooks` bind to. */
@@ -616,6 +648,127 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Next-input suggestion, the browser end of src/trae/suggest.ts: when a
+     * turn ends, ask the host what the user will probably type next and show
+     * it as ghost text in the empty composer, in the placeholder's place.
+     * Tab takes it into the draft; typing anything else dismisses it.
+     *
+     * The composer exposes no ghost-text seat, so this rides the session's
+     * `conversation.input.overlay` entry: it finds its own composer card,
+     * hides the real placeholder while a suggestion shows, and portals a
+     * look-alike (same class, so same position and colour) next to it. If the
+     * card's structure ever differs, nothing is found and nothing shows.
+     */
+    function SuggestionGhost(props) {
+      const { t, sessionId, inputActions } = props
+      const running = props.useSession(s => s.running) ?? false
+      const draft = props.useInput(s => s.draft ?? '')
+      const phase = props.useInput(s => s.phase)
+      const [suggestion, setSuggestion] = React.useState(null)
+      const probe = React.useRef(null)
+      const [card, setCard] = React.useState(null)
+      const [seat, setSeat] = React.useState(null)
+
+      React.useLayoutEffect(() => { setCard(probe.current?.closest('[data-composer-card]') ?? null) }, [])
+
+      // The placeholder comes and goes with the draft; track where it sits.
+      React.useEffect(() => {
+        if (!card) return undefined
+        const read = () => {
+          const placeholder = card.querySelector('[data-composer-placeholder]')
+          const next = placeholder?.parentElement ? { parent: placeholder.parentElement, className: placeholder.className } : null
+          setSeat(prev => prev?.parent === next?.parent && prev?.className === next?.className ? prev : next)
+        }
+        read()
+        const observer = new MutationObserver(read)
+        observer.observe(card, { childList: true, subtree: true })
+        return () => { observer.disconnect() }
+      }, [card])
+
+      // Ask once a turn ends (waiting while the host still works it out), and
+      // once on mount so switching back to a session shows what it had.
+      const wasRunning = React.useRef(running)
+      React.useEffect(() => {
+        const ended = wasRunning.current && !running
+        wasRunning.current = running
+        if (running) { setSuggestion(null); return undefined }
+        const abort = new AbortController()
+        const wait = ended ? SUGGESTION_WAIT_MS : 0
+        fetch(`${SUGGESTION_ROUTE.slice(1)}?session=${encodeURIComponent(sessionId)}&wait=${wait}`, {
+          headers: { accept: 'application/json' }, signal: abort.signal,
+        })
+          .then(response => response.ok ? response.json() : null)
+          .then((body) => {
+            const value = body?.ok ? body.value : null
+            if (abort.signal.aborted) return
+            if (!value || !value.text || dismissedSuggestions.get(sessionId) === value.at) setSuggestion(null)
+            else setSuggestion(value)
+          })
+          .catch(() => {})
+        return () => { abort.abort() }
+      }, [running, sessionId])
+
+      // Typing your own message means the suggestion was not it.
+      React.useEffect(() => {
+        if (!suggestion || draft === '') return
+        dismissedSuggestions.set(sessionId, suggestion.at)
+        setSuggestion(null)
+      }, [draft])
+
+      const visible = suggestion !== null && !running && draft === '' && (phase === undefined || phase === 'plain') && seat !== null
+
+      // Tell the host it was actually on screen; it counts each suggestion once.
+      React.useEffect(() => {
+        if (visible && suggestion.id) reportSuggestion(sessionId, suggestion.id, 'shown')
+      }, [visible, suggestion?.id])
+
+      // Tab, caught before the editor's own keymap sees it.
+      const accept = React.useRef(undefined)
+      accept.current = visible
+        ? () => {
+          dismissedSuggestions.set(sessionId, suggestion.at)
+          if (!inputActions.insertText(suggestion.text, inputActions.captureInsertion())) inputActions.setDraft(suggestion.text)
+          if (suggestion.id) reportSuggestion(sessionId, suggestion.id, 'accept')
+          setSuggestion(null)
+        }
+        : undefined
+      React.useEffect(() => {
+        if (!card) return undefined
+        const onKeyDown = (event) => {
+          if (event.key !== 'Tab' || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey || event.isComposing) return
+          if (!accept.current || !(event.target instanceof Element) || !event.target.closest('[contenteditable="true"]')) return
+          event.preventDefault()
+          event.stopPropagation()
+          accept.current()
+        }
+        card.addEventListener('keydown', onKeyDown, true)
+        return () => { card.removeEventListener('keydown', onKeyDown, true) }
+      }, [card])
+
+      React.useLayoutEffect(() => {
+        if (!card || !visible) return undefined
+        card.setAttribute(SUGGEST_ATTR, '')
+        return () => { card.removeAttribute(SUGGEST_ATTR) }
+      }, [card, visible])
+
+      const anchor = h('span', { ref: probe, hidden: true })
+      if (!visible || !createPortal) return anchor
+      return h(React.Fragment, null, anchor, createPortal(
+        h('div', { className: seat.className, [SUGGEST_GHOST_ATTR]: '', 'aria-hidden': true },
+          suggestion.text,
+          h('kbd', {
+            style: {
+              marginLeft: 8, padding: '0 5px', borderRadius: 4, fontSize: 11, lineHeight: '16px', fontFamily: 'inherit',
+              border: '1px solid var(--dsw-alias-border-l3)', color: 'var(--dsw-alias-label-secondary)', verticalAlign: 1,
+            },
+            title: t('suggestHint'),
+          }, 'Tab'),
+        ),
+        seat.parent,
+      ))
+    }
+
+    /**
      * The enterprise console login. Once it is saved and the quota is actually
      * coming back, this is settled business: it folds away to one line, and
      * opens again on demand (or on its own when something is missing or a
@@ -931,6 +1084,19 @@ window.__ModuleLoader__.load({
             },
           }, QuotaChip))
         })
+        // Next-input suggestion: ghost text in the empty composer, Tab takes it.
+        ctx.effect(() => {
+          const style = document.createElement('style')
+          style.dataset.plugin = PACKAGE
+          style.textContent = SUGGEST_CSS
+          document.head.appendChild(style)
+          return () => { style.remove() }
+        }, 'dsh-trae2api: suggestion styles')
+        ctx.slots.inject('conversation.input.overlay', () => ctx.slots.register({
+          name: 'conversation.input.overlay',
+          locale: NS,
+          inject: () => ({}),
+        }, SuggestionGhost))
         ctx.effect(
           () => ctx.remote.$on('credentials/reference-updated', (ref) => { card.refreshCredential(ref) }),
           'dsh-trae2api: credential updates',
