@@ -19,6 +19,7 @@ import {
   type ToolCallId,
 } from '@deepseek-ai/dsh-llm'
 import type { TraeAuth } from './trae/auth.ts'
+import type { FinishedTurn } from './trae/suggest.ts'
 import { EFFORT_NAMES, findModel, TRAE_ROUTES, type TraeEffort, type TraeRoute } from './trae/catalog.ts'
 import {
   approxTokens,
@@ -64,6 +65,10 @@ export interface AdapterOptions {
    * `[image omitted]` note instead of failing the turn.
    */
   resolveAttachments?: () => AttachmentStoreLike | undefined
+  /** A main-loop request (one carrying tools) is about to run in this session. */
+  onTurnStart?: (sessionId: string) => void
+  /** A main-loop request ended the turn with a plain answer, no tool calls. */
+  onTurnEnd?: (turn: FinishedTurn) => void
   logger: { info(...a: unknown[]): void; warn(...a: unknown[]): void }
 }
 
@@ -248,35 +253,21 @@ export class TraeAdapter extends LlmAdapter {
     return map
   }
 
-  async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
-    const route = findModel(options.model)
-    if (!route) {
-      throw new LlmError(`Trae：未知模型「${options.model}」。可用：${TRAE_ROUTES.map(r => r.id).join('、')}`, 'MODEL_NOT_FOUND')
-    }
-    const effort = effortFor(route, options.reasoningEffort ? String(options.reasoningEffort) : undefined)
-    const session = sessionUuid(options.sessionId ? String(options.sessionId) : undefined)
-    // Text-only routes keep the [image omitted] note even if an image slipped
-    // through: upstream answers a text-only model handed an image with
-    // `1210:messages.content.type 参数非法` wrapped in a fake rate-limit error.
-    const images = route.multimodal ? await this.prepareImages(options, options.signal) : undefined
+  /** The llm_raw_chat request body: one route, one thinking level, one upstream session. */
+  private requestBody(route: TraeRoute, effort: TraeEffort | undefined, session: string, messages: unknown[], tools: unknown[]): Record<string, unknown> {
     const body: Record<string, unknown> = {
       config_name: route.configName,
       model_name: route.key,
       user_input: '',
-      messages: toTraeMessages(options, images).map(m => ({
-        role: m.role,
-        content: wireContent(m),
-        ...m.tool_calls?.length ? { tool_calls: m.tool_calls } : {},
-        ...m.tool_call_id ? { tool_call_id: m.tool_call_id } : {},
-      })),
+      messages,
       session_id: session,
       conversation_id: session,
-      tools: toTraeTools(options.tools),
+      tools,
       access_type: 4,
     }
     if (route.maxMode) {
       // Max is expressed two ways by the two first-party clients: traecli swaps
-      // `model_name` to the `__max` key (done above), the IDE marks the turn
+      // `model_name` to the `__max` key (`route.key`), the IDE marks the turn
       // with a strategy plus the window it wants. Both are sent.
       body.model_auto_selection = { strategy: 'max' }
       body.context_window_size = route.contextWindow
@@ -288,7 +279,55 @@ export class TraeAdapter extends LlmAdapter {
       }
       body.reasoning_effort_level = effort
     }
-    const payload = JSON.stringify(body)
+    return body
+  }
+
+  /**
+   * One tool-less completion, collected rather than streamed — for side
+   * requests such as next-input suggestions. Runs on the route's lowest
+   * thinking level under a throwaway upstream session, so it never touches
+   * the conversation's own server-side state.
+   */
+  async complete(model: string, system: string, user: string, signal: AbortSignal): Promise<string> {
+    const route = findModel(model)
+    if (!route) throw new LlmError(`Trae：未知模型「${model}」`, 'MODEL_NOT_FOUND')
+    const messages = [
+      { role: 'system', content: [{ type: 'text', text: system }] },
+      { role: 'user', content: [{ type: 'text', text: user }] },
+    ]
+    const payload = JSON.stringify(this.requestBody(route, route.efforts[0], randomUUID(), messages, []))
+    let text = ''
+    let error: Record<string, unknown> | undefined
+    for await (const ev of this.once(payload, signal)) {
+      if (ev.event === 'output' && typeof ev.data.response === 'string') text += ev.data.response
+      else if (ev.event === 'error' || ev.event === 'biz_error') error ??= ev.data
+    }
+    if (!text && error) throw new LlmError(`Trae：${upstreamMessage(error)}`, classify(error).code)
+    return text
+  }
+
+  async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    const route = findModel(options.model)
+    if (!route) {
+      throw new LlmError(`Trae：未知模型「${options.model}」。可用：${TRAE_ROUTES.map(r => r.id).join('、')}`, 'MODEL_NOT_FOUND')
+    }
+    const effort = effortFor(route, options.reasoningEffort ? String(options.reasoningEffort) : undefined)
+    const session = sessionUuid(options.sessionId ? String(options.sessionId) : undefined)
+    // Only the agent loop's own requests carry tools; title, compaction and
+    // other side requests in the same session neither start nor end a turn.
+    const mainLoop = options.sessionId !== undefined && (options.tools?.length ?? 0) > 0
+    if (mainLoop) this.opts.onTurnStart?.(String(options.sessionId))
+    // Text-only routes keep the [image omitted] note even if an image slipped
+    // through: upstream answers a text-only model handed an image with
+    // `1210:messages.content.type 参数非法` wrapped in a fake rate-limit error.
+    const images = route.multimodal ? await this.prepareImages(options, options.signal) : undefined
+    const messages = toTraeMessages(options, images).map(m => ({
+      role: m.role,
+      content: wireContent(m),
+      ...m.tool_calls?.length ? { tool_calls: m.tool_calls } : {},
+      ...m.tool_call_id ? { tool_call_id: m.tool_call_id } : {},
+    }))
+    const payload = JSON.stringify(this.requestBody(route, effort, session, messages, toTraeTools(options.tools)))
     const schemas = new Map((options.tools ?? []).map(t => [t.name, t.parameters ?? {}]))
 
     // Our own controller so the guards can cut the upstream stream.
@@ -442,6 +481,13 @@ export class TraeAdapter extends LlmAdapter {
       else if (tools.size > 0 || recovered.length > 0) reason = { kind: 'tool-calls' }
       else if (upstreamFinish === 'length') reason = { kind: 'max-tokens' }
       else reason = { kind: 'stop' }
+      // Before `finish`, so the suggestion is already pending by the time the
+      // session reports the turn over and the composer asks for it.
+      if (mainLoop && reason.kind === 'stop' && text.trim()) {
+        try {
+          this.opts.onTurnEnd?.({ sessionId: String(options.sessionId), model: route.id, options, answer: text })
+        } catch { /* a suggestion must never fail the turn */ }
+      }
       yield { type: 'finish', reason }
     } finally {
       options.signal?.removeEventListener('abort', onAbort)

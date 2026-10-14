@@ -100,3 +100,42 @@ test('apply serves the remaining quota on a login-gated Connection route', async
     assert.match(failed.error, /无法连接 https:\/\/pay\.example.*offline/)
   } finally { globalThis.fetch = original }
 })
+
+test('apply serves next-input suggestions for finished Trae turns', async () => {
+  const routes = new Map()
+  const adapters = {}
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    effect() {}, on() {},
+    get: (name) => name === 'credentials' ? { resolve: async () => ({ value: 'eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQxMDI0NDQ4MDB9.c2ln' }) } : undefined,
+    inject: (deps, cb) => {
+      if (deps.includes('connection')) cb({ connection: { fetch: { register: (route) => { routes.set(route.path, route) } } } })
+    },
+    fiber: { entry: { options: { id: 'trae2api' } } },
+    llm: { registerAdapter: (r, a) => { for (const k of r) adapters[k] = a }, registerConfigurableProviders() {} },
+  }
+  plugin.apply(ctx, plugin.Config({}))
+  const route = routes.get(plugin.SUGGESTION_ROUTE)
+  assert.ok(route, 'suggestion route registered')
+  const ask = async (query) => (await route.fetch(new Request(`http://127.0.0.1${plugin.SUGGESTION_ROUTE}${query}`))).json()
+  assert.deepEqual(await ask('?session=s1'), { ok: true, value: null })
+
+  const sse = (text) => new Response(`event: output\ndata: ${JSON.stringify({ response: text })}\n\n`, { status: 200 })
+  const original = globalThis.fetch
+  const bodies = []
+  globalThis.fetch = async (url, init) => {
+    bodies.push(JSON.parse(init.body))
+    return sse(bodies.length === 1 ? 'Done, tests pass.' : '提交一下')
+  }
+  try {
+    for await (const _ of adapters.trae.stream({
+      model: 'GLM-5.3', sessionId: 's1', tools: [{ name: 'bash', description: '', parameters: {} }],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'fix it' }] }],
+    })) { /* consume */ }
+    const got = await ask('?session=s1&wait=2000')
+    assert.equal(got.ok, true)
+    assert.equal(got.value.text, '提交一下')
+    assert.equal(bodies.length, 2)
+    assert.match(bodies[1].messages[1].content[0].text, /fix it[\s\S]*Done, tests pass\./)
+  } finally { globalThis.fetch = original }
+})

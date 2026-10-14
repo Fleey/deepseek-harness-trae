@@ -19,6 +19,7 @@ import Schema from '@deepseek-ai/schemastery'
 import { TraeAdapter, traeHeaders, type TraeIdentity } from './adapter.ts'
 import { CLI_CLIENT_ID, TRAE_HOST, TraeAuth } from './trae/auth.ts'
 import { TraeQuota } from './trae/quota.ts'
+import { TraeSuggestions } from './trae/suggest.ts'
 import { TOB_CONSOLE_HOST, TobConsole } from './trae/tob.ts'
 
 export const name = 'dsh-trae2api'
@@ -27,6 +28,10 @@ export const inject = ['llm']
 const CLIENT_VERSION = '0.206.1-tob'
 /** Host route the browser half reads the remaining quota from. */
 export const QUOTA_ROUTE = '/api/dsh-trae2api/quota'
+/** Host route the browser half reads a session's next-input suggestion from. */
+export const SUGGESTION_ROUTE = '/api/dsh-trae2api/suggestion'
+/** Longest a suggestion request may wait for one still being generated. */
+const SUGGESTION_MAX_WAIT_MS = 30_000
 
 export interface Config {
   provider: string
@@ -51,6 +56,11 @@ export interface Config {
   readTimeoutMs: number
   emptyRetries: number
   loopGuardChars: number
+  /** Suggest the next input in the composer after each answer (Tab accepts). */
+  suggestions: boolean
+  /** Model asked for suggestions; empty = the model that answered. */
+  suggestModel: string
+  suggestTimeoutMs: number
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -73,6 +83,9 @@ export const Config: Schema<Config> = Schema.object({
   readTimeoutMs: Schema.natural().default(300_000),
   emptyRetries: Schema.natural().default(1),
   loopGuardChars: Schema.natural().default(600),
+  suggestions: Schema.boolean().default(true),
+  suggestModel: Schema.string().default(''),
+  suggestTimeoutMs: Schema.natural().default(20_000),
 }) as unknown as Schema<Config>
 
 type CredentialsService = { resolve(ref: string): Promise<{ value?: string } | undefined> }
@@ -139,7 +152,18 @@ export function apply(ctx: Context, config: Config): void {
     userAgent,
   }
 
-  const adapter = new TraeAdapter({
+  // Next-input suggestions ride on the adapter: it reports finished turns and
+  // runs the side completion. `adapter` is assigned right below.
+  const suggestions = config.suggestions
+    ? new TraeSuggestions({
+      complete: (model, system, user, signal) => adapter.complete(model, system, user, signal),
+      model: config.suggestModel,
+      timeoutMs: config.suggestTimeoutMs,
+      logger,
+    })
+    : undefined
+
+  const adapter: TraeAdapter = new TraeAdapter({
     displayName: config.displayName,
     host,
     identity,
@@ -154,6 +178,12 @@ export function apply(ctx: Context, config: Config): void {
     resolveAttachments: () => {
       try { return anyCtx.get('attachments') as import('./adapter.ts').AttachmentStoreLike | undefined } catch { return undefined }
     },
+    ...suggestions
+      ? {
+        onTurnStart: (sessionId: string) => { suggestions.turnStarted(sessionId) },
+        onTurnEnd: turn => { suggestions.turnEnded(turn) },
+      }
+      : {},
     logger,
   })
 
@@ -195,6 +225,22 @@ export function apply(ctx: Context, config: Config): void {
         },
       })
     } catch (error) { logger.warn('dsh-trae2api: quota route unavailable', error) }
+    // `?session=<id>&wait=<ms>`: the session's suggestion, waiting for one
+    // still in flight. `{ ok: true, value: null }` = nothing to suggest.
+    try {
+      child.connection.fetch.register({
+        path: SUGGESTION_ROUTE,
+        methods: ['GET'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          const params = new URL(request.url).searchParams
+          const sessionId = params.get('session') ?? ''
+          const wait = Math.min(SUGGESTION_MAX_WAIT_MS, Math.max(0, Number(params.get('wait')) || 0))
+          const value = suggestions && sessionId ? await suggestions.get(sessionId, wait) : null
+          return Response.json({ ok: true, value })
+        },
+      })
+    } catch (error) { logger.warn('dsh-trae2api: suggestion route unavailable', error) }
   })
 
   // Released automatically on unload.

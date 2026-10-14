@@ -579,3 +579,110 @@ test('quota fetch: an enterprise seat reads the console instead of the IDE API',
     assert.equal(tob.reads, 1, 'unchanged')
   } finally { restore2() }
 })
+
+// ------------------------------------------------------------ suggestions
+
+const sse = events => new Response(events.map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join(''), {
+  status: 200, headers: { 'content-type': 'text/event-stream' },
+})
+
+const turnOptions = (extra = {}) => ({
+  model: 'GLM-5.3',
+  sessionId: 's1',
+  tools: [{ name: 'bash', description: 'run', parameters: {} }],
+  messages: [
+    { role: 'user', content: [{ type: 'text', text: 'first ask' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'done one' }] },
+    { role: 'user', content: [{ type: 'text', text: 'fix the build' }] },
+  ],
+  ...extra,
+})
+
+async function drain(iterable) { for await (const _ of iterable) { /* consume */ } }
+
+test('suggestions: prompt carries the recent user messages and the answer, output is cleaned', async () => {
+  const { suggestPrompt, cleanSuggestion } = await import('../lib/testing.mjs')
+  const prompt = suggestPrompt({ options: turnOptions(), answer: 'Build fixed. Want me to run the tests?' })
+  assert.match(prompt, /first ask[\s\S]*fix the build[\s\S]*Want me to run the tests\?/)
+
+  assert.equal(cleanSuggestion('"好的，跑一下测试"\n'), '好的，跑一下测试')
+  assert.equal(cleanSuggestion('<think>hm</think>\n\nUser: run the tests\nsecond line'), 'run the tests')
+  assert.equal(cleanSuggestion('   \n'), '')
+  assert.equal(cleanSuggestion('x'.repeat(500)), '')
+})
+
+test('suggestions: a finished turn is waited for, a new turn drops it, a failure is just nothing', async () => {
+  const { TraeSuggestions } = await import('../lib/testing.mjs')
+  let release
+  const asked = []
+  const store = new TraeSuggestions({
+    complete: (model, system, user, signal) => {
+      asked.push(model)
+      return new Promise((resolve, reject) => {
+        release = resolve
+        signal.addEventListener('abort', () => reject(new Error('aborted')))
+      })
+    },
+    model: '', timeoutMs: 5000, logger: { warn() {} },
+  })
+  assert.equal(await store.get('s1', 0), null)
+
+  store.turnEnded({ sessionId: 's1', model: 'GLM-5.3', options: turnOptions(), answer: 'ok' })
+  assert.deepEqual(asked, ['GLM-5.3'])
+  const waiting = store.get('s1', 1000)
+  release('“run the tests”')
+  const got = await waiting
+  assert.equal(got.text, 'run the tests')
+
+  store.turnStarted('s1')
+  assert.equal(await store.get('s1', 0), null)
+
+  // Still in flight past the wait: answered as empty for now, not as an error.
+  store.turnEnded({ sessionId: 's1', model: 'GLM-5.3', options: turnOptions(), answer: 'ok' })
+  assert.equal((await store.get('s1', 10)).text, '')
+
+  // An empty answer suggests nothing at all.
+  store.turnEnded({ sessionId: 's2', model: 'GLM-5.3', options: turnOptions(), answer: '  ' })
+  assert.equal(await store.get('s2', 0), null)
+})
+
+test('adapter: only a main-loop turn that ends in prose reports itself; complete() is a tool-less side call', async () => {
+  const { TraeAdapter } = await import('../lib/testing.mjs')
+  const started = []
+  const ended = []
+  const adapter = new TraeAdapter({
+    displayName: 'Trae', host: 'https://h', identity: {},
+    auth: stubAuth(),
+    readTimeoutMs: 1000, emptyRetries: 0, loopGuardChars: 600,
+    onTurnStart: id => { started.push(id) },
+    onTurnEnd: turn => { ended.push(turn) },
+    logger: { info() {}, warn() {} },
+  })
+
+  let stub = stubFetch(() => sse([['output', { response: 'All fixed.' }], ['done', { finish_reason: 'stop' }]]))
+  try {
+    await drain(adapter.stream(turnOptions()))
+    // A side request (no tools, e.g. a title) neither starts nor ends a turn.
+    await drain(adapter.stream(turnOptions({ tools: [] })))
+  } finally { stub.restore() }
+  assert.deepEqual(started, ['s1'])
+  assert.equal(ended.length, 1)
+  assert.equal(ended[0].sessionId, 's1')
+  assert.equal(ended[0].model, 'GLM-5.3')
+  assert.equal(ended[0].answer, 'All fixed.')
+
+  // A turn that calls a tool is not over yet.
+  stub = stubFetch(() => sse([['output', { tool_calls: [{ index: 0, id: 'c1', function: { name: 'bash', arguments: '{}' } }] }]]))
+  try { await drain(adapter.stream(turnOptions())) } finally { stub.restore() }
+  assert.equal(ended.length, 1)
+
+  stub = stubFetch(() => sse([['output', { reasoning_content: 'thinking', response: 'run ' }], ['output', { response: 'the tests' }]]))
+  let text
+  try { text = await adapter.complete('GLM-5.3', 'sys', 'user', new AbortController().signal) } finally { stub.restore() }
+  assert.equal(text, 'run the tests')
+  const body = JSON.parse(stub.calls[0].body)
+  assert.deepEqual(body.tools, [])
+  assert.equal(body.reasoning_effort_level, 'light')
+  assert.notEqual(body.session_id, 's1')
+  assert.deepEqual(body.messages.map(m => m.role), ['system', 'user'])
+})
