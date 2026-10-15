@@ -126,8 +126,14 @@ export interface TraeRoute {
   contextWindow: number
   efforts: readonly TraeEffort[]
   defaultEffort?: TraeEffort
-  /** True when this is the Max variant: the request also carries the `max` strategy marker. */
+  /** True when this is the Max variant, however Max is expressed for it. */
   maxMode: boolean
+  /**
+   * True when Max rides the `max` strategy marker because the catalog ships no
+   * `max_key` for this model. With a `max_key` the `__max` key in `key` says it
+   * all — traecli sends no marker there, so neither do we.
+   */
+  maxMarker: boolean
   /** True when this model accepts images on user messages (upstream `image_url`). */
   multimodal: boolean
 }
@@ -149,6 +155,7 @@ export const TRAE_ROUTES: readonly TraeRoute[] = TRAE_MODELS.map((model) => {
     efforts: model.efforts,
     ...model.defaultEffort ? { defaultEffort: model.defaultEffort } : {},
     maxMode: max !== undefined,
+    maxMarker: max !== undefined && max.key === undefined,
     multimodal: model.multimodal ?? false,
   }
 })

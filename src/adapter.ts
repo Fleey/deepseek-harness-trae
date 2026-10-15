@@ -109,6 +109,15 @@ function* imageRefs(options: GenerateOptions): Generator<ImageBlock['attachment'
 const REQUEST_IMAGE_LONG_EDGE = 1024
 const REQUEST_IMAGE_MAX_BYTES = 2 * 1024 * 1024
 
+/**
+ * Output cap the backend grants a turn, the other half of the context window
+ * (168K + 32K = 200K on a `__dev` key, 936K + 64K = 1M on `__max`). Observed
+ * on a Kimi-K3 capture and applied to every route by its Max-ness; a model
+ * whose own cap turns out to differ wants its own catalog field.
+ */
+const OUTPUT_TOKENS = 32_000
+const MAX_OUTPUT_TOKENS = 64_000
+
 /** The identity headers every Trae API call carries (chat and quota alike). */
 export function traeHeaders(id: TraeIdentity, token: string, accept: string): Record<string, string> {
   return {
@@ -188,6 +197,12 @@ export class TraeAdapter extends LlmAdapter {
       // Hard-coded per model from the IDE capability table, so the loop plans
       // compaction against the window the backend actually enforces.
       context: { contextWindow: known?.contextWindow ?? 200_000 },
+      // The output half of that window: switching a route to its `__max` key
+      // doubles what the backend lets the model write. llm_raw_chat itself
+      // ignores `max_tokens`, so this is also the only cap `stream` can hold
+      // the turn to — without it the loop sends no budget and nothing cuts a
+      // runaway answer.
+      defaultMaxTokens: known?.maxMode ? MAX_OUTPUT_TOKENS : OUTPUT_TOKENS,
     }
     if (known && known.efforts.length > 0) {
       info.reasoning = {
@@ -256,19 +271,26 @@ export class TraeAdapter extends LlmAdapter {
   /** The llm_raw_chat request body: one route, one thinking level, one upstream session. */
   private requestBody(route: TraeRoute, effort: TraeEffort | undefined, session: string, messages: unknown[], tools: unknown[]): Record<string, unknown> {
     const body: Record<string, unknown> = {
+      function: 'chat',
       config_name: route.configName,
       model_name: route.key,
       user_input: '',
       messages,
       session_id: session,
       conversation_id: session,
+      // `use_prompt_cache_pool` is what buys the shared prefix cache; traecli
+      // sends it on every turn, and without it each turn pays full prompt price.
+      metadata: { agent_type: 'chat', use_prompt_cache_pool: true },
       tools,
+      mode_type: 0,
       access_type: 4,
     }
-    if (route.maxMode) {
-      // Max is expressed two ways by the two first-party clients: traecli swaps
-      // `model_name` to the `__max` key (`route.key`), the IDE marks the turn
-      // with a strategy plus the window it wants. Both are sent.
+    if (route.maxMarker) {
+      // Max without a catalog `max_key`: the standard key stays, so the turn
+      // needs the IDE's marker plus the window it wants to reach 1M. With a
+      // `max_key`, `model_name` is already the `__max` key and traecli sends
+      // neither field — matched here, so the two clients stay distinguishable
+      // only by what they genuinely differ on.
       body.model_auto_selection = { strategy: 'max' }
       body.context_window_size = route.contextWindow
     }
