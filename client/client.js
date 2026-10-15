@@ -125,6 +125,8 @@ window.__ModuleLoader__.load({
       quotaUnknown: 'Trae 返回了无法识别的额度格式。原始响应如下，可用于反馈：',
       quotaFailed: '额度查询失败：',
       quotaChip: 'Trae 剩余 {percent}',
+      quotaChipPack: '{name}：{detail}',
+      quotaChipTotal: '合计：{detail}',
       quotaChipHint: '点击刷新',
       suggestHint: '按 Tab 填入这条建议',
     }
@@ -177,6 +179,8 @@ window.__ModuleLoader__.load({
       quotaUnknown: 'Trae answered in a quota format this plugin does not recognise. The raw answer, for a bug report:',
       quotaFailed: 'Quota check failed: ',
       quotaChip: 'Trae {percent} left',
+      quotaChipPack: '{name}: {detail}',
+      quotaChipTotal: 'Total: {detail}',
       quotaChipHint: 'Click to refresh',
       suggestHint: 'Press Tab to use this suggestion',
     }
@@ -258,6 +262,18 @@ window.__ModuleLoader__.load({
         .replace('{remaining}', formatAmount(value.remaining, value.dollars))
         .replace('{limit}', formatAmount(value.limit, value.dollars))
         .replace('{percent}', formatPercent(remainingPercent(value) ?? 0))
+    }
+
+    /**
+     * What is left of one allowance, however that allowance is shaped: a
+     * finite limit reads as the usual remaining line, an unlimited pack says
+     * so, and a pack with no limit of this kind (limit 0) can only report
+     * what it has spent.
+     */
+    function packDetail(t, pack, dollars) {
+      if (pack.limit === null) return t('quotaUnlimited')
+      if (remainingPercent(pack) === null) return t('quotaUsed').replace('{used}', formatAmount(pack.used, dollars))
+      return remainingLine(t, { ...pack, dollars })
     }
 
     /** Settings form + credential + connection status for one card. */
@@ -627,12 +643,29 @@ window.__ModuleLoader__.load({
       const value = quota.value
       const percent = remainingPercent(value)
       if (!active || quota.phase === 'error' || !value || value.raw !== undefined || percent === null) return null
-      const details = [remainingLine(t, value), t('quotaUsed').replace('{used}', formatAmount(value.used, value.dollars))]
+      // Several allowances are several numbers: adding a top-up pack to the
+      // plan's own quota hides which one is about to run out, so each pack
+      // gets its line and the total follows only to explain the chip's figure.
+      const details = value.packs.length > 1
+        ? [
+            ...value.packs.map(pack => t('quotaChipPack')
+              .replace('{name}', pack.name)
+              .replace('{detail}', packDetail(t, pack, value.dollars))),
+            t('quotaChipTotal').replace('{detail}', remainingLine(t, value)),
+          ]
+        : [remainingLine(t, value), t('quotaUsed').replace('{used}', formatAmount(value.used, value.dollars))]
       if (value.endsAt !== undefined) details.push(t('quotaEnds').replace('{date}', formatDate(value.endsAt)))
       details.push(t('quotaChipHint'))
-      // Same bands as the card's meters, read off what is left rather than spent;
-      // a comfortable chip stays quiet grey instead of shouting green.
-      const tone = meterTone(100 - percent)
+      // The chip itself splits the same way, in pack order. A pack carrying no
+      // quota of this kind (limit 0) has no share to show and is left out, so
+      // one real allowance beside a free empty pack still reads as one figure.
+      const shares = value.packs.map(remainingPercent).filter(share => share !== null)
+      const figures = shares.length > 1 ? shares : [percent]
+      // Same bands as the card's meters, read off what is left rather than
+      // spent; a comfortable chip stays quiet grey instead of shouting green.
+      // Split, the colour follows the pack closest to empty — that is the one
+      // the user needs to notice, and an untouched top-up must not mask it.
+      const tone = meterTone(100 - Math.min(...figures))
       const color = tone === 'ok' ? 'var(--dsw-alias-label-secondary)' : TONE_COLOR[tone]
       return h(P.Tooltip, { label: h('div', { style: { whiteSpace: 'pre-line' } }, details.join('\n')), side: 'top' },
         h('button', {
@@ -643,7 +676,7 @@ window.__ModuleLoader__.load({
             color, fontSize: 12, lineHeight: '20px', whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums',
             opacity: quota.phase === 'loading' ? 0.6 : 1,
           },
-        }, t('quotaChip').replace('{percent}', formatPercent(percent))),
+        }, t('quotaChip').replace('{percent}', figures.map(formatPercent).join(' / '))),
       )
     }
 
