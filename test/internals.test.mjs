@@ -39,6 +39,8 @@ test('catalog: a Max-capable model is listed once, already at 1M', () => {
   assert.equal(glm.key, 'glm-5.3__max')
   assert.equal(glm.contextWindow, 1000000)
   assert.equal(glm.maxMode, true)
+  // The key already says Max, so the request carries no strategy marker.
+  assert.equal(glm.maxMarker, false)
   assert.equal(findModel('DeepSeek-V4.1-Flash').key, 'DeepSeek-V4.1-Flash__max')
 
   // Without one: keep the standard key, Max rides the strategy marker.
@@ -46,6 +48,9 @@ test('catalog: a Max-capable model is listed once, already at 1M', () => {
   assert.equal(doubao.key, 'Doubao-Seed-Evolving__dev')
   assert.equal(doubao.contextWindow, 1000000)
   assert.equal(doubao.maxMode, true)
+  assert.equal(doubao.maxMarker, true)
+  // Only those two reach 1M through the marker; every other Max route has a key.
+  assert.deepEqual(TRAE_ROUTES.filter(r => r.maxMarker).map(r => r.id), ['Doubao-Seed-Evolving', 'Doubao-Seed-2.1-Pro-0915'])
 
   // The client table says these have no Max, even though the catalog ships a
   // max_key for two of them — so they stay at their standard window.
@@ -230,6 +235,13 @@ test('adapter: the picker gets every route, each with its own window and levels'
   // What the agent loop plans compaction against.
   const glm = await adapter.resolveModel('trae', 'GLM-5.3')
   assert.equal(glm.context.contextWindow, 1000000)
+  // The output half of the window: a Max route writes up to 64K, the rest 32K.
+  assert.equal(glm.defaultMaxTokens, 64000)
+  assert.equal((await adapter.resolveModel('trae', 'GLM-5.2')).defaultMaxTokens, 32000)
+  // An id the catalog does not know falls back to the smaller pair.
+  const unknown = await adapter.resolveModel('trae', 'nope')
+  assert.equal(unknown.context.contextWindow, 200000)
+  assert.equal(unknown.defaultMaxTokens, 32000)
   assert.deepEqual(glm.reasoning.efforts.map(e => e.id), ['light', 'high', 'extra_high'])
   assert.equal(glm.reasoning.defaultEffort, 'high')
   // Text-only model resolved by alias keeps its modality honest.
@@ -685,6 +697,47 @@ test('adapter: only a main-loop turn that ends in prose reports itself; complete
   assert.equal(body.reasoning_effort_level, 'light')
   assert.notEqual(body.session_id, 's1')
   assert.deepEqual(body.messages.map(m => m.role), ['system', 'user'])
+})
+
+test('adapter: the body matches a traecli capture; the max marker rides only the keyless Max routes', async () => {
+  const { TraeAdapter } = await import('../lib/testing.mjs')
+  const adapter = new TraeAdapter({
+    displayName: 'Trae', host: 'https://h', identity: {}, auth: stubAuth(),
+    readTimeoutMs: 1000, emptyRetries: 0, loopGuardChars: 600,
+    logger: { info() {}, warn() {} },
+  })
+  const bodyFor = async (extra) => {
+    const stub = stubFetch(() => sse([['output', { response: 'ok' }], ['done', { finish_reason: 'stop' }]]))
+    try { await drain(adapter.stream(turnOptions(extra))) } finally { stub.restore() }
+    return JSON.parse(stub.calls[0].body)
+  }
+
+  // A Max route with a catalog max_key: the `__max` key carries Max on its
+  // own, exactly as traecli sends it — no strategy marker, no window.
+  const kimi = await bodyFor({ model: 'Kimi-K3', reasoningEffort: 'extra_high' })
+  assert.equal(kimi.function, 'chat')
+  assert.equal(kimi.config_name, 'kimi-k3')
+  assert.equal(kimi.model_name, 'kimi-k3__max')
+  assert.equal(kimi.user_input, '')
+  assert.deepEqual(kimi.metadata, { agent_type: 'chat', use_prompt_cache_pool: true })
+  assert.equal(kimi.mode_type, 0)
+  assert.equal(kimi.access_type, 4)
+  assert.equal(kimi.reasoning_effort_level, 'extra_high')
+  assert.equal(kimi.model_auto_selection, undefined)
+  assert.equal(kimi.context_window_size, undefined)
+
+  // Max without a max_key: the standard key stays, so the marker and the
+  // window are the only things asking for 1M.
+  const doubao = await bodyFor({ model: 'Doubao-Seed-Evolving' })
+  assert.equal(doubao.model_name, 'Doubao-Seed-Evolving__dev')
+  assert.deepEqual(doubao.model_auto_selection, { strategy: 'max' })
+  assert.equal(doubao.context_window_size, 1000000)
+
+  // No Max at all: neither field, whatever the window.
+  const plain = await bodyFor({ model: 'GLM-5.2' })
+  assert.equal(plain.model_name, 'glm-5.2__dev')
+  assert.equal(plain.model_auto_selection, undefined)
+  assert.equal(plain.context_window_size, undefined)
 })
 
 test('cue: report/clients gets multipart `body` with env_metadata and stringified payloads', async () => {
