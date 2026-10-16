@@ -18,6 +18,7 @@ import type {} from '@deepseek-ai/dsh-llm'
 import Schema from '@deepseek-ai/schemastery'
 import { TraeAdapter, traeHeaders, type TraeIdentity } from './adapter.ts'
 import { CLI_CLIENT_ID, TRAE_HOST, TraeAuth } from './trae/auth.ts'
+import { CATALOG_BODY, CATALOG_PATH, MODELS_CACHE_FILE, TraeCatalog, type CatalogOrigin } from './trae/catalog-source.ts'
 import { TraeCueReporter } from './trae/cue.ts'
 import { TraeUserInfo } from './trae/user.ts'
 import { TraeQuota } from './trae/quota.ts'
@@ -30,6 +31,8 @@ export const inject = ['llm']
 const CLIENT_VERSION = '0.206.1-tob'
 /** Host route the browser half reads the remaining quota from. */
 export const QUOTA_ROUTE = '/api/dsh-trae2api/quota'
+/** Host route serving the model catalog and its origin; `?refresh` re-asks upstream. */
+export const CATALOG_ROUTE = '/api/dsh-trae2api/catalog'
 /** Host route the browser half reads a session's next-input suggestion from. */
 export const SUGGESTION_ROUTE = '/api/dsh-trae2api/suggestion'
 /** Longest a suggestion request may wait for one still being generated. */
@@ -59,6 +62,13 @@ export interface Config {
   appId: string
   ideVersionCode: string
   clientVersion: string
+  /**
+   * Where the model list comes from: `auto` asks Trae, then traecli's cache
+   * file, then the built-in table; the other values pin it to one source.
+   */
+  catalogSource: CatalogOrigin | 'auto'
+  /** traecli's model cache; empty = `~/.trae/cli/models_cache.json`. */
+  modelsCacheFile: string
   readTimeoutMs: number
   emptyRetries: number
   loopGuardChars: number
@@ -90,6 +100,10 @@ export const Config: Schema<Config> = Schema.object({
   appId: Schema.string().default('7b3f9dc2-8a4e-5c6d-2f1b-9e4a3c5b7df0'),
   ideVersionCode: Schema.string().default('20260908'),
   clientVersion: Schema.string().default(CLIENT_VERSION),
+  catalogSource: Schema.union(['auto', 'upstream', 'cache', 'builtin'] as const).default('auto')
+    .description('模型目录来源：auto = 上游 → traecli 缓存 → 内置'),
+  modelsCacheFile: Schema.string().default('')
+    .description('traecli 模型缓存路径；空 = ~/.trae/cli/models_cache.json'),
   readTimeoutMs: Schema.natural().default(300_000),
   emptyRetries: Schema.natural().default(1),
   loopGuardChars: Schema.natural().default(600),
@@ -164,6 +178,40 @@ export function apply(ctx: Context, config: Config): void {
     userAgent,
   }
 
+  /**
+   * The live model catalog. Trae retires models without warning — one that is
+   * gone upstream answers every turn with `4023 the model is unknown` — so the
+   * list is asked for rather than shipped: `batch_get_detail_param` first (the
+   * call traecli makes), then traecli's own cache file, then the built-in
+   * table. Refreshed once per plugin start, again whenever the PAT changes,
+   * and on demand from the card's 刷新 button.
+   */
+  const catalog = new TraeCatalog({
+    mode: config.catalogSource,
+    cacheFile: config.modelsCacheFile || MODELS_CACHE_FILE,
+    ...config.catalogSource === 'builtin' ? {} : {
+      fetchUpstream: async () => {
+        const body = JSON.stringify(CATALOG_BODY)
+        let session = await auth.get()
+        for (let attempt = 0; ; attempt++) {
+          const res = await fetch(`${host}${CATALOG_PATH}`, {
+            method: 'POST',
+            headers: traeHeaders(identity, session.token, 'application/json'),
+            body,
+          })
+          if ((res.status === 401 || res.status === 403) && attempt === 0) {
+            await res.body?.cancel()
+            session = await auth.get(true)
+            continue
+          }
+          if (!res.ok) throw new Error(`HTTP ${res.status}：${(await res.text()).slice(0, 200)}`)
+          return await res.json()
+        }
+      },
+    },
+    logger,
+  })
+
   // The account as the IDE login sees it: user id for reports, privacy gate.
   const userInfo = new TraeUserInfo({ host: config.consoleHost, auth, userAgent })
   // On by default, like the IDE's own reporting. The user id comes from
@@ -198,6 +246,7 @@ export function apply(ctx: Context, config: Config): void {
     host,
     identity,
     auth,
+    catalog,
     readTimeoutMs: config.readTimeoutMs,
     emptyRetries: config.emptyRetries,
     loopGuardChars: config.loopGuardChars,
@@ -228,12 +277,17 @@ export function apply(ctx: Context, config: Config): void {
 
   // A PAT saved from the UI changes no config field; drop the cached JWT.
   ctx.on('credentials/reference-updated' as never, ((ref: string) => {
-    if (ref === config.patEnv.get()) { auth.reset(); quota.reset(); userInfo.reset() }
+    if (ref === config.patEnv.get()) { auth.reset(); quota.reset(); userInfo.reset(); catalog.reset() }
     // The console password is its own credential; a new one invalidates the
     // cached console session, not the JWT.
     if (ref === config.consolePasswordEnv.get() || ref === config.consoleEmailEnv.get()) { tob.reset(); quota.reset() }
   }) as never)
-  ctx.on('loader/volatile-update' as never, (() => { auth.reset(); quota.reset(); userInfo.reset() }) as never)
+  ctx.on('loader/volatile-update' as never, (() => { auth.reset(); quota.reset(); userInfo.reset(); catalog.reset() }) as never)
+
+  // One catalog refresh per plugin start, without waiting for the first turn:
+  // reloading the plugin is how a user asks for a fresh model list. A failure
+  // is already logged by the store, which keeps serving the previous answer.
+  void catalog.ready().catch(() => { /* logged in the store */ })
 
   // Remaining quota for the card and the composer chip. A Connection route
   // rather than a bare webServer one: it sits behind the same Host/Origin
@@ -255,6 +309,37 @@ export function apply(ctx: Context, config: Config): void {
         },
       })
     } catch (error) { logger.warn('dsh-trae2api: quota route unavailable', error) }
+    // The model list as this plugin currently sees it, with where it came from
+    // and when. `?refresh` re-asks Trae instead of answering from the snapshot
+    // taken at startup — the manual half of "reload the plugin to reload the
+    // models".
+    try {
+      child.connection.fetch.register({
+        path: CATALOG_ROUTE,
+        methods: ['GET'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          const force = new URL(request.url).searchParams.has('refresh')
+          try {
+            const snapshot = force ? await catalog.refresh(true) : await catalog.ready()
+            return Response.json({
+              ok: true,
+              value: {
+                origin: snapshot.origin,
+                at: snapshot.at,
+                ...snapshot.note ? { note: snapshot.note } : {},
+                models: snapshot.routes.map(r => ({
+                  id: r.id, key: r.key, contextWindow: r.contextWindow,
+                  maxMode: r.maxMode, multimodal: r.multimodal, efforts: r.efforts,
+                })),
+              },
+            })
+          } catch (error) {
+            return Response.json({ ok: false, error: error instanceof Error ? error.message : String(error) })
+          }
+        },
+      })
+    } catch (error) { logger.warn('dsh-trae2api: catalog route unavailable', error) }
     // `?session=<id>&wait=<ms>`: the session's suggestion, waiting for one
     // still in flight. `{ ok: true, value: null }` = nothing to suggest.
     try {

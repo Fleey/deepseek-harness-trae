@@ -1,6 +1,9 @@
 // Entry for `npm run build:test`: re-exports the pure internals the unit tests
 // in internals.test.mjs exercise, bundled to lib/testing.mjs.
-export { TRAE_MODELS, TRAE_ROUTES, findModel } from '../src/trae/catalog.ts'
+export { TRAE_MODELS, TRAE_ROUTES, findModel, toRoutes } from '../src/trae/catalog.ts'
+export {
+  parseDetailParams, parseModelsCache, TraeCatalog, CATALOG_PATH, CATALOG_BODY, MODELS_CACHE_FILE, BUILTIN_SNAPSHOT,
+} from '../src/trae/catalog-source.ts'
 export {
   toTraeMessages, repairToolHistory, traeEvents, wireContent, LoopDetector, TextToolCallSniffer, sessionUuid, classify, approxTokens,
 } from '../src/trae/wire.ts'

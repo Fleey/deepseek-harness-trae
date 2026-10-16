@@ -1,26 +1,31 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import {
-  TRAE_MODELS, TRAE_ROUTES, findModel, toTraeMessages, repairToolHistory, traeEvents, wireContent,
+  TRAE_MODELS, TRAE_ROUTES, findModel, toRoutes,
+  parseDetailParams, parseModelsCache, TraeCatalog,
+  toTraeMessages, repairToolHistory, traeEvents, wireContent,
   LoopDetector, TextToolCallSniffer, sessionUuid, classify, approxTokens, decodeJwt, parseExpiry,
   parseQuota, TraeQuota, QUOTA_PATHS, enterpriseTenant,
   parseTobQuota, TobConsole, TOB_LOGIN_PATH, TOB_QUOTA_PATH, TOB_USAGE_PATH, TOB_SESSION_COOKIE,
 } from '../lib/testing.mjs'
 
-test('catalog: windows and levels come from the TRAE SOLO CN client table', () => {
-  assert.equal(TRAE_MODELS.length, 24)
+test('catalog: the built-in table matches the live catalog it was synced with', () => {
+  assert.equal(TRAE_MODELS.length, 20)
   // One entry per model, no separate small/large pair.
-  assert.equal(TRAE_ROUTES.length, 24)
+  assert.equal(TRAE_ROUTES.length, 20)
   const glm = findModel('GLM-5.3')
-  // The live client spells the ladder light/high/extra_high (轻/高/极高),
-  // which is what the picker shows and what goes upstream.
+  // The picker's ladder is light/high/extra_high (轻/高/极高), which is what
+  // the live catalog's `reasoning_effort_config.options` spells too.
   assert.deepEqual(glm.efforts, ['light', 'high', 'extra_high'])
   assert.equal(findModel('Kimi-K3').defaultEffort, 'extra_high')
-  // Windows for the models with no Max come from the client table.
-  assert.equal(findModel('Doubao-Seed-2.1-Turbo').contextWindow, 256000)   // catalog claimed 200K
-  assert.equal(findModel('GLM-5.2').contextWindow, 200000)
-  // Described only by the catalog, so it keeps the catalog's vocabulary.
-  assert.deepEqual(findModel('GLM-5.2').efforts, ['high', 'xhigh'])
+  // Windows of the models with no Max, and the Doubao family's smaller output
+  // cap — both as the live catalog reports them (the 10-13 client table this
+  // file used to follow claimed 256K for the Turbo).
+  assert.equal(findModel('Doubao-Seed-2.1-Turbo').contextWindow, 200000)
+  assert.equal(findModel('Doubao-Seed-Evolving').outputTokens, 16000)
+  assert.equal(findModel('MiniMax-M2.7').contextWindow, 200000)
+  assert.deepEqual(findModel('GLM-5.2').efforts, ['high', 'extra_high'])
   assert.deepEqual(findModel('MiniMax-M3').efforts, [])
   // Alias lookup on config name and on either backend key.
   assert.equal(findModel('glm-5.3__dev'), glm)
@@ -31,10 +36,11 @@ test('catalog: windows and levels come from the TRAE SOLO CN client table', () =
 
 test('catalog: a Max-capable model is listed once, already at 1M', () => {
   const maxRoutes = TRAE_ROUTES.filter(r => r.maxMode)
-  assert.equal(maxRoutes.length, 16)
+  assert.equal(maxRoutes.length, 14)
   assert.ok(maxRoutes.every(r => r.contextWindow === 1000000))
 
-  // With a catalog max_key: route to that key.
+  // With a catalog max_key: route to that key. Every current model is this
+  // kind, so no route carries the IDE's strategy marker.
   const glm = findModel('GLM-5.3')
   assert.equal(glm.key, 'glm-5.3__max')
   assert.equal(glm.contextWindow, 1000000)
@@ -42,19 +48,11 @@ test('catalog: a Max-capable model is listed once, already at 1M', () => {
   // The key already says Max, so the request carries no strategy marker.
   assert.equal(glm.maxMarker, false)
   assert.equal(findModel('DeepSeek-V4.1-Flash').key, 'DeepSeek-V4.1-Flash__max')
+  assert.deepEqual(TRAE_ROUTES.filter(r => r.maxMarker).map(r => r.id), [])
 
-  // Without one: keep the standard key, Max rides the strategy marker.
-  const doubao = findModel('Doubao-Seed-Evolving')
-  assert.equal(doubao.key, 'Doubao-Seed-Evolving__dev')
-  assert.equal(doubao.contextWindow, 1000000)
-  assert.equal(doubao.maxMode, true)
-  assert.equal(doubao.maxMarker, true)
-  // Only those two reach 1M through the marker; every other Max route has a key.
-  assert.deepEqual(TRAE_ROUTES.filter(r => r.maxMarker).map(r => r.id), ['Doubao-Seed-Evolving', 'Doubao-Seed-2.1-Pro-0915'])
-
-  // The client table says these have no Max, even though the catalog ships a
-  // max_key for two of them — so they stay at their standard window.
-  for (const [id, window] of [['GLM-5.2', 200000], ['DeepSeek-V4-Pro', 200000], ['Doubao-Seed-Code', 184000]]) {
+  // The Doubao family has no Max: its `__max` keys open the same window, which
+  // the live catalog states as `max_mode: false`.
+  for (const [id, window] of [['Doubao-Seed-Evolving', 184000], ['Doubao-Seed-2.1-Pro-0915', 200000], ['Doubao-Seed-Code', 184000]]) {
     const route = findModel(id)
     assert.equal(route.maxMode, false, id)
     assert.equal(route.contextWindow, window, id)
@@ -62,15 +60,142 @@ test('catalog: a Max-capable model is listed once, already at 1M', () => {
   }
 })
 
+test('catalog: the marker path still works for a source that describes Max that way', () => {
+  // No current model needs it, but a models_cache.json without a `max_key`
+  // can still describe Max as the IDE does: standard key plus the strategy
+  // marker and the window it wants.
+  const [route] = toRoutes([
+    { id: 'Marker-Only', configName: 'marker-only', key: 'marker-only__dev', contextWindow: 184_000, efforts: [], max: { contextWindow: 1_000_000 } },
+  ])
+  assert.equal(route.key, 'marker-only__dev')
+  assert.equal(route.contextWindow, 1000000)
+  assert.equal(route.maxMode, true)
+  assert.equal(route.maxMarker, true)
+})
+
 test('catalog: multimodal flags come from the client capability table, not traecli', () => {
   // traecli reports input_modalities ["text","image"] for *every* model — a
   // Codex-fork constant. Only the client table's `multimodal` is real, and
   // these are the models it marks text-only.
-  const textOnly = new Set(['GLM-5.3', 'GLM-5.2', 'MiniMax-M2.7', 'DeepSeek-V4-Pro 正式版', 'DeepSeek-V4-Pro', 'DeepSeek-V4-Flash 正式版'])
+  const textOnly = new Set(['GLM-5.3', 'GLM-5.2', 'MiniMax-M2.7', 'DeepSeek-V4-Pro 正式版', 'DeepSeek-V4-Flash 正式版'])
   for (const route of TRAE_ROUTES) {
     assert.equal(route.multimodal, !textOnly.has(route.id), route.id)
   }
-  assert.equal(TRAE_ROUTES.filter(r => r.multimodal).length, 18)
+  assert.equal(TRAE_ROUTES.filter(r => r.multimodal).length, 15)
+})
+
+const fixture = (name) => JSON.parse(readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8'))
+
+test('catalog source: the live ToB catalog, with the retired models left out', () => {
+  // Trimmed capture of POST /api/ide/v1/batch_get_detail_param (the call
+  // traecli labels "Trae ToB batch model config"), prompts and icons removed.
+  const models = parseDetailParams(fixture('detail_param.json'))
+  // qwen-3.7-plus is still in the response — flagged `is_invisible_to_user`
+  // with no `model_detail_list`, which is what `4023 the model is unknown`
+  // looks like from the outside. `summary` is the compaction config and
+  // `custom_model_placeholder` the "add your own" row; none is a model.
+  assert.deepEqual(models.map(m => m.id), ['Doubao-Seed-Evolving', 'GLM-5.3', 'MiniMax-M3', 'DeepSeek-V4-Flash 正式版'])
+
+  // A `__max` key whose window is the same 184K is not a Max variant.
+  const doubao = models[0]
+  assert.equal(doubao.max, undefined)
+  assert.equal(doubao.contextWindow, 184_000)
+  assert.equal(doubao.outputTokens, 16_000)
+  assert.deepEqual(doubao.efforts, ['light', 'high'])
+  assert.equal(doubao.defaultEffort, 'high')
+  assert.equal(doubao.multimodal, true)
+
+  const glm = models[1]
+  assert.deepEqual(glm.max, { key: 'glm-5.3__max', contextWindow: 1_000_000, outputTokens: 64_000 })
+  assert.equal(glm.outputTokens, 32_000)
+  assert.deepEqual(glm.efforts, ['light', 'high', 'extra_high'])
+  assert.equal(glm.multimodal, false)
+  assert.deepEqual(models[2].efforts, [])
+  // The backend key need not follow the config name.
+  assert.equal(models[3].key, 'deepseek_v4_flash_official__dev')
+
+  const routes = toRoutes(models)
+  assert.equal(routes[1].key, 'glm-5.3__max')
+  assert.equal(routes[1].maxMode, true)
+  assert.equal(routes[1].maxMarker, false)
+  assert.equal(routes[1].outputTokens, 64_000)
+  assert.equal(routes[0].outputTokens, 16_000)
+})
+
+test("catalog source: traecli's cache file, image support from the built-in table", () => {
+  const models = parseModelsCache(fixture('models_cache.json'))
+  assert.deepEqual(models.map(m => m.configName), ['Doubao-Seed-Evolving', 'glm-5.3', 'glm-5.2', 'minimax-m3'])
+  // The cache spells the ladder low/high/xhigh and carries the client's own
+  // translation to the 轻/高/极高 buttons; that translation is applied here.
+  assert.deepEqual(models[0].efforts, ['light', 'high'])
+  assert.deepEqual(models[1].efforts, ['light', 'high', 'extra_high'])
+  assert.equal(models[1].defaultEffort, 'high')
+  // `input_modalities` is ["text","image"] for every model, so it says nothing;
+  // the flag comes from the built-in table instead.
+  assert.equal(models[0].multimodal, true)
+  assert.equal(models[1].multimodal, false)
+  // Keys and both windows live under business_metadata.variants.
+  assert.equal(models[1].key, 'glm-5.3__dev')
+  assert.deepEqual(models[1].max, { key: 'glm-5.3__max', contextWindow: 1_000_000 })
+  // GLM-5.2 ships a max_key the 10-13 client table claimed it did not have.
+  // A live source outranks that table, so Max is on here.
+  assert.equal(models[2].max?.key, 'glm-5.2__max')
+})
+
+test('catalog store: upstream, then the cache file, then the built-in table', async () => {
+  const upstream = fixture('detail_param.json')
+  let fetches = 0
+
+  const live = new TraeCatalog({ cacheFile: '', fetchUpstream: async () => { fetches++; return upstream } })
+  const first = await live.ready()
+  assert.equal(first.origin, 'upstream')
+  assert.equal(first.routes.length, 4)
+  assert.equal(first.find('glm-5.3__dev').id, 'GLM-5.3')
+  assert.equal(first.find('deepseek-v4-flash 正式版').key, 'deepseek_v4_flash_official__max')
+  // One refresh per plugin start; `refresh(true)` is the manual path.
+  await live.ready()
+  assert.equal(fetches, 1)
+  await live.refresh(true)
+  assert.equal(fetches, 2)
+  // A saved PAT resets the store, so the next use asks again.
+  live.reset()
+  await live.ready()
+  assert.equal(fetches, 3)
+
+  // Upstream unreachable: traecli's cache carries the list, and the snapshot
+  // says why the better source was skipped.
+  const cached = new TraeCatalog({
+    cacheFile: '/fixture/models_cache.json',
+    fetchUpstream: () => Promise.reject(new Error('HTTP 500')),
+    readCacheFile: () => Promise.resolve(readFileSync(new URL('./fixtures/models_cache.json', import.meta.url), 'utf8')),
+  })
+  const snapshot = await cached.ready()
+  assert.equal(snapshot.origin, 'cache')
+  assert.equal(snapshot.routes.length, 4)
+  assert.match(snapshot.note, /HTTP 500/)
+
+  // Neither source available: the built-in table, never an empty picker.
+  const floor = new TraeCatalog({
+    cacheFile: '/fixture/missing.json',
+    fetchUpstream: () => Promise.reject(new Error('offline')),
+    readCacheFile: () => Promise.reject(new Error('ENOENT')),
+  })
+  const builtin = await floor.ready()
+  assert.equal(builtin.origin, 'builtin')
+  assert.equal(builtin.routes.length, TRAE_ROUTES.length)
+  assert.match(builtin.note, /offline/)
+
+  // A failed refresh keeps the snapshot that worked.
+  let ok = true
+  const flaky = new TraeCatalog({
+    cacheFile: '',
+    fetchUpstream: () => ok ? Promise.resolve(upstream) : Promise.reject(new Error('gateway')),
+  })
+  await flaky.ready()
+  ok = false
+  const kept = await flaky.refresh(true)
+  assert.equal(kept.origin, 'upstream')
+  assert.equal(kept.routes.length, 4)
 })
 
 test('message translation: system/user/assistant+tool-call/tool-result', () => {
@@ -223,21 +348,23 @@ test('adapter: the picker gets every route, each with its own window and levels'
   })
 
   const models = await adapter.listModels('trae')
-  assert.equal(models.length, 24)
+  assert.equal(models.length, 20)
   assert.ok(models.every(m => m.provider === 'trae' && m.inputModalities[0] === 'text'))
-  // Multimodal flags: 18 routes accept images, 6 stay text-only.
-  assert.equal(models.filter(m => m.inputModalities.includes('image')).length, 18)
+  // Multimodal flags: 15 routes accept images, 5 stay text-only.
+  assert.equal(models.filter(m => m.inputModalities.includes('image')).length, 15)
   assert.ok(models.find(m => m.id === 'GLM-5.3-Flash').inputModalities.includes('image'))
   assert.ok(!models.find(m => m.id === 'GLM-5.3').inputModalities.includes('image'))
   assert.equal(models.find(m => m.id === 'GLM-5.3').description, '1M 上下文（Max）')
-  assert.equal(models.find(m => m.id === 'GLM-5.2').description, '200K 上下文')
+  assert.equal(models.find(m => m.id === 'MiniMax-M2.7').description, '200K 上下文')
 
   // What the agent loop plans compaction against.
   const glm = await adapter.resolveModel('trae', 'GLM-5.3')
   assert.equal(glm.context.contextWindow, 1000000)
-  // The output half of the window: a Max route writes up to 64K, the rest 32K.
+  // The output half of the window: a Max route writes up to 64K, the rest 32K,
+  // except where the catalog states the model's own cap (Doubao: 16K).
   assert.equal(glm.defaultMaxTokens, 64000)
-  assert.equal((await adapter.resolveModel('trae', 'GLM-5.2')).defaultMaxTokens, 32000)
+  assert.equal((await adapter.resolveModel('trae', 'MiniMax-M2.7')).defaultMaxTokens, 32000)
+  assert.equal((await adapter.resolveModel('trae', 'Doubao-Seed-Evolving')).defaultMaxTokens, 16000)
   // An id the catalog does not know falls back to the smaller pair.
   const unknown = await adapter.resolveModel('trae', 'nope')
   assert.equal(unknown.context.contextWindow, 200000)
@@ -726,18 +853,30 @@ test('adapter: the body matches a traecli capture; the max marker rides only the
   assert.equal(kimi.model_auto_selection, undefined)
   assert.equal(kimi.context_window_size, undefined)
 
-  // Max without a max_key: the standard key stays, so the marker and the
-  // window are the only things asking for 1M.
-  const doubao = await bodyFor({ model: 'Doubao-Seed-Evolving' })
-  assert.equal(doubao.model_name, 'Doubao-Seed-Evolving__dev')
-  assert.deepEqual(doubao.model_auto_selection, { strategy: 'max' })
-  assert.equal(doubao.context_window_size, 1000000)
-
   // No Max at all: neither field, whatever the window.
-  const plain = await bodyFor({ model: 'GLM-5.2' })
-  assert.equal(plain.model_name, 'glm-5.2__dev')
+  const plain = await bodyFor({ model: 'Doubao-Seed-Evolving' })
+  assert.equal(plain.model_name, 'Doubao-Seed-Evolving__dev')
   assert.equal(plain.model_auto_selection, undefined)
   assert.equal(plain.context_window_size, undefined)
+
+  // Max without a max_key: the standard key stays, so the marker and the
+  // window are the only things asking for 1M. No model Trae currently serves
+  // is described that way, so the route comes from a catalog of one.
+  const routes = toRoutes([
+    { id: 'Marker-Only', configName: 'marker-only', key: 'marker-only__dev', contextWindow: 184_000, efforts: [], max: { contextWindow: 1_000_000 } },
+  ])
+  const marker = new TraeAdapter({
+    displayName: 'Trae', host: 'https://h', identity: {}, auth: stubAuth(),
+    catalog: { ready: async () => ({ routes, find: id => routes.find(r => r.id === id || r.key === id) }) },
+    readTimeoutMs: 1000, emptyRetries: 0, loopGuardChars: 600,
+    logger: { info() {}, warn() {} },
+  })
+  const stub = stubFetch(() => sse([['output', { response: 'ok' }], ['done', { finish_reason: 'stop' }]]))
+  try { await drain(marker.stream(turnOptions({ model: 'Marker-Only' }))) } finally { stub.restore() }
+  const body = JSON.parse(stub.calls[0].body)
+  assert.equal(body.model_name, 'marker-only__dev')
+  assert.deepEqual(body.model_auto_selection, { strategy: 'max' })
+  assert.equal(body.context_window_size, 1000000)
 })
 
 test('cue: report/clients gets multipart `body` with env_metadata and stringified payloads', async () => {
