@@ -11,6 +11,9 @@ test('config: only the PAT reference is user-facing, with a built-in default', (
   assert.equal(config.patEnv.get(), 'TRAE_PAT')
   assert.equal(config.host, 'https://api.enterprise.trae.cn')
   assert.equal(config.ideVersionCode, '20260908')
+  // The model list is asked for, not shipped: upstream, then traecli's cache.
+  assert.equal(config.catalogSource, 'auto')
+  assert.equal(config.modelsCacheFile, '')
 })
 
 test('apply registers the provider route and a Models-page row', () => {
@@ -25,7 +28,9 @@ test('apply registers the provider route and a Models-page row', () => {
       registerConfigurableProviders: (e) => { directory.push(...e) },
     },
   }
-  plugin.apply(ctx, plugin.Config({}))
+  // `builtin` keeps these tests off the network and off whatever traecli last
+  // cached on the machine running them; the live sources have their own tests.
+  plugin.apply(ctx, plugin.Config({ catalogSource: 'builtin' }))
   assert.ok(routes.trae, 'adapter registered on the trae route')
   assert.equal(routes.trae.providerInfo('trae').name, 'Trae')
   assert.deepEqual(directory, [{ provider: 'trae', displayName: 'Trae', settingsNs: 'trae2api', settingsPath: [] }])
@@ -39,20 +44,23 @@ test('shipped bundle: hard-coded windows and thinking levels reach the agent loo
     inject: () => {}, fiber: { entry: { options: { id: 'trae2api' } } },
     llm: { registerAdapter: (r, a) => { for (const k of r) routes[k] = a }, registerConfigurableProviders() {} },
   }
-  plugin.apply(ctx, plugin.Config({}))
+  // `builtin` keeps these tests off the network and off whatever traecli last
+  // cached on the machine running them; the live sources have their own tests.
+  plugin.apply(ctx, plugin.Config({ catalogSource: 'builtin' }))
   const adapter = routes.trae
 
-  // Windows the IDE capability table reports, not the catalog's inflated ones.
+  // Windows as the live catalog states them: Max routes at 1M, the Doubao
+  // family at its own standard window since none of them has Max.
   assert.equal((await adapter.resolveModel('trae', 'GLM-5.3')).context.contextWindow, 1000000)
-  assert.equal((await adapter.resolveModel('trae', 'Doubao-Seed-Evolving')).context.contextWindow, 1000000)
-  assert.equal((await adapter.resolveModel('trae', 'Doubao-Seed-2.1-Turbo')).context.contextWindow, 256000)
-  assert.equal((await adapter.resolveModel('trae', 'GLM-5.2')).context.contextWindow, 200000)
+  assert.equal((await adapter.resolveModel('trae', 'GLM-5.2')).context.contextWindow, 1000000)
+  assert.equal((await adapter.resolveModel('trae', 'Doubao-Seed-Evolving')).context.contextWindow, 184000)
+  assert.equal((await adapter.resolveModel('trae', 'Doubao-Seed-2.1-Turbo')).context.contextWindow, 200000)
 
   // Thinking levels are selectable per model.
   const kimi = await adapter.resolveModel('trae', 'Kimi-K3')
   assert.deepEqual(kimi.reasoning.efforts.map(e => e.id), ['light', 'high', 'extra_high'])
   assert.equal(kimi.reasoning.defaultEffort, 'extra_high')
-  assert.equal((await adapter.resolveModel('trae', 'GLM-5V-Turbo')).reasoning, undefined)
+  assert.equal((await adapter.resolveModel('trae', 'MiniMax-M3')).reasoning, undefined)
 })
 
 test('apply serves the remaining quota on a login-gated Connection route', async () => {
@@ -67,7 +75,9 @@ test('apply serves the remaining quota on a login-gated Connection route', async
     fiber: { entry: { options: { id: 'trae2api' } } },
     llm: { registerAdapter() {}, registerConfigurableProviders() {} },
   }
-  plugin.apply(ctx, plugin.Config({}))
+  // `builtin` keeps these tests off the network and off whatever traecli last
+  // cached on the machine running them; the live sources have their own tests.
+  plugin.apply(ctx, plugin.Config({ catalogSource: 'builtin' }))
   const route = routes.get(plugin.QUOTA_ROUTE)
   assert.ok(route, 'quota route registered')
   assert.equal(plugin.QUOTA_ROUTE, '/api/dsh-trae2api/quota')
@@ -101,6 +111,67 @@ test('apply serves the remaining quota on a login-gated Connection route', async
   } finally { globalThis.fetch = original }
 })
 
+test('apply serves the model catalog, refreshed from Trae on request', async () => {
+  const routes = new Map()
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    effect() {}, on() {},
+    get: (name) => name === 'credentials' ? { resolve: async () => ({ value: 'eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQxMDI0NDQ4MDB9.c2ln' }) } : undefined,
+    inject: (deps, cb) => {
+      if (deps.includes('connection')) cb({ connection: { fetch: { register: (route) => { routes.set(route.path, route) } } } })
+    },
+    fiber: { entry: { options: { id: 'trae2api' } } },
+    llm: { registerAdapter() {}, registerConfigurableProviders() {} },
+  }
+  const original = globalThis.fetch
+  const seen = []
+  // One config entry is enough to prove the plugin asks Trae and parses it.
+  globalThis.fetch = async (url, init) => {
+    seen.push({ url: String(url), headers: init.headers, body: init.body })
+    return Response.json({
+      function_configs: [{
+        function: 'chat',
+        config_info_list: [{
+          config_name: 'glm-5.3',
+          config_switch: true,
+          is_invisible_to_user: false,
+          context_window_tokens: { dev: 200000, max: 1000000 },
+          display_config: { display_name: 'GLM-5.3', max_mode: true, multimodal: false },
+          reasoning_effort_config: { default_level: 'high', options: ['light', 'high'], support_thinking: true },
+          model_detail_list: [
+            { model_name: 'glm-5.3__dev', prompt_max_tokens: 168000, max_tokens: 32000 },
+            { model_name: 'glm-5.3__max', prompt_max_tokens: 936000, max_tokens: 64000 },
+          ],
+        }],
+      }],
+    })
+  }
+  try {
+    plugin.apply(ctx, plugin.Config({}))
+    const route = routes.get(plugin.CATALOG_ROUTE)
+    assert.ok(route, 'catalog route registered')
+    assert.equal(plugin.CATALOG_ROUTE, '/api/dsh-trae2api/catalog')
+
+    const body = await (await route.fetch(new Request('http://127.0.0.1/api/dsh-trae2api/catalog'))).json()
+    assert.equal(body.ok, true)
+    assert.equal(body.value.origin, 'upstream')
+    assert.deepEqual(body.value.models, [{
+      id: 'GLM-5.3', key: 'glm-5.3__max', contextWindow: 1000000,
+      maxMode: true, multimodal: false, efforts: ['light', 'high'],
+    }])
+
+    // The startup refresh is the only call so far: a plain GET answers from it.
+    const asked = seen.filter(c => c.url.endsWith('/api/ide/v1/batch_get_detail_param'))
+    assert.equal(asked.length, 1)
+    assert.equal(asked[0].headers['x-ide-version-code'], '20260908')
+    assert.match(asked[0].headers.authorization, /^Cloud-IDE-JWT eyJ/)
+    assert.deepEqual(JSON.parse(asked[0].body).functions, ['chat'])
+    // `?refresh` is the manual path and does ask again.
+    await route.fetch(new Request('http://127.0.0.1/api/dsh-trae2api/catalog?refresh=1'))
+    assert.equal(seen.filter(c => c.url.endsWith('/api/ide/v1/batch_get_detail_param')).length, 2)
+  } finally { globalThis.fetch = original }
+})
+
 test('apply serves next-input suggestions for finished Trae turns', async () => {
   const routes = new Map()
   const adapters = {}
@@ -114,7 +185,9 @@ test('apply serves next-input suggestions for finished Trae turns', async () => 
     fiber: { entry: { options: { id: 'trae2api' } } },
     llm: { registerAdapter: (r, a) => { for (const k of r) adapters[k] = a }, registerConfigurableProviders() {} },
   }
-  plugin.apply(ctx, plugin.Config({}))
+  // `builtin` keeps these tests off the network and off whatever traecli last
+  // cached on the machine running them; the live sources have their own tests.
+  plugin.apply(ctx, plugin.Config({ catalogSource: 'builtin' }))
   const route = routes.get(plugin.SUGGESTION_ROUTE)
   assert.ok(route, 'suggestion route registered')
   const ask = async (query) => (await route.fetch(new Request(`http://127.0.0.1${plugin.SUGGESTION_ROUTE}${query}`))).json()
@@ -154,7 +227,7 @@ test('suggestion events reach report/clients by default, with the GetUserInfo us
       fiber: { entry: { options: { id: 'trae2api' } } },
       llm: { registerAdapter: (r, a) => { for (const k of r) adapters[k] = a }, registerConfigurableProviders() {} },
     }
-    plugin.apply(ctx, plugin.Config(overrides))
+    plugin.apply(ctx, plugin.Config({ catalogSource: 'builtin', ...overrides }))
     return { routes, adapters }
   }
   const run = async ({ routes, adapters }, privacy = false) => {

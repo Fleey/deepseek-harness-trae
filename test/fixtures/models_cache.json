@@ -1,0 +1,204 @@
+{
+ "fetched_at": "2026-10-16T02:55:22.600661Z",
+ "cache_schema_version": 7,
+ "provider_mode": "replaces_bundled_catalog",
+ "models": [
+  {
+   "slug": "Doubao-Seed-Evolving",
+   "default_reasoning_level": "high",
+   "supported_reasoning_levels": [
+    {
+     "effort": "low",
+     "description": "Fast responses with lighter reasoning."
+    },
+    {
+     "effort": "high",
+     "description": "Greater reasoning depth for complex tasks."
+    }
+   ],
+   "visibility": "list",
+   "supported_in_api": true,
+   "context_window": 184000,
+   "input_modalities": [
+    "text",
+    "image"
+   ],
+   "config_name": "Doubao-Seed-Evolving",
+   "business_metadata": {
+    "variants": {
+     "standard_key": "Doubao-Seed-Evolving__dev",
+     "standard_context_window": 184000,
+     "standard_default_reasoning_level": "high",
+     "standard_supported_reasoning_levels": [
+      {
+       "effort": "low",
+       "description": "Fast responses with lighter reasoning."
+      },
+      {
+       "effort": "high",
+       "description": "Greater reasoning depth for complex tasks."
+      }
+     ],
+     "max_key": null,
+     "max_context_window": null,
+     "effective_context_window_percent": 95
+    },
+    "trae_reasoning_effort_levels": {
+     "high": "high",
+     "low": "light"
+    }
+   }
+  },
+  {
+   "slug": "GLM-5.3",
+   "default_reasoning_level": "high",
+   "supported_reasoning_levels": [
+    {
+     "effort": "low",
+     "description": "Fast responses with lighter reasoning."
+    },
+    {
+     "effort": "high",
+     "description": "Greater reasoning depth for complex tasks."
+    },
+    {
+     "effort": "xhigh",
+     "description": "Maximum reasoning depth for complex tasks."
+    }
+   ],
+   "visibility": "list",
+   "supported_in_api": true,
+   "context_window": 200000,
+   "max_context_window": 1000000,
+   "input_modalities": [
+    "text",
+    "image"
+   ],
+   "config_name": "glm-5.3",
+   "business_metadata": {
+    "variants": {
+     "standard_key": "glm-5.3__dev",
+     "standard_context_window": 200000,
+     "standard_default_reasoning_level": "high",
+     "standard_supported_reasoning_levels": [
+      {
+       "effort": "low",
+       "description": "Fast responses with lighter reasoning."
+      },
+      {
+       "effort": "high",
+       "description": "Greater reasoning depth for complex tasks."
+      },
+      {
+       "effort": "xhigh",
+       "description": "Maximum reasoning depth for complex tasks."
+      }
+     ],
+     "max_key": "glm-5.3__max",
+     "max_context_window": 1000000,
+     "max_default_reasoning_level": "high",
+     "max_supported_reasoning_levels": [
+      {
+       "effort": "low",
+       "description": "Fast responses with lighter reasoning."
+      },
+      {
+       "effort": "high",
+       "description": "Greater reasoning depth for complex tasks."
+      },
+      {
+       "effort": "xhigh",
+       "description": "Maximum reasoning depth for complex tasks."
+      }
+     ],
+     "effective_context_window_percent": 95
+    },
+    "trae_reasoning_effort_levels": {
+     "high": "high",
+     "low": "light",
+     "xhigh": "extra_high"
+    }
+   }
+  },
+  {
+   "slug": "GLM-5.2",
+   "default_reasoning_level": "high",
+   "supported_reasoning_levels": [
+    {
+     "effort": "high",
+     "description": "Greater reasoning depth for complex tasks."
+    },
+    {
+     "effort": "xhigh",
+     "description": "Maximum reasoning depth for complex tasks."
+    }
+   ],
+   "visibility": "list",
+   "supported_in_api": true,
+   "context_window": 200000,
+   "max_context_window": 1000000,
+   "input_modalities": [
+    "text",
+    "image"
+   ],
+   "config_name": "glm-5.2",
+   "business_metadata": {
+    "variants": {
+     "standard_key": "glm-5.2__dev",
+     "standard_context_window": 200000,
+     "standard_default_reasoning_level": "high",
+     "standard_supported_reasoning_levels": [
+      {
+       "effort": "high",
+       "description": "Greater reasoning depth for complex tasks."
+      },
+      {
+       "effort": "xhigh",
+       "description": "Maximum reasoning depth for complex tasks."
+      }
+     ],
+     "max_key": "glm-5.2__max",
+     "max_context_window": 1000000,
+     "max_default_reasoning_level": "high",
+     "max_supported_reasoning_levels": [
+      {
+       "effort": "high",
+       "description": "Greater reasoning depth for complex tasks."
+      },
+      {
+       "effort": "xhigh",
+       "description": "Maximum reasoning depth for complex tasks."
+      }
+     ],
+     "effective_context_window_percent": 95
+    },
+    "trae_reasoning_effort_levels": {
+     "high": "high",
+     "xhigh": "extra_high"
+    }
+   }
+  },
+  {
+   "slug": "MiniMax-M3",
+   "supported_reasoning_levels": [],
+   "visibility": "list",
+   "supported_in_api": true,
+   "context_window": 200000,
+   "max_context_window": 1000000,
+   "input_modalities": [
+    "text",
+    "image"
+   ],
+   "config_name": "minimax-m3",
+   "business_metadata": {
+    "variants": {
+     "standard_key": "minimax-m3__dev",
+     "standard_context_window": 200000,
+     "max_key": "minimax-m3__max",
+     "max_context_window": 1000000,
+     "effective_context_window_percent": 95
+    }
+   }
+  }
+ ]
+}

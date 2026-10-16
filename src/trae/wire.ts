@@ -250,7 +250,7 @@ export function upstreamMessage(data: Record<string, unknown>): string {
     const first = chain.find(l => l && typeof l === 'object' && (l as Record<string, unknown>).error) as Record<string, unknown> | undefined
     if (first) detail = `${detail}: ${String(first.error).trim()}`
   }
-  if (Number(data.code) === 4023) detail += '（上游不认识这个模型名：插件内置的模型目录与 x-ide-version-code 不同代）'
+  if (Number(data.code) === 4023) detail += '（上游不认识这个模型名：该模型多半已经下线，或者插件的模型目录和 x-ide-version-code 不同代。对照 ~/.trae/cli/models_cache.json 里现在还在的模型）'
   return detail.replace(/\n/g, ' ').slice(0, 400)
 }
 

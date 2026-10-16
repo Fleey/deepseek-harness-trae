@@ -20,7 +20,8 @@ import {
 } from '@deepseek-ai/dsh-llm'
 import type { TraeAuth } from './trae/auth.ts'
 import type { FinishedTurn } from './trae/suggest.ts'
-import { EFFORT_NAMES, findModel, TRAE_ROUTES, type TraeEffort, type TraeRoute } from './trae/catalog.ts'
+import { EFFORT_NAMES, type TraeEffort, type TraeRoute } from './trae/catalog.ts'
+import { BUILTIN_SNAPSHOT, type CatalogSnapshot, type TraeCatalog } from './trae/catalog-source.ts'
 import {
   approxTokens,
   classify,
@@ -53,6 +54,11 @@ export interface AdapterOptions {
   host: string
   identity: TraeIdentity
   auth: TraeAuth
+  /**
+   * The live model catalog. Absent = the built-in table alone, which is what
+   * the tests and a `catalogSource: builtin` setup run on.
+   */
+  catalog?: TraeCatalog
   /** Max ms between two upstream bytes before the turn is abandoned. */
   readTimeoutMs: number
   /** Extra attempts for a turn that produced nothing (or a transient 3003). */
@@ -173,36 +179,43 @@ export class TraeAdapter extends LlmAdapter {
     return { id: provider, name: this.opts.displayName }
   }
 
+  /** The catalog as of this plugin start, refreshed on first use. */
+  private catalog(): Promise<CatalogSnapshot> {
+    return this.opts.catalog?.ready() ?? Promise.resolve(BUILTIN_SNAPSHOT)
+  }
+
   /**
-   * The catalog is built in, but listing also proves the PAT works: an
-   * unconfigured or rejected PAT makes the model picker show the reason
-   * instead of a silently missing group.
+   * Listing also proves the PAT works: an unconfigured or rejected PAT makes
+   * the model picker show the reason instead of a silently missing group.
    */
   override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
     await this.opts.auth.get()
-    return TRAE_ROUTES.map(r => ({
+    const { routes } = await this.catalog()
+    return routes.map(r => ({
       provider, id: r.id, name: r.id,
       description: r.maxMode ? '1M 上下文（Max）' : `${Math.round(r.contextWindow / 1000)}K 上下文`,
       inputModalities: (r.multimodal ? ['text', 'image'] : ['text']) as readonly ('text' | 'image')[],
     }))
   }
 
-  override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
-    const known = findModel(model)
+  override async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    const known = (await this.catalog()).find(model)
     const info: LlmResolvedModelInfo = {
       provider,
       id: model,
       name: known?.id ?? model,
       inputModalities: (known?.multimodal ? ['text', 'image'] : ['text']) as readonly ('text' | 'image')[],
-      // Hard-coded per model from the IDE capability table, so the loop plans
-      // compaction against the window the backend actually enforces.
+      // Per model from the catalog, so the loop plans compaction against the
+      // window the backend actually enforces.
       context: { contextWindow: known?.contextWindow ?? 200_000 },
       // The output half of that window: switching a route to its `__max` key
       // doubles what the backend lets the model write. llm_raw_chat itself
       // ignores `max_tokens`, so this is also the only cap `stream` can hold
       // the turn to — without it the loop sends no budget and nothing cuts a
-      // runaway answer.
-      defaultMaxTokens: known?.maxMode ? MAX_OUTPUT_TOKENS : OUTPUT_TOKENS,
+      // runaway answer. The live catalog states the real cap per variant
+      // (`model_detail_list[].max_tokens`, 16K on the Doubao family); the two
+      // constants are the by-Max-ness default for a source that does not.
+      defaultMaxTokens: known?.outputTokens ?? (known?.maxMode ? MAX_OUTPUT_TOKENS : OUTPUT_TOKENS),
     }
     if (known && known.efforts.length > 0) {
       info.reasoning = {
@@ -210,7 +223,7 @@ export class TraeAdapter extends LlmAdapter {
         ...known.defaultEffort ? { defaultEffort: known.defaultEffort as ReasoningEffortId } : {},
       }
     }
-    return Promise.resolve(info)
+    return info
   }
 
   private headers(token: string): Record<string, string> {
@@ -311,7 +324,7 @@ export class TraeAdapter extends LlmAdapter {
    * the conversation's own server-side state.
    */
   async complete(model: string, system: string, user: string, signal: AbortSignal): Promise<string> {
-    const route = findModel(model)
+    const route = (await this.catalog()).find(model)
     if (!route) throw new LlmError(`Trae：未知模型「${model}」`, 'MODEL_NOT_FOUND')
     const messages = [
       { role: 'system', content: [{ type: 'text', text: system }] },
@@ -329,9 +342,10 @@ export class TraeAdapter extends LlmAdapter {
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
-    const route = findModel(options.model)
+    const catalog = await this.catalog()
+    const route = catalog.find(options.model)
     if (!route) {
-      throw new LlmError(`Trae：未知模型「${options.model}」。可用：${TRAE_ROUTES.map(r => r.id).join('、')}`, 'MODEL_NOT_FOUND')
+      throw new LlmError(`Trae：未知模型「${options.model}」。可用：${catalog.routes.map(r => r.id).join('、')}`, 'MODEL_NOT_FOUND')
     }
     const effort = effortFor(route, options.reasoningEffort ? String(options.reasoningEffort) : undefined)
     const session = sessionUuid(options.sessionId ? String(options.sessionId) : undefined)

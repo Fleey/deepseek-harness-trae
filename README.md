@@ -12,22 +12,25 @@ v0.3 起插件自己直连 Trae 的 `llm_raw_chat` 接口（和 trae2api 的 dir
   换一个 Cloud-IDE JWT（和 `traecli login --with-trae-pat` 同一套流程），快过期时自动再换。
 - 注册一个叫 **Trae** 的模型来源，直接走 `/api/ide/v2/llm_raw_chat`：流式正文、流式 thinking、
   function calling、token 用量都支持。
-- **模型、上下文长度、思考档位全部内置写死**，数据来自两处合并（和 trae2api 的
-  `_apply_ide_capabilities` 同一套规则）：
-  - 模型列表、`config_name`、后端 key（`__dev` / `__max`）、思考档位 → traecli 0.206.1 的
-    `models_cache.json`。
-  - **上下文窗口、哪些模型有 Max、思考档位** → 客户端自己的能力表
-    （globalStorage 里的 `AI.agent.model.model_list_map`），取自 **TRAE SOLO CN**（31 条），
-    也就是 TraeWork CN 实际在用的那份。
-  - **16 个模型直接按 1M 上下文（Max）提供**，不再额外列一个小窗口的版本；剩下 8 个用各自的
-    标准窗口（Doubao-Seed-2.1-Turbo 256K、Doubao 系 184K、其余 200K）。
-  - **思考档位**在对话框模型菜单里选，用客户端自己的词表 `light / high / extra_high`
-    （就是界面上的 轻 / 高 / 极高）；只有目录描述、能力表没覆盖的几个模型沿用 `low/high/xhigh`。
+- **模型目录是问来的，不是写死的**。Trae 会随时下线模型（2026-10-16 就一次下掉了四个），
+  写死的目录过期后那些模型在选择器里还在，一发就是 `4023 the model is unknown`。所以每次
+  插件启动（重载插件 = 重新拉一次）按这个顺序取：
+  1. **上游** `POST /api/ide/v1/batch_get_detail_param` —— traecli 自己也走这个，请求体就是
+     traecli 二进制里内置的那份。它是所有事实的权威：有哪些模型、两个后端 key、两个上下文
+     窗口、每个变体的输出上限、Max 是不是真的、能不能吃图、思考档位及默认档。
+  2. **traecli 缓存** `~/.trae/cli/models_cache.json` —— 不走网络，但只有 traecli 跑过才会更新；
+     它的 `input_modalities` 对每个模型都写 `["text","image"]`（Codex fork 的常量，不是能力），
+     所以能不能吃图这一项取插件内置表里的标记。
+  3. **插件内置表**（`src/trae/catalog.ts`，20 个模型）—— 兜底，保证断网也有选择器。
+     已于 2026-10-16 和上游对齐过。
 
-  > ⚠️ 注意 trae2api 的 `_IDE_STATE_DEFAULTS` **找不到**这张表：它只看 `Trae CN` / `Trae`
-  > 两个旧客户端。那份 `Trae CN` 缓存是过期的——仍列着目录已删的 `glm-5.1`/`glm-5`，没有
-  > DeepSeek-V4.1-Flash，窗口报 116K/112K，还把明明有 Max 的模型标成 `max_mode: false`。
-  > 以后刷新这张表，请读 **TRAE SOLO CN** 那个库。
+  拿到的目录里：**14 个模型直接按 1M 上下文（Max）提供**，不再额外列小窗口的版本；剩下 6 个
+  用各自的标准窗口（Doubao 系 184K/200K，其余 200K）。**思考档位**在对话框模型菜单里选，
+  词表是 `light / high / extra_high`（界面上的 轻 / 高 / 极高）。
+
+  > 想看插件现在用的是哪一份：`GET /api/dsh-trae2api/catalog` 会返回模型列表、来源
+  > （`upstream` / `cache` / `builtin`）和取到的时间；加 `?refresh` 当场重新问一次上游。
+  > 刷新失败不会清空目录，继续用上一次拿到的那份。
 
 - 内置了 trae2api 里那几道兜底：工具调用历史修复（避免 `4027`）、把模型写成文本的
   `<invoke>` 工具调用捞回来、重复塌缩截断、空回合重试、上游错误码翻译。
@@ -53,10 +56,10 @@ v0.3 起插件自己直连 Trae 的 `llm_raw_chat` 接口（和 trae2api 的 dir
 
 ### 用 tgz 安装（发给别人）
 
-`dsh-trae2api-0.3.0.tgz` 是预构建好的包，不需要构建权限：
+`dsh-trae2api-0.4.0.tgz` 是预构建好的包，不需要构建权限：
 
 ```sh
-dsh plugin --profile desktop add ./dsh-trae2api-0.3.0.tgz
+dsh plugin --profile desktop add ./dsh-trae2api-0.4.0.tgz
 ```
 
 装完同样去 **设置 → 模型 → Trae** 填 PAT。tgz 方式下插件自带全部代码，和项目目录无关。
@@ -79,7 +82,9 @@ dsh plugin --profile desktop add ./dsh-trae2api-0.3.0.tgz
 | `patEnv` | `TRAE_PAT` | PAT 在凭据库里的名字 |
 | `host` | `https://api.enterprise.trae.cn` | Trae 接口地址 |
 | `clientId` | `app_EMoamEEZ73f0CkXaXp7hrann` | PAT 兑换用的 OAuth client id（traecli 的） |
-| `appId` / `ideVersionCode` / `clientVersion` | 20260908 那一代 | 身份头，和内置模型目录的后缀（`__dev`）配对 |
+| `appId` / `ideVersionCode` / `clientVersion` | 20260908 那一代 | 身份头，和模型名后缀（`__dev`）配对 |
+| `catalogSource` | `auto` | 模型目录来源：`auto` = 上游 → traecli 缓存 → 内置；也可锁成 `upstream` / `cache` / `builtin` |
+| `modelsCacheFile` | 空 | traecli 模型缓存路径；空 = `~/.trae/cli/models_cache.json` |
 | `consoleEmailEnv` | `TRAE_CONSOLE_EMAIL` | 控制台邮箱在凭据库里的引用名（卡片写这里） |
 | `consoleEmail` | 空 | 控制台邮箱的配置兜底（凭据库里没有时才用） |
 | `consolePasswordEnv` | `TRAE_CONSOLE_PASSWORD` | 控制台密码在凭据库里的引用名 |
@@ -94,7 +99,11 @@ dsh plugin --profile desktop add ./dsh-trae2api-0.3.0.tgz
 | `cueUserId` | 空 | 覆盖上报用的 Trae user id；空 = 环境变量 `TRAE_USER_ID`，再空 = 自动从 `GetUserInfo` 取 |
 
 > ⚠️ 模型名后缀（`__dev`）和 `ideVersionCode`（`20260908`）是一对，必须同代。Trae 升级后若
-> 大量模型报 `4023` / `4001`，说明内置目录和身份头过时了，需要更新插件（或临时改这几个字段）。
+> 大量模型报 `4023` / `4001`，说明身份头过时了，需要更新插件（或临时改这几个字段）。
+> 单个模型报 `4023` 基本只有一种情况：目录没刷新到。重载一次插件，或
+> `GET /api/dsh-trae2api/catalog?refresh`；`catalogSource: builtin` 锁死在内置表时也会这样，
+> 那就换回 `auto`。2026-10-16 被下线的是 Qwen3.7-Plus、GLM-5V-Turbo、Kimi-K2.7-Code、
+> DeepSeek-V4-Pro（`DeepSeek-V4-Pro 正式版` 还在），上游把它们标成 `is_invisible_to_user`。
 
 ## 额度显示
 
@@ -158,6 +167,12 @@ TRAE_PAT=… TRAE_CONSOLE_EMAIL=… TRAE_CONSOLE_PASSWORD=… python3 -I tools/p
 
 （把 IDE 两条路径在各个地址、两套请求头下的原始响应，以及控制台的两条接口全打出来。）
 
+模型目录那两条接口同样有个探针，拿 `~/.trae/cli/auth.json` 里的会话直接问：
+
+```sh
+python3 -I tools/probe_catalog.py
+```
+
 ## 输入建议（Tab 填入）
 
 Trae 模型回答完一轮后，输入框为空时会用灰字显示一条**猜你下一句要说的话**（取代原来的占位提示），
@@ -217,16 +232,17 @@ X-App-Id: <appId>
 
 ## 已知限制
 
-- **图片仅限多模态模型与 user 消息**：图片以 `data:` URI 内联发给能力表标记
-  `multimodal: true` 的模型（24 个里 18 个，GLM-5.3/GLM-5.2/DeepSeek 全系/MiniMax-M2.7
+- **图片仅限多模态模型与 user 消息**：图片以 `data:` URI 内联发给目录标记
+  `multimodal: true` 的模型（20 个里 15 个，GLM-5.3/GLM-5.2/DeepSeek 全系/MiniMax-M2.7
   除外）；纯文本模型与 tool 结果里的图片仍是占位文本（上游接口只在 user 消息接受
   `image_url`，发给纯文本模型会被 `1210` 拒绝还伪装成限流）。读取失败的单张图片降级为
   占位文本而不是让整轮失败。图片按每边 1024px / 2MiB 预算由附件服务缩放。
 - 这是 Trae 未公开的内部接口，后端改协议插件就会断——和 trae2api 的 direct 模式同样的前提。
 - **Max 的实际效果未经证实**：trae2api 实测这条私有接口对 `context_window_size` 和 `__max` key
   没有可观测差异（两者 `extra_info.model` 相同）。路由是真的（15 个模型的 `4023` 就是靠它修好的），
-  但「真能吃下 1M」没被实测过——这 16 个模型 dsh 会按 1M 规划上下文，万一后端不认，很长的会话
-  可能在上游被截断。真遇到了就把 `src/trae/catalog.ts` 里那个模型的 `max` 去掉、重新构建。
+  但「真能吃下 1M」没被实测过——目录里标着 Max 的那 14 个模型 dsh 会按 1M 规划上下文，万一后端
+  不认，很长的会话可能在上游被截断。真遇到了把 `catalogSource` 锁成 `builtin`，再改
+  `src/trae/catalog.ts` 里那个模型的 `max`。
 
 ## 开发
 
@@ -242,7 +258,9 @@ npm test           # 目录、消息转换、SSE 解码、重复检测、文本�
 - `src/index.ts` —— 宿主端：注册模型来源和 Models 页的 Trae 行。
 - `src/adapter.ts` —— dsh `LlmAdapter`，组装 llm_raw_chat 请求、解流、重组工具调用、兜底。
 - `src/trae/auth.ts` —— PAT → Cloud-IDE JWT 兑换与缓存。
-- `src/trae/catalog.ts` —— 写死的 24 个模型（key / 上下文 / 思考档位），其中 16 个默认走 Max。
+- `src/trae/catalog.ts` —— 目录的数据结构，外加断网兜底用的 20 个模型（其中 14 个走 Max）。
+- `src/trae/catalog-source.ts` —— 运行时目录：上游 `batch_get_detail_param` 与 traecli 缓存的
+  解析、三级兜底、每次插件启动刷新一次的 `TraeCatalog`。
 - `src/trae/wire.ts` —— 消息转换、SSE、错误分类、重复检测、文本工具调用嗅探。
 - `src/trae/quota.ts` —— 额度查询：CheckLogin 发现支付网关、v1/v2 兜底、宽容解析、企业席位判定。
 - `src/trae/tob.ts` —— 企业版额度：控制台密码登录 + 个人配额/按模型用量两条接口。
