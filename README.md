@@ -6,6 +6,17 @@
 v0.3 起插件自己直连 Trae 的 `llm_raw_chat` 接口（和 trae2api 的 direct 模式同一套协议），
 **不再需要 trae2api 进程、不需要 Python、不需要 traecli**。
 
+## 插件相关功能界面
+
+当选择trae模式是聊天支持显示trae额度
+
+<img width="1126" height="338" alt="image" src="https://github.com/user-attachments/assets/174f1592-8132-432f-ab31-cfc6d1f3f96c" />
+
+模型配置只需要添加traecli令牌继续使用，配置上企业额度可实时读取企业额度信息，支持tob与toc额度显示（toc无需登录企业账号即可获取额度）
+
+<img width="1598" height="1536" alt="image" src="https://github.com/user-attachments/assets/3d35d44e-dd11-44ce-a370-ec186e44f0fb" />
+
+
 ## 它做了什么
 
 - 用你填的 PAT 向 `https://api.enterprise.trae.cn/cloudide/api/v3/trae/oauth/ExchangeToken`
