@@ -319,7 +319,7 @@ export class TraeAdapter extends LlmAdapter {
 
   /**
    * One tool-less completion, collected rather than streamed — for side
-   * requests such as next-input suggestions. Runs on the route's lowest
+   * requests such as next-step choices. Runs on the route's lowest
    * thinking level under a throwaway upstream session, so it never touches
    * the conversation's own server-side state.
    */

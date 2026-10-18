@@ -33,11 +33,11 @@ const CLIENT_VERSION = '0.206.1-tob'
 export const QUOTA_ROUTE = '/api/dsh-trae2api/quota'
 /** Host route serving the model catalog and its origin; `?refresh` re-asks upstream. */
 export const CATALOG_ROUTE = '/api/dsh-trae2api/catalog'
-/** Host route the browser half reads a session's next-input suggestion from. */
+/** Host route the browser half reads a session's next-step choices from. */
 export const SUGGESTION_ROUTE = '/api/dsh-trae2api/suggestion'
 /** Longest a suggestion request may wait for one still being generated. */
 const SUGGESTION_MAX_WAIT_MS = 30_000
-/** Host route the browser half reports a suggestion being shown / accepted to. */
+/** Host route the browser half reports choices being shown / one being accepted to. */
 export const SUGGESTION_EVENT_ROUTE = '/api/dsh-trae2api/suggestion/event'
 /** Environment fallback for `cueUserId`. */
 const CUE_USER_ID_ENV = 'TRAE_USER_ID'
@@ -72,7 +72,7 @@ export interface Config {
   readTimeoutMs: number
   emptyRetries: number
   loopGuardChars: number
-  /** Suggest the next input in the composer after each answer (Tab accepts). */
+  /** Offer next-step choices above the composer after each answer (yes sends one). */
   suggestions: boolean
   /** Model asked for suggestions; empty = the model that answered. */
   suggestModel: string
@@ -340,8 +340,8 @@ export function apply(ctx: Context, config: Config): void {
         },
       })
     } catch (error) { logger.warn('dsh-trae2api: catalog route unavailable', error) }
-    // `?session=<id>&wait=<ms>`: the session's suggestion, waiting for one
-    // still in flight. `{ ok: true, value: null }` = nothing to suggest.
+    // `?session=<id>&wait=<ms>`: the session's next-step choices, waiting for
+    // ones still in flight. `{ ok: true, value: null }` = nothing to suggest.
     try {
       child.connection.fetch.register({
         path: SUGGESTION_ROUTE,
@@ -356,22 +356,29 @@ export function apply(ctx: Context, config: Config): void {
         },
       })
     } catch (error) { logger.warn('dsh-trae2api: suggestion route unavailable', error) }
-    // `{ session, id, action: 'shown' | 'accept' }`: what the composer did with
-    // a suggestion. The store decides whether it counts (once each, current
-    // suggestion only) and whether it is reported at all.
+    // `{ session, id, action: 'shown' | 'accept', card?, choice? }`: the
+    // composer showed a suggestion's cards, or the user pressed button
+    // `choice` on card `card` (both required for accept). The store decides
+    // whether it counts (once each, current suggestion only) and whether it is
+    // reported at all.
     try {
       child.connection.fetch.register({
         path: SUGGESTION_EVENT_ROUTE,
         methods: ['POST'],
         requestBody: 'buffered',
         fetch: async (request) => {
-          let input: { session?: unknown; id?: unknown; action?: unknown }
+          let input: { session?: unknown; id?: unknown; action?: unknown; card?: unknown; choice?: unknown }
           try { input = await request.json() as typeof input } catch { return Response.json({ ok: false, error: 'invalid JSON' }, { status: 400 }) }
-          const { session, id, action } = input
-          if (typeof session !== 'string' || typeof id !== 'string' || (action !== 'shown' && action !== 'accept')) {
-            return Response.json({ ok: false, error: 'expected { session, id, action: "shown" | "accept" }' }, { status: 400 })
+          const { session, id, action, card, choice } = input
+          const index = (n: unknown): n is number => Number.isInteger(n) && (n as number) >= 0
+          if (
+            typeof session !== 'string' || typeof id !== 'string' || (action !== 'shown' && action !== 'accept')
+            || (action === 'accept' && !(index(card) && index(choice)))
+          ) {
+            return Response.json({ ok: false, error: 'expected { session, id, action: "shown" | "accept", card, choice }' }, { status: 400 })
           }
-          const reported = suggestions ? await suggestions.record(session, id, action) : false
+          const pick = index(card) && index(choice) ? { card, choice } : undefined
+          const reported = suggestions ? await suggestions.record(session, id, action, pick) : false
           return Response.json({ ok: true, reported })
         },
       })
