@@ -745,6 +745,13 @@ test('suggestions: prompt carries the recent user messages and the answer', asyn
   assert.match(prompt, /first ask[\s\S]*fix the build[\s\S]*Want me to run the tests\?/)
 })
 
+test('suggestions: the prompt\'s worked example is two cards and survives the parser as it is', async () => {
+  const { SUGGEST_SYSTEM, SUGGEST_EXAMPLE, parseSuggestions } = await import('../lib/testing.mjs')
+  assert.equal(SUGGEST_EXAMPLE.length, 2, 'two separate problems, two cards')
+  assert.ok(SUGGEST_SYSTEM.includes(JSON.stringify(SUGGEST_EXAMPLE)))
+  assert.deepEqual(parseSuggestions(JSON.stringify(SUGGEST_EXAMPLE)), SUGGEST_EXAMPLE)
+})
+
 test('suggestions: the model\'s cards keep its own questions and buttons', async () => {
   const { parseSuggestions, MAX_CARDS, MAX_CHOICES } = await import('../lib/testing.mjs')
   // Two decisions, two cards; the buttons are whatever the model offered, not a yes/no pair.
