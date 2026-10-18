@@ -832,6 +832,46 @@ test('suggestions: a finished turn is waited for, a new turn drops it, a failure
   assert.equal(await store.get('s2', 0), null)
 })
 
+test('suggestions: no cards right after the host\'s own ask dialog, but later steps of that turn still get them', async () => {
+  const { TraeSuggestions, followsAsk } = await import('../lib/testing.mjs')
+  const step = (name, id) => [
+    { role: 'assistant', content: [{ type: 'text', text: '…' }, { type: 'tool-call', id, name, arguments: '{}' }] },
+    { role: 'tool', toolCallId: id, content: [{ type: 'text', text: '{}' }] },
+  ]
+  const base = turnOptions().messages
+  // The model asked in the dialog, the user skipped it, the model re-asks in prose.
+  const afterAsk = [...base, ...step('bash', 'c1'), ...step('ask_user_question', 'c2')]
+  // Asked first, then went on working: the closing next steps are new.
+  const askedEarlier = [...base, ...step('ask_user_question', 'c1'), ...step('bash', 'c2')]
+  // A host reminder appended after the tool result does not hide the ask.
+  const reminded = [...afterAsk, { role: 'user', content: [{ type: 'text', text: '<system-reminder>time</system-reminder>' }] }]
+  // The previous turn's plain answer asked nothing in this one.
+  const previousAnswer = [
+    { role: 'user', content: [{ type: 'text', text: 'first' }] },
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'c0', name: 'ask_user_question', arguments: '{}' }] },
+    { role: 'tool', toolCallId: 'c0', content: [{ type: 'text', text: '{}' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'done' }] },
+    { role: 'user', content: [{ type: 'text', text: 'next' }] },
+  ]
+  assert.equal(followsAsk(afterAsk), true)
+  assert.equal(followsAsk(reminded), true)
+  assert.equal(followsAsk(askedEarlier), false)
+  assert.equal(followsAsk(previousAnswer), false)
+  assert.equal(followsAsk(base), false)
+
+  const asked = []
+  const store = new TraeSuggestions({
+    complete: async () => { asked.push(1); return '[{"question": "Q?", "choices": [{"label": "Go", "reply": "go"}]}]' },
+    model: '', timeoutMs: 5000, logger: { warn() {} },
+  })
+  store.turnEnded({ sessionId: 's1', model: 'GLM-5.3', options: turnOptions({ messages: afterAsk }), answer: '你想用哪个方案？' })
+  assert.equal(await store.get('s1', 0), null)
+  assert.equal(asked.length, 0, 'not even asked for')
+
+  store.turnEnded({ sessionId: 's1', model: 'GLM-5.3', options: turnOptions({ messages: askedEarlier }), answer: '改好了，要跑测试吗？' })
+  assert.equal((await store.get('s1', 1000)).cards.length, 1)
+})
+
 test('adapter: only a main-loop turn that ends in prose reports itself; complete() is a tool-less side call', async () => {
   const { TraeAdapter } = await import('../lib/testing.mjs')
   const started = []

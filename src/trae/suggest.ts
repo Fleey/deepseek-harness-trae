@@ -109,6 +109,29 @@ function textOf(content: readonly ContentBlock[]): string {
   return content.filter(b => b.type === 'text').map(b => (b as { text: string }).text).join('\n').trim()
 }
 
+/**
+ * Tools that put a question to the user in the host's own dialog
+ * (dsh-tool-ask-user). An answer that closes right after one is the model
+ * following up on that dialog, often asking the same thing again in prose;
+ * cards would make it a third time.
+ */
+const ASK_TOOLS = new Set(['ask_user_question'])
+
+/**
+ * Whether the step right before the final answer asked the user through the
+ * host's dialog. That step is the request's last assistant message: a tool
+ * step of this turn, or — when it has no tool calls — the previous turn's
+ * answer, which asked nothing in this one.
+ */
+export function followsAsk(messages: readonly RequestMessage[]): boolean {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]!
+    if (message.role !== 'assistant') continue
+    return message.content.some(block => block.type === 'tool-call' && ASK_TOOLS.has(block.name))
+  }
+  return false
+}
+
 const clip = (text: string, max: number, tail = false): string =>
   text.length <= max ? text : tail ? `…${text.slice(-max)}` : `${text.slice(0, max)}…`
 
@@ -202,9 +225,12 @@ export class TraeSuggestions {
 
   constructor(private readonly opts: SuggestionsOptions) {}
 
-  /** A turn ended with a plain answer: start working out what comes next. */
+  /**
+   * A turn ended with a plain answer: start working out what comes next —
+   * unless the model has just asked through the host's own dialog.
+   */
   turnEnded(turn: FinishedTurn): void {
-    if (!turn.answer.trim()) return
+    if (!turn.answer.trim() || followsAsk(turn.options.messages as readonly RequestMessage[])) return
     this.drop(turn.sessionId)
     const abort = new AbortController()
     const entry: Entry = {
