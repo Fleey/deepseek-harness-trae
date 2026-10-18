@@ -91,17 +91,48 @@ export const MAX_CHOICES = 4
 /** Longest question, label or reply kept; anything longer is not a quick choice. */
 const MAX_TEXT = 200
 
+/**
+ * A worked example for the suggester: an answer that reported two separate
+ * problems is two cards, not one "what next?" card. Kept apart so a test can
+ * check it still parses into what it claims.
+ */
+export const SUGGEST_EXAMPLE: SuggestionCard[] = [
+  {
+    question: '要把 README 里过时的安装路径改成 DSH NEXT.app 吗？',
+    choices: [
+      { label: '改路径', reply: '把 README 里过时的安装路径改成 DSH NEXT.app' },
+      { label: '先查可执行名', reply: '先查一下 DSH NEXT.app 里实际的可执行文件名，再改路径' },
+    ],
+  },
+  {
+    question: '要补上配置何时生效的说明吗？',
+    choices: [
+      { label: '补说明', reply: '在 README 里补上 profile 配置改完后何时生效的说明' },
+    ],
+  },
+]
+
 export const SUGGEST_SYSTEM = [
-  'You read a coding-agent chat right after the assistant\'s latest answer and work out what the user is most likely to decide next:',
-  'the actions the answer proposed or offered (a change to write, a command to run, a document to draft, …), or else the obvious follow-up.',
+  'You read a coding-agent chat right after the assistant\'s latest answer and turn what it leaves open into cards the user answers with one click.',
   `Output ONLY a JSON array of 0 to ${MAX_CARDS} cards, most likely first:`,
   '[{"question": "...", "choices": [{"label": "...", "reply": "..."}]}]',
-  '- One card per independent decision. Alternatives for the same decision go into the same card as separate choices, never into separate cards.',
-  '- "question": one short question to the user (at most ~30 Chinese characters or ~15 English words), e.g. "要把加保护逻辑的改动写出来吗？" or "先做哪一个？".',
-  `- "choices": 1 to ${MAX_CHOICES} answers the user would pick from, recommended first. Fit them to the question — they need not be yes/no: name the concrete options when there are several, and include a "not now" style answer only when declining is a real option.`,
-  '- "label": the button text, 1 to 6 words (at most ~10 Chinese characters), e.g. "写出改动", "整理成文档", "暂不用".',
-  '- "reply": the message sent when the button is pressed, written as the user, e.g. "把加保护逻辑的改动写出来".',
+  '',
+  'Splitting into cards:',
+  '- One card per separate thing the answer found, proposed or offered: each problem to fix, each change to make, each command to run, each document to write. An answer that reports two problems is two cards, even if both could be done together.',
+  '- Choices on one card are only alternative ways to handle that one thing (do it this way / that way; option A, B or C of one decision).',
+  '- Never bundle: no "what next?" card spanning several things, no "do both" or "fix all" choice.',
+  '- No "not now", "skip" or "something else" choices: every card already has its own close button and a box for the user\'s own answer.',
+  '',
+  'Each card:',
+  '- "question": one short question about that one thing (at most ~30 Chinese characters or ~15 English words).',
+  `- "choices": 1 to ${MAX_CHOICES} answers, recommended first. They need not be yes/no — name the concrete options when there are several.`,
+  '- "label": the button text, 1 to 6 words (at most ~10 Chinese characters).',
+  '- "reply": the message sent when the button is pressed, written as the user, specific enough to act on by itself.',
   '- Write everything in the same language the user writes in.',
+  '',
+  'Example — the answer reported an outdated install path and a missing note on when config changes apply:',
+  JSON.stringify(SUGGEST_EXAMPLE),
+  '',
   'No code fences, no explanation. If the answer leaves the user nothing to decide, output [].',
 ].join('\n')
 

@@ -170,14 +170,23 @@ test('chip: the label carries one figure per allowance, coloured by the emptiest
 
 /**
  * Render the next-step cards for one session state with the same element
- * recorder as the chip. Effects never run; the slot's own inject() supplies
- * load/clear/dismiss/take against the real controller, seeded through its store.
+ * recorder as the chip, plus just enough of React's state hook to re-render
+ * after a click. Effects never run; the slot's own inject() supplies
+ * load/clear/dismiss/close/take against the real controller, seeded through
+ * its store.
  */
 function renderCards({ cards, dismissed = [], running = false, draft = '', phase = 'plain' }) {
+  const states = []
+  let cursor = 0
   const react = {
     createElement: (type, props, ...children) => ({ type, props, children }),
     useEffect: () => {},
     useRef: value => ({ current: value }),
+    useState: (initial) => {
+      const at = cursor++
+      if (!(at in states)) states[at] = initial
+      return [states[at], (next) => { states[at] = typeof next === 'function' ? next(states[at]) : next }]
+    },
   }
   const plugin = loadClient(react)
   let Cards, entry, zh
@@ -201,39 +210,57 @@ function renderCards({ cards, dismissed = [], running = false, draft = '', phase
     setDraft: (text) => { sent.push(['draft', text]) },
     submit: () => { sent.push(['submit']) },
   }
-  const render = () => Cards({
-    t: key => zh[key],
-    sessionId: 's1',
-    inputActions,
-    useSession: select => select({ running }),
-    useInput: select => select({ draft, phase }),
-    useTraeChoices: select => select(store.getSnapshot()),
-    ...injected,
-  })
+  const render = () => {
+    cursor = 0
+    return Cards({
+      t: key => zh[key],
+      sessionId: 's1',
+      inputActions,
+      useSession: select => select({ running }),
+      useInput: select => select({ draft, phase }),
+      useTraeChoices: select => select(store.getSnapshot()),
+      ...injected,
+    })
+  }
   return { node: render(), render, store, sent }
 }
 
+/** Pull the parts of a card out of the recorded tree. */
 const cardsOf = node => node.children[0]
-const questionOf = card => card.children[0].children[0].children[0]
-const buttonsOf = card => card.children[1].children[0]
+const headOf = card => card.children[0]
+const eyebrowOf = card => headOf(card).children[0].children[0].children[1]
+const questionOf = card => headOf(card).children[0].children[1].children[0]
+const closeOf = card => headOf(card).children[1]
+const actionsOf = card => card.children[1].children
+const choiceButtonsOf = card => actionsOf(card).filter(button => button.props['data-other'] === undefined)
+const otherButtonOf = card => actionsOf(card).find(button => button.props['data-other'] === '')
+const labelOf = button => button.children.at(-1).children[0]
+const otherBoxOf = card => card.children[2]
 
 const TWO_CARDS = [
   {
-    question: '先做哪一个？',
+    question: '要把 README 里过时的安装路径改掉吗？',
     choices: [
-      { label: '写保护逻辑', reply: '把加保护逻辑的改动写出来' },
-      { label: '整理成文档', reply: '把这份判定整理成给产品的说明文档' },
+      { label: '改路径', reply: '把 README 里过时的安装路径改成 DSH NEXT.app' },
+      { label: '先查可执行名', reply: '先查一下实际的可执行文件名，再改路径' },
     ],
   },
-  { question: '要跑一下测试吗？', choices: [{ label: '跑测试', reply: '跑一下测试' }, { label: '暂不用', reply: '先不跑' }] },
+  { question: '要补上配置何时生效的说明吗？', choices: [{ label: '补说明', reply: '在 README 里补上配置何时生效的说明' }] },
 ]
 
-test('cards: one card per decision, the model\'s own answers as buttons, its pick first', () => {
+test('cards: one card per decision, the model\'s own answers as buttons, its pick first, then "something else"', () => {
   const { node } = renderCards({ cards: TWO_CARDS })
+  assert.equal(node.props.className, 'trae-choices')
   const cards = cardsOf(node)
-  assert.deepEqual(cards.map(questionOf), ['先做哪一个？', '要跑一下测试吗？'])
-  assert.deepEqual(cards.map(card => buttonsOf(card).map(button => button.children[0])), [['写保护逻辑', '整理成文档'], ['跑测试', '暂不用']])
-  assert.deepEqual(buttonsOf(cards[0]).map(button => button.props.variant), ['primary', 'outline'])
+  assert.deepEqual(cards.map(questionOf), ['要把 README 里过时的安装路径改掉吗？', '要补上配置何时生效的说明吗？'])
+  assert.deepEqual(cards.map(eyebrowOf), ['下一步 · 1/2', '下一步 · 2/2'])
+  assert.deepEqual(cards.map(card => choiceButtonsOf(card).map(labelOf)), [['改路径', '先查可执行名'], ['补说明']])
+  assert.deepEqual(choiceButtonsOf(cards[0]).map(button => button.props['data-primary']), ['', undefined])
+  assert.deepEqual(cards.map(card => labelOf(otherButtonOf(card))), ['其他建议', '其他建议'])
+  assert.equal(otherBoxOf(cards[0]), null, 'the box stays shut until asked for')
+
+  // A single card needs no count.
+  assert.equal(eyebrowOf(cardsOf(renderCards({ cards: TWO_CARDS.slice(0, 1) }).node)[0]), '下一步')
 })
 
 test('cards: a button sends its reply as the next message and retires every card', () => {
@@ -242,18 +269,67 @@ test('cards: a button sends its reply as the next message and retires every card
   globalThis.fetch = async (_url, init) => { events.push(JSON.parse(init.body)); return Response.json({ ok: true }) }
   try {
     const { node, render, sent } = renderCards({ cards: TWO_CARDS })
-    buttonsOf(cardsOf(node)[0])[1].props.onClick()
-    assert.deepEqual(sent, [['draft', '把这份判定整理成给产品的说明文档'], ['submit']])
+    choiceButtonsOf(cardsOf(node)[0])[1].props.onClick()
+    assert.deepEqual(sent, [['draft', '先查一下实际的可执行文件名，再改路径'], ['submit']])
     assert.deepEqual(events, [{ session: 's1', id: 'sug-1', action: 'accept', card: 0, choice: 1 }])
     assert.equal(render(), null)
   } finally { globalThis.fetch = original }
 })
 
+test('cards: "something else" opens a box on that card; Enter sends the user\'s own words, unreported', () => {
+  const original = globalThis.fetch
+  const events = []
+  globalThis.fetch = async (_url, init) => { events.push(JSON.parse(init.body)); return Response.json({ ok: true }) }
+  try {
+    const { node, render, sent } = renderCards({ cards: TWO_CARDS })
+    otherButtonOf(cardsOf(node)[1]).props.onClick()
+    let cards = cardsOf(render())
+    assert.equal(otherBoxOf(cards[0]), null)
+    const box = otherBoxOf(cards[1])
+    assert.equal(otherButtonOf(cards[1]).props['aria-expanded'], true)
+    const [input, sendButton] = box.children
+    assert.equal(input.props.autoFocus, true)
+    assert.equal(input.props.placeholder, '说说你想怎么做，回车发送')
+    assert.equal(sendButton.props.disabled, true, 'nothing typed, nothing to send')
+
+    const key = (k, extra = {}) => ({ key: k, shiftKey: false, keyCode: 0, nativeEvent: {}, preventDefault() {}, ...extra })
+    // Blank input: Enter does nothing.
+    input.props.onKeyDown(key('Enter'))
+    assert.deepEqual(sent, [])
+
+    input.props.onChange({ target: { value: '  先只改路径，配置说明下次再补  ', style: {}, scrollHeight: 44 } })
+    const [typed] = otherBoxOf(cardsOf(render())[1]).children
+    assert.equal(typed.props.value, '  先只改路径，配置说明下次再补  ')
+    // Enter while an IME is still composing picks a candidate, it does not send.
+    typed.props.onKeyDown(key('Enter', { nativeEvent: { isComposing: true } }))
+    typed.props.onKeyDown(key('Enter', { keyCode: 229 }))
+    // Shift+Enter is a new line.
+    typed.props.onKeyDown(key('Enter', { shiftKey: true }))
+    assert.deepEqual(sent, [])
+
+    typed.props.onKeyDown(key('Enter'))
+    assert.deepEqual(sent, [['draft', '先只改路径，配置说明下次再补'], ['submit']])
+    assert.deepEqual(events, [], 'the user\'s own words are no suggestion of Trae\'s')
+    assert.equal(render(), null, 'answered: every card is done')
+  } finally { globalThis.fetch = original }
+})
+
+test('cards: Escape or a second click shuts the box without sending', () => {
+  const { node, render, sent } = renderCards({ cards: TWO_CARDS })
+  otherButtonOf(cardsOf(node)[0]).props.onClick()
+  otherBoxOf(cardsOf(render())[0]).children[0].props.onKeyDown({ key: 'Escape', shiftKey: false, keyCode: 0, nativeEvent: {}, preventDefault() {} })
+  assert.equal(otherBoxOf(cardsOf(render())[0]), null)
+
+  otherButtonOf(cardsOf(render())[0]).props.onClick()
+  otherButtonOf(cardsOf(render())[0]).props.onClick()
+  assert.equal(otherBoxOf(cardsOf(render())[0]), null)
+  assert.deepEqual(sent, [])
+})
+
 test('cards: × closes just that card; typing, a running turn or an open menu hide them all', () => {
   const { node, render } = renderCards({ cards: TWO_CARDS })
-  // The × sits beside the question.
-  cardsOf(node)[0].children[0].children[1].props.onClick()
-  assert.deepEqual(cardsOf(render()).map(questionOf), ['要跑一下测试吗？'])
+  closeOf(cardsOf(node)[0]).props.onClick()
+  assert.deepEqual(cardsOf(render()).map(questionOf), ['要补上配置何时生效的说明吗？'])
 
   assert.equal(renderCards({ cards: TWO_CARDS, draft: '我自己说' }).node, null)
   assert.equal(renderCards({ cards: TWO_CARDS, running: true }).node, null)
