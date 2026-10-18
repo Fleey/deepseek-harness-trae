@@ -172,7 +172,7 @@ test('apply serves the model catalog, refreshed from Trae on request', async () 
   } finally { globalThis.fetch = original }
 })
 
-test('apply serves next-input suggestions for finished Trae turns', async () => {
+test('apply serves next-step cards for finished Trae turns', async () => {
   const routes = new Map()
   const adapters = {}
   const ctx = {
@@ -207,7 +207,7 @@ test('apply serves next-input suggestions for finished Trae turns', async () => 
     })) { /* consume */ }
     const got = await ask('?session=s1&wait=2000')
     assert.equal(got.ok, true)
-    assert.equal(got.value.text, '提交一下')
+    assert.deepEqual(got.value.cards, [{ question: '', choices: [{ label: '提交一下', reply: '提交一下' }] }])
     assert.equal(bodies.length, 2)
     assert.match(bodies[1].messages[1].content[0].text, /fix it[\s\S]*Done, tests pass\./)
   } finally { globalThis.fetch = original }
@@ -252,7 +252,7 @@ test('suggestion events reach report/clients by default, with the GetUserInfo us
       })) { /* consume */ }
       const get = await (await routes.get(plugin.SUGGESTION_ROUTE).fetch(new Request(`http://127.0.0.1${plugin.SUGGESTION_ROUTE}?session=s1&wait=2000`))).json()
       const post = async (action) => (await routes.get(plugin.SUGGESTION_EVENT_ROUTE).fetch(new Request(`http://127.0.0.1${plugin.SUGGESTION_EVENT_ROUTE}`, {
-        method: 'POST', body: JSON.stringify({ session: 's1', id: get.value.id, action }),
+        method: 'POST', body: JSON.stringify({ session: 's1', id: get.value.id, action, card: 0, choice: 0 }),
       }))).json()
       return { seen, shown: await post('shown'), accept: await post('accept') }
     } finally { globalThis.fetch = original }
@@ -283,4 +283,9 @@ test('suggestion events reach report/clients by default, with the GetUserInfo us
 
   const bad = await (await setup({}).routes.get(plugin.SUGGESTION_EVENT_ROUTE).fetch(new Request('http://127.0.0.1/x', { method: 'POST', body: '{"action":"nope"}' }))).json()
   assert.equal(bad.ok, false)
+  // An accept has to say which button.
+  const noPick = await (await setup({}).routes.get(plugin.SUGGESTION_EVENT_ROUTE).fetch(new Request('http://127.0.0.1/x', {
+    method: 'POST', body: JSON.stringify({ session: 's1', id: 'x', action: 'accept' }),
+  }))).json()
+  assert.equal(noPick.ok, false)
 })

@@ -739,15 +739,62 @@ const turnOptions = (extra = {}) => ({
 
 async function drain(iterable) { for await (const _ of iterable) { /* consume */ } }
 
-test('suggestions: prompt carries the recent user messages and the answer, output is cleaned', async () => {
-  const { suggestPrompt, cleanSuggestion } = await import('../lib/testing.mjs')
+test('suggestions: prompt carries the recent user messages and the answer', async () => {
+  const { suggestPrompt } = await import('../lib/testing.mjs')
   const prompt = suggestPrompt({ options: turnOptions(), answer: 'Build fixed. Want me to run the tests?' })
   assert.match(prompt, /first ask[\s\S]*fix the build[\s\S]*Want me to run the tests\?/)
+})
 
-  assert.equal(cleanSuggestion('"好的，跑一下测试"\n'), '好的，跑一下测试')
-  assert.equal(cleanSuggestion('<think>hm</think>\n\nUser: run the tests\nsecond line'), 'run the tests')
-  assert.equal(cleanSuggestion('   \n'), '')
-  assert.equal(cleanSuggestion('x'.repeat(500)), '')
+test('suggestions: the model\'s cards keep its own questions and buttons', async () => {
+  const { parseSuggestions, MAX_CARDS, MAX_CHOICES } = await import('../lib/testing.mjs')
+  // Two decisions, two cards; the buttons are whatever the model offered, not a yes/no pair.
+  const raw = '<think>hm</think>\n```json\n' + JSON.stringify([
+    {
+      question: '先做哪一个？',
+      choices: [
+        { label: '写保护逻辑', reply: '把加保护逻辑的改动写出来' },
+        { label: '整理成文档', reply: '把这份判定整理成给产品的说明文档' },
+      ],
+    },
+    { question: '要跑一下测试吗？', choices: [{ label: '跑测试', reply: '跑一下测试' }, { label: '暂不用', reply: '先不跑' }] },
+  ]) + '\n```'
+  assert.deepEqual(parseSuggestions(raw), [
+    {
+      question: '先做哪一个？',
+      choices: [
+        { label: '写保护逻辑', reply: '把加保护逻辑的改动写出来' },
+        { label: '整理成文档', reply: '把这份判定整理成给产品的说明文档' },
+      ],
+    },
+    { question: '要跑一下测试吗？', choices: [{ label: '跑测试', reply: '跑一下测试' }, { label: '暂不用', reply: '先不跑' }] },
+  ])
+
+  // A button needs something to send; a missing label says what it sends;
+  // a repeated reply and a card left with no buttons are dropped.
+  assert.deepEqual(parseSuggestions(JSON.stringify([
+    { question: 'Q', choices: [{ label: 'no reply' }, { reply: 'run the tests' }, { label: 'again', reply: 'run the tests' }] },
+    { question: 'empty', choices: [] },
+    'commit it',
+  ])), [
+    { question: 'Q', choices: [{ label: 'run the tests', reply: 'run the tests' }] },
+    { question: '', choices: [{ label: 'commit it', reply: 'commit it' }] },
+  ])
+
+  // Capped: cards and buttons per card.
+  const many = Array.from({ length: 6 }, (_, i) => ({
+    question: `q${i}`, choices: Array.from({ length: 6 }, (_, j) => ({ label: `l${j}`, reply: `r${i}.${j}` })),
+  }))
+  const capped = parseSuggestions(JSON.stringify(many))
+  assert.equal(capped.length, MAX_CARDS)
+  assert.ok(capped.every(card => card.choices.length === MAX_CHOICES))
+
+  // Not JSON: a bare line is still one card with one button; nothing usable is no card.
+  assert.deepEqual(parseSuggestions('"好的，跑一下测试"\n'), [{ question: '', choices: [{ label: '好的，跑一下测试', reply: '好的，跑一下测试' }] }])
+  assert.deepEqual(parseSuggestions('User: run the tests\nsecond line'), [{ question: '', choices: [{ label: 'run the tests', reply: 'run the tests' }] }])
+  assert.deepEqual(parseSuggestions('[]'), [])
+  assert.deepEqual(parseSuggestions('   \n'), [])
+  assert.deepEqual(parseSuggestions('[{"question": "cut off'), [])
+  assert.deepEqual(parseSuggestions('x'.repeat(500)), [])
 })
 
 test('suggestions: a finished turn is waited for, a new turn drops it, a failure is just nothing', async () => {
@@ -769,16 +816,16 @@ test('suggestions: a finished turn is waited for, a new turn drops it, a failure
   store.turnEnded({ sessionId: 's1', model: 'GLM-5.3', options: turnOptions(), answer: 'ok' })
   assert.deepEqual(asked, ['GLM-5.3'])
   const waiting = store.get('s1', 1000)
-  release('“run the tests”')
+  release('[{"question": "Run them?", "choices": [{"label": "Run", "reply": "run the tests"}]}]')
   const got = await waiting
-  assert.equal(got.text, 'run the tests')
+  assert.deepEqual(got.cards, [{ question: 'Run them?', choices: [{ label: 'Run', reply: 'run the tests' }] }])
 
   store.turnStarted('s1')
   assert.equal(await store.get('s1', 0), null)
 
   // Still in flight past the wait: answered as empty for now, not as an error.
   store.turnEnded({ sessionId: 's1', model: 'GLM-5.3', options: turnOptions(), answer: 'ok' })
-  assert.equal((await store.get('s1', 10)).text, '')
+  assert.deepEqual((await store.get('s1', 10)).cards, [])
 
   // An empty answer suggests nothing at all.
   store.turnEnded({ sessionId: 's2', model: 'GLM-5.3', options: turnOptions(), answer: '  ' })
@@ -948,7 +995,9 @@ test('suggestions: shown then accept, once each, sharing one resp_id; stale ids 
   const { TraeSuggestions, sessionUuid } = await import('../lib/testing.mjs')
   const reported = []
   const store = new TraeSuggestions({
-    complete: async () => 'run the tests',
+    complete: async () => JSON.stringify([
+      { question: 'Next?', choices: [{ label: 'Test', reply: 'run the tests' }, { label: 'Commit', reply: 'commit it' }] },
+    ]),
     model: '', timeoutMs: 5000, logger: { warn() {} },
     report: async (events) => { reported.push(...events); return true },
   })
@@ -958,19 +1007,21 @@ test('suggestions: shown then accept, once each, sharing one resp_id; stale ids 
   assert.equal(await store.record('s1', 'other-id', 'shown'), false)
   assert.equal(await store.record('s1', id, 'shown'), true)
   assert.equal(await store.record('s1', id, 'shown'), false, 'shown counts once')
-  assert.equal(await store.record('s1', id, 'accept'), true)
-  assert.equal(await store.record('s1', id, 'accept'), false, 'accept counts once')
+  assert.equal(await store.record('s1', id, 'accept'), false, 'accept names the button')
+  assert.equal(await store.record('s1', id, 'accept', { card: 0, choice: 5 }), false, 'no such button')
+  assert.equal(await store.record('s1', id, 'accept', { card: 0, choice: 1 }), true)
+  assert.equal(await store.record('s1', id, 'accept', { card: 0, choice: 0 }), false, 'accept counts once')
 
   assert.deepEqual(reported.map(e => e.event), ['code_gen_shown', 'code_gen_accept'])
   const [shown, accept] = reported.map(e => e.payload)
   assert.equal(shown.resp_id, id)
   assert.equal(accept.resp_id, id)
   assert.equal(accept.conversation_id, sessionUuid('s1'))
-  assert.equal(accept.accept_content, 'run the tests')
+  assert.equal(accept.accept_content, 'commit it', 'the pressed button\'s reply')
   assert.equal(typeof accept.suggestion_visible_duration, 'number')
 
   // A new turn retires the old id.
   store.turnStarted('s1')
-  assert.equal(await store.record('s1', id, 'accept'), false)
+  assert.equal(await store.record('s1', id, 'accept', { card: 0, choice: 0 }), false)
   assert.equal(reported.length, 2)
 })

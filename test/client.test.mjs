@@ -6,7 +6,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 
 /** Slot kinds as the host declares them (dsh-client-ui-conversation / settings). */
-const LIST_SLOTS = new Set(['conversation.input.right', 'conversation.input.overlay'])
+const LIST_SLOTS = new Set(['conversation.input.right', 'conversation.input.dock'])
 const KEYED_SLOTS = new Set(['plugins.bundle.config', 'settings.models.provider-card'])
 
 function loadClient(react = { createElement: () => null }) {
@@ -52,7 +52,8 @@ test('client: every slot registration passes the host registry rules', () => {
   }
   plugin.apply(ctx)
   const byName = Object.fromEntries(registered.map(r => [r.name, r]))
-  assert.equal(byName['conversation.input.overlay'].id, 'trae-suggestion')
+  assert.equal(byName['conversation.input.dock'].id, 'trae-choices')
+  assert.equal(byName['conversation.input.overlay'], undefined, 'no Tab ghost text any more')
   assert.equal(byName['conversation.input.right'].id, 'trae-quota')
   assert.ok(byName['plugins.bundle.config'] && byName['settings.models.provider-card'])
 })
@@ -165,4 +166,98 @@ test('chip: the label carries one figure per allowance, coloured by the emptiest
     ],
     limit: 800, used: 87.63, remaining: 712.37, dollars: false,
   }).label, 'Trae 剩余 89%')
+})
+
+/**
+ * Render the next-step cards for one session state with the same element
+ * recorder as the chip. Effects never run; the slot's own inject() supplies
+ * load/clear/dismiss/take against the real controller, seeded through its store.
+ */
+function renderCards({ cards, dismissed = [], running = false, draft = '', phase = 'plain' }) {
+  const react = {
+    createElement: (type, props, ...children) => ({ type, props, children }),
+    useEffect: () => {},
+    useRef: value => ({ current: value }),
+  }
+  const plugin = loadClient(react)
+  let Cards, entry, zh
+  const slots = {
+    inject: (_name, fn) => { fn(); return () => {} },
+    register: (options, component) => { if (options.id === 'trae-choices') { Cards = component; entry = options } return () => {} },
+  }
+  plugin.apply({
+    slots,
+    locale: { register: (_ns, dicts) => { zh = dicts.zh; return () => {} } },
+    remote: { $on: () => () => {}, credentials: { describe: async () => ({ ok: false }) } },
+    configForms: { get: () => ({ getSnapshot: () => ({}), subscribe: () => () => {} }), whileServed: (_ns, fn) => fn() },
+    effect: (fn) => { fn() },
+    inject: (_deps, cb) => { cb({ slots, modelDirectories: {} }) },
+  })
+  const injected = entry.inject('s1')
+  const store = injected.hooks.traeChoices
+  store.set({ id: 'sug-1', cards, dismissed })
+  const sent = []
+  const inputActions = {
+    setDraft: (text) => { sent.push(['draft', text]) },
+    submit: () => { sent.push(['submit']) },
+  }
+  const render = () => Cards({
+    t: key => zh[key],
+    sessionId: 's1',
+    inputActions,
+    useSession: select => select({ running }),
+    useInput: select => select({ draft, phase }),
+    useTraeChoices: select => select(store.getSnapshot()),
+    ...injected,
+  })
+  return { node: render(), render, store, sent }
+}
+
+const cardsOf = node => node.children[0]
+const questionOf = card => card.children[0].children[0].children[0]
+const buttonsOf = card => card.children[1].children[0]
+
+const TWO_CARDS = [
+  {
+    question: '先做哪一个？',
+    choices: [
+      { label: '写保护逻辑', reply: '把加保护逻辑的改动写出来' },
+      { label: '整理成文档', reply: '把这份判定整理成给产品的说明文档' },
+    ],
+  },
+  { question: '要跑一下测试吗？', choices: [{ label: '跑测试', reply: '跑一下测试' }, { label: '暂不用', reply: '先不跑' }] },
+]
+
+test('cards: one card per decision, the model\'s own answers as buttons, its pick first', () => {
+  const { node } = renderCards({ cards: TWO_CARDS })
+  const cards = cardsOf(node)
+  assert.deepEqual(cards.map(questionOf), ['先做哪一个？', '要跑一下测试吗？'])
+  assert.deepEqual(cards.map(card => buttonsOf(card).map(button => button.children[0])), [['写保护逻辑', '整理成文档'], ['跑测试', '暂不用']])
+  assert.deepEqual(buttonsOf(cards[0]).map(button => button.props.variant), ['primary', 'outline'])
+})
+
+test('cards: a button sends its reply as the next message and retires every card', () => {
+  const original = globalThis.fetch
+  const events = []
+  globalThis.fetch = async (_url, init) => { events.push(JSON.parse(init.body)); return Response.json({ ok: true }) }
+  try {
+    const { node, render, sent } = renderCards({ cards: TWO_CARDS })
+    buttonsOf(cardsOf(node)[0])[1].props.onClick()
+    assert.deepEqual(sent, [['draft', '把这份判定整理成给产品的说明文档'], ['submit']])
+    assert.deepEqual(events, [{ session: 's1', id: 'sug-1', action: 'accept', card: 0, choice: 1 }])
+    assert.equal(render(), null)
+  } finally { globalThis.fetch = original }
+})
+
+test('cards: × closes just that card; typing, a running turn or an open menu hide them all', () => {
+  const { node, render } = renderCards({ cards: TWO_CARDS })
+  // The × sits beside the question.
+  cardsOf(node)[0].children[0].children[1].props.onClick()
+  assert.deepEqual(cardsOf(render()).map(questionOf), ['要跑一下测试吗？'])
+
+  assert.equal(renderCards({ cards: TWO_CARDS, draft: '我自己说' }).node, null)
+  assert.equal(renderCards({ cards: TWO_CARDS, running: true }).node, null)
+  assert.equal(renderCards({ cards: TWO_CARDS, phase: 'claimed' }).node, null)
+  assert.equal(renderCards({ cards: TWO_CARDS, dismissed: [0, 1] }).node, null)
+  assert.equal(renderCards({ cards: [] }).node, null)
 })
