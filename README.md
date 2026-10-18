@@ -16,6 +16,10 @@ v0.3 起插件自己直连 Trae 的 `llm_raw_chat` 接口（和 trae2api 的 dir
 
 <img width="1598" height="1536" alt="image" src="https://github.com/user-attachments/assets/3d35d44e-dd11-44ce-a370-ec186e44f0fb" />
 
+支持像claude一样弹出建议弹窗
+
+<img width="600" height="135" alt="image" src="https://github.com/user-attachments/assets/bbefde18-3309-40ee-99f0-9bf9b5904592" />
+
 
 ## 它做了什么
 
