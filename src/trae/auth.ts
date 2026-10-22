@@ -13,6 +13,7 @@
  */
 
 import { LlmError } from '@deepseek-ai/dsh-llm'
+import { httpCode } from './wire.ts'
 
 export const TRAE_HOST = 'https://api.enterprise.trae.cn'
 export const EXCHANGE_PATH = '/cloudide/api/v3/trae/oauth/ExchangeToken'
@@ -154,7 +155,10 @@ export class TraeAuth {
         signal: AbortSignal.timeout(30_000),
       })
     } catch (error) {
-      throw new LlmError(`Trae：无法连接 ${this.opts.host}（${error instanceof Error ? error.message : String(error)}）`, 'PROVIDER_UNAVAILABLE')
+      // `TRANSPORT`, not a provider-shaped code: this is the host's own
+      // retryable set, and a PAT exchange that could not connect is worth
+      // another attempt before the turn fails.
+      throw new LlmError(`Trae：无法连接 ${this.opts.host}（${error instanceof Error ? error.message : String(error)}）`, 'TRANSPORT', { cause: error })
     }
     const text = await res.text()
     let body: unknown
@@ -165,7 +169,7 @@ export class TraeAuth {
       const auth = res.status === 401 || res.status === 403 || /token|auth|expire|invalid|unauthor/i.test(detail)
       throw new LlmError(
         `Trae：个人访问令牌兑换失败（HTTP ${res.status}）${detail ? `：${detail}` : ''}。请确认 PAT 正确且未过期。`,
-        auth ? 'AUTH' : 'PROVIDER_HTTP_ERROR',
+        auth ? 'AUTH' : httpCode(res.status, detail),
         { status: res.status },
       )
     }

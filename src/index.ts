@@ -72,6 +72,12 @@ export interface Config {
   readTimeoutMs: number
   emptyRetries: number
   loopGuardChars: number
+  /**
+   * Turn a tool call the model wrote as `<invoke>` prose into a real one. Only
+   * outside code fences, only at the end of an answer with no native tool
+   * call; false leaves every such block in the answer as text.
+   */
+  recoverTextToolCalls: boolean
   /** Offer next-step choices above the composer after each answer (yes sends one). */
   suggestions: boolean
   /** Model asked for suggestions; empty = the model that answered. */
@@ -107,6 +113,8 @@ export const Config: Schema<Config> = Schema.object({
   readTimeoutMs: Schema.natural().default(300_000),
   emptyRetries: Schema.natural().default(1),
   loopGuardChars: Schema.natural().default(600),
+  recoverTextToolCalls: Schema.boolean().default(true)
+    .description('把模型写成 <invoke> 文本的工具调用恢复成真实调用（代码块里的、正文中间的一律不算）'),
   suggestions: Schema.boolean().default(true),
   suggestModel: Schema.string().default(''),
   suggestTimeoutMs: Schema.natural().default(20_000),
@@ -190,7 +198,7 @@ export function apply(ctx: Context, config: Config): void {
     mode: config.catalogSource,
     cacheFile: config.modelsCacheFile || MODELS_CACHE_FILE,
     ...config.catalogSource === 'builtin' ? {} : {
-      fetchUpstream: async () => {
+      fetchUpstream: async (signal) => {
         const body = JSON.stringify(CATALOG_BODY)
         let session = await auth.get()
         for (let attempt = 0; ; attempt++) {
@@ -198,6 +206,7 @@ export function apply(ctx: Context, config: Config): void {
             method: 'POST',
             headers: traeHeaders(identity, session.token, 'application/json'),
             body,
+            signal,
           })
           if ((res.status === 401 || res.status === 403) && attempt === 0) {
             await res.body?.cancel()
@@ -250,6 +259,7 @@ export function apply(ctx: Context, config: Config): void {
     readTimeoutMs: config.readTimeoutMs,
     emptyRetries: config.emptyRetries,
     loopGuardChars: config.loopGuardChars,
+    recoverTextToolCalls: config.recoverTextToolCalls,
     // The attachment store that turns durable image references into request
     // bytes; `ctx.get` throws when absent, so guard with optional chaining on
     // the injected context (Desktop and Web both mount it; CLI-only setups
