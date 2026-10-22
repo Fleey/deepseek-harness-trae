@@ -247,11 +247,22 @@ export interface CatalogOptions {
   /** traecli's cache file; empty disables that step. */
   cacheFile?: string
   /** The upstream call, injected so tests and the builtin mode stay offline. */
-  fetchUpstream?: () => Promise<unknown>
+  fetchUpstream?: (signal: AbortSignal) => Promise<unknown>
   /** Overridable for tests. */
   readCacheFile?: (file: string) => Promise<string>
+  /**
+   * Deadline for one upstream catalog call. Without it the request inherits
+   * undici's own (300s headers, and a body timer any trickle of bytes resets),
+   * which is far longer than a turn may wait for a model list.
+   */
+  fetchTimeoutMs?: number
+  /** How long `ready()` waits before the caller runs on the snapshot it has. */
+  readyWaitMs?: number
   logger?: { info(...a: unknown[]): void; warn(...a: unknown[]): void }
 }
+
+const FETCH_TIMEOUT_MS = 15_000
+const READY_WAIT_MS = 15_000
 
 /**
  * The catalog the adapter asks. It holds the newest snapshot it managed to
@@ -271,10 +282,46 @@ export class TraeCatalog {
     return this.current
   }
 
-  /** Refresh once per plugin start; concurrent callers share the one attempt. */
-  ready(): Promise<CatalogSnapshot> {
+  /**
+   * Refresh once per plugin start; concurrent callers share the one attempt.
+   *
+   * A caller waiting on a turn never waits indefinitely: past `readyWaitMs`
+   * this answers with the snapshot it already has (the built-in table on a
+   * first run) and leaves the refresh running for the next caller. `signal`
+   * is the caller's own — a stop press rejects instead of waiting out the
+   * deadline.
+   */
+  ready(signal?: AbortSignal): Promise<CatalogSnapshot> {
     if (this.done) return Promise.resolve(this.current)
-    return this.refresh()
+    return this.race(this.refresh(), signal)
+  }
+
+  /** The refresh, the wait deadline and the caller's stop, whichever lands first. */
+  private race(attempt: Promise<CatalogSnapshot>, signal: AbortSignal | undefined): Promise<CatalogSnapshot> {
+    const wait = this.opts.readyWaitMs ?? READY_WAIT_MS
+    if (wait <= 0 && !signal) return attempt
+    return new Promise<CatalogSnapshot>((resolve, reject) => {
+      let settled = false
+      const land = (run: () => void): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+        run()
+      }
+      const onAbort = (): void => land(() => reject(signal?.reason ?? new Error('aborted')))
+      const timer = wait > 0
+        ? setTimeout(() => land(() => {
+          this.opts.logger?.warn(`dsh-trae2api: 模型目录 ${Math.round(wait / 1000)} 秒没有回来，本轮先用现有的那份（${this.current.origin}）`)
+          resolve(this.current)
+        }), wait)
+        : undefined
+      timer?.unref?.()
+      if (signal?.aborted) { onAbort(); return }
+      signal?.addEventListener('abort', onAbort, { once: true })
+      // A failed refresh keeps serving the previous snapshot, so never reject.
+      attempt.then(next => land(() => resolve(next)), () => land(() => resolve(this.current)))
+    })
   }
 
   /** Re-ask the sources now. Never downgrades a good snapshot on failure. */
@@ -304,7 +351,8 @@ export class TraeCatalog {
 
     if ((mode === 'auto' || mode === 'upstream') && this.opts.fetchUpstream) {
       try {
-        const models = parseDetailParams(await this.opts.fetchUpstream())
+        const timeout = this.opts.fetchTimeoutMs ?? FETCH_TIMEOUT_MS
+        const models = parseDetailParams(await this.opts.fetchUpstream(AbortSignal.timeout(timeout)))
         if (models.length > 0) {
           this.opts.logger?.info(`dsh-trae2api: 模型目录已从上游刷新，共 ${models.length} 个模型`)
           return snapshot(models, 'upstream', Date.now())

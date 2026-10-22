@@ -50,6 +50,11 @@ v0.3 起插件自己直连 Trae 的 `llm_raw_chat` 接口（和 trae2api 的 dir
 - 内置了 trae2api 里那几道兜底：工具调用历史修复（避免 `4027`）、把模型写成文本的
   `<invoke>` 工具调用捞回来、重复塌缩截断、空回合重试、上游错误码翻译。
 
+  > 「捞回来」只认模型自己发起的那一个：代码块（``` ```）和行内反引号里的、正文中间
+  > 后面还有正文的、以及这一轮已经有原生 `tool_calls` 的，一律当文本留在回答里。所以
+  > 讲解 XML 工具格式的回答、或模型转述别处读到的这类标记，都不会变成真实调用。
+  > `recoverTextToolCalls: false` 可以整个关掉。
+
 ## 安装到 Desktop
 
 1. 打开一次 DeepSeek Harness Desktop（初始化 `desktop` profile），然后**完全退出**。
@@ -107,6 +112,7 @@ dsh plugin --profile desktop add ./dsh-trae2api-0.5.0.tgz
 | `readTimeoutMs` | `300000` | 上游两次数据之间的最长间隔 |
 | `emptyRetries` | `1` | 空回合/瞬时故障的额外重试次数 |
 | `loopGuardChars` | `600` | 重复塌缩截断的触发长度；0 关闭 |
+| `recoverTextToolCalls` | `true` | 把模型写成 `<invoke>` 文本的工具调用恢复成真实调用；`false` 一律当文本留在回答里 |
 | `suggestions` | `true` | 回答完后在输入框上方给出下一步选择卡片（点按钮直接发送）；`false` 关闭 |
 | `suggestModel` | 空 | 生成建议用的模型；空 = 用刚回答的那个模型 |
 | `suggestTimeoutMs` | `20000` | 生成一轮选择卡片的最长等待 |

@@ -25,6 +25,7 @@ import { BUILTIN_SNAPSHOT, type CatalogSnapshot, type TraeCatalog } from './trae
 import {
   approxTokens,
   classify,
+  httpCode,
   LoopDetector,
   sessionUuid,
   TextToolCallSniffer,
@@ -65,6 +66,11 @@ export interface AdapterOptions {
   emptyRetries: number
   /** Repetition guard span in characters; 0 disables. */
   loopGuardChars: number
+  /**
+   * Turn a tool call the model wrote as `<invoke>` prose into a real one.
+   * Default on; false leaves every such block in the answer as text.
+   */
+  recoverTextToolCalls?: boolean
   /**
    * Mounted harness attachment store, resolved per request; absent (or a
    * provider that cannot project images) degrades images to their
@@ -179,9 +185,13 @@ export class TraeAdapter extends LlmAdapter {
     return { id: provider, name: this.opts.displayName }
   }
 
-  /** The catalog as of this plugin start, refreshed on first use. */
-  private catalog(): Promise<CatalogSnapshot> {
-    return this.opts.catalog?.ready() ?? Promise.resolve(BUILTIN_SNAPSHOT)
+  /**
+   * The catalog as of this plugin start, refreshed on first use. `signal` is
+   * the turn's own: waiting for a model list must not outlive the stop button,
+   * and `ready` itself gives up on the snapshot it has rather than hang.
+   */
+  private catalog(signal?: AbortSignal): Promise<CatalogSnapshot> {
+    return this.opts.catalog?.ready(signal) ?? Promise.resolve(BUILTIN_SNAPSHOT)
   }
 
   /**
@@ -239,7 +249,9 @@ export class TraeAdapter extends LlmAdapter {
         res = await fetch(`${this.opts.host}${CHAT_PATH}`, { method: 'POST', headers: this.headers(session.token), body, signal })
       } catch (error) {
         if (signal.aborted) throw error
-        throw new LlmError(`Trae：无法连接 ${this.opts.host}（${error instanceof Error ? error.message : String(error)}）`, 'PROVIDER_UNAVAILABLE')
+        // A refused or dropped connection is the host's `TRANSPORT`: the next
+        // attempt may well land, and nothing was consumed upstream.
+        throw new LlmError(`Trae：无法连接 ${this.opts.host}（${error instanceof Error ? error.message : String(error)}）`, 'TRANSPORT', { cause: error })
       }
       if ((res.status === 401 || res.status === 403) && attempt === 0) {
         await res.body?.cancel()
@@ -248,8 +260,7 @@ export class TraeAdapter extends LlmAdapter {
       }
       if (!res.ok) {
         const detail = (await res.text()).slice(0, 400)
-        const code = res.status === 401 || res.status === 403 ? 'AUTH' : res.status === 429 ? 'RATE_LIMIT' : res.status >= 500 ? 'PROVIDER_UNAVAILABLE' : 'PROVIDER_HTTP_ERROR'
-        throw new LlmError(`Trae llm_raw_chat HTTP ${res.status}${detail ? `：${detail}` : ''}`, code, { status: res.status })
+        throw new LlmError(`Trae llm_raw_chat HTTP ${res.status}${detail ? `：${detail}` : ''}`, httpCode(res.status, detail), { status: res.status })
       }
       if (!res.body) throw new LlmError('Trae 返回了空响应体', 'PROVIDER_PROTOCOL_ERROR')
       yield* traeEvents(res.body)
@@ -324,7 +335,7 @@ export class TraeAdapter extends LlmAdapter {
    * the conversation's own server-side state.
    */
   async complete(model: string, system: string, user: string, signal: AbortSignal): Promise<string> {
-    const route = (await this.catalog()).find(model)
+    const route = (await this.catalog(signal)).find(model)
     if (!route) throw new LlmError(`Trae：未知模型「${model}」`, 'MODEL_NOT_FOUND')
     const messages = [
       { role: 'system', content: [{ type: 'text', text: system }] },
@@ -342,7 +353,7 @@ export class TraeAdapter extends LlmAdapter {
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
-    const catalog = await this.catalog()
+    const catalog = await this.catalog(options.signal)
     const route = catalog.find(options.model)
     if (!route) {
       throw new LlmError(`Trae：未知模型「${options.model}」。可用：${catalog.routes.map(r => r.id).join('、')}`, 'MODEL_NOT_FOUND')
@@ -388,7 +399,7 @@ export class TraeAdapter extends LlmAdapter {
     const budget = options.maxTokens
     const contentLoop = new LoopDetector(this.opts.loopGuardChars)
     const reasoningLoop = new LoopDetector(this.opts.loopGuardChars)
-    const sniffer = new TextToolCallSniffer(schemas)
+    const sniffer = new TextToolCallSniffer(schemas, this.opts.recoverTextToolCalls ?? true)
 
     function* emitText(piece: string): Generator<StreamChunk> {
       if (!piece) return
@@ -439,9 +450,7 @@ export class TraeAdapter extends LlmAdapter {
               const response = typeof data.response === 'string' ? data.response : ''
               if (response) {
                 produced = true
-                const { visible, calls } = sniffer.feed(response)
-                yield* emitText(visible)
-                yield* emitRecovered(calls)
+                yield* emitText(sniffer.feed(response))
               }
               const calls = Array.isArray(data.tool_calls) ? data.tool_calls as Array<Record<string, unknown>> : []
               for (const call of calls) {
@@ -484,9 +493,14 @@ export class TraeAdapter extends LlmAdapter {
           if (!stopped) {
             if (options.signal?.aborted) throw err
             if (controller.signal.aborted) {
-              throw new LlmError(`Trae：上游 ${Math.round(this.opts.readTimeoutMs / 1000)} 秒没有数据，已放弃本轮`, 'PROVIDER_TIMEOUT')
+              throw new LlmError(`Trae：上游 ${Math.round(this.opts.readTimeoutMs / 1000)} 秒没有数据，已放弃本轮`, 'TIMEOUT')
             }
-            throw err
+            // Already an LlmError (`once` classified it) or a bare read fault:
+            // undici throws `TypeError: terminated` when the stream is reset
+            // mid-answer, and an unwrapped one reaches the host as `UNKNOWN`,
+            // which it will not retry.
+            if (err instanceof LlmError) throw err
+            throw new LlmError(`Trae：读取上游流失败（${err instanceof Error ? err.message : String(err)}）`, 'TRANSPORT', { cause: err })
           }
         } finally {
           clearTimeout(idle)
@@ -506,7 +520,9 @@ export class TraeAdapter extends LlmAdapter {
         await sleep(1000 * (attempt + 1))
       }
 
-      const tail = sniffer.flush()
+      // A turn that already called a tool properly needs no recovery from its
+      // prose, so a quoted `<invoke>` next to a real call stays text.
+      const tail = sniffer.flush(tools.size === 0)
       yield* emitText(tail.visible)
       yield* emitRecovered(tail.calls)
       for (const end of ends) yield end()
