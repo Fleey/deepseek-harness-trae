@@ -85,10 +85,10 @@ v0.3 起插件自己直连 Trae 的 `llm_raw_chat` 接口（和 trae2api 的 dir
 
 ### 用 tgz 安装（发给别人）
 
-`dsh-trae2api-0.5.3.tgz` 是预构建好的包，不需要构建权限：
+`dsh-trae2api-0.5.4.tgz` 是预构建好的包，不需要构建权限：
 
 ```sh
-dsh plugin --profile desktop add ./dsh-trae2api-0.5.3.tgz
+dsh plugin --profile desktop add ./dsh-trae2api-0.5.4.tgz
 ```
 
 装完同样去 **设置 → 模型 → Trae** 填 PAT。tgz 方式下插件自带全部代码，和项目目录无关。
