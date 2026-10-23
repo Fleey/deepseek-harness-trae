@@ -258,22 +258,49 @@ export interface CatalogOptions {
   fetchTimeoutMs?: number
   /** How long `ready()` waits before the caller runs on the snapshot it has. */
   readyWaitMs?: number
+  /** After a refresh upstream failed, how long `ready()` keeps the fallback before asking again. */
+  retryAfterMs?: number
+  /** The same, when upstream was never asked because the PAT could not be read. */
+  retryNoCredentialMs?: number
   logger?: { info(...a: unknown[]): void; warn(...a: unknown[]): void }
 }
 
 const FETCH_TIMEOUT_MS = 15_000
 const READY_WAIT_MS = 15_000
+/** A failing upstream is asked again at most this often. */
+const RETRY_AFTER_MS = 60_000
+/**
+ * A PAT that cannot be read sent nothing upstream — at plugin start the host's
+ * credential store may simply not be up yet — so it is worth asking again
+ * soon; not on every call, though, or a profile with no PAT re-reads the
+ * traecli cache file for each one.
+ */
+const RETRY_NO_CREDENTIAL_MS = 5_000
+/** TraeAuth's error code for a PAT that is not there (yet). */
+const MISSING_CREDENTIAL = 'MISSING_CREDENTIAL'
 
 /**
  * The catalog the adapter asks. It holds the newest snapshot it managed to
  * build and refreshes once per plugin start — a plugin reload (and a saved PAT,
  * which resets it) is therefore also a catalog refresh. `refresh(true)` is the
- * manual path behind the Models card's button.
+ * manual path.
+ *
+ * Only upstream settles it. A refresh that had to fall back to traecli's cache
+ * or the built-in table is served as it is, and asked again once its cooldown
+ * is over: those sources cannot say which models take images (the cache claims
+ * images for every model, so a model the built-in table does not know is
+ * text-only there), and the usual cause — the PAT not being readable while the
+ * host is still starting — is gone a few seconds later.
  */
 export class TraeCatalog {
   private current: CatalogSnapshot = BUILTIN_SNAPSHOT
   private inflight: Promise<CatalogSnapshot> | undefined
-  private done = false
+  /**
+   * When `ready()` may ask again: undefined before the first refresh (and
+   * after a reset), Infinity once upstream has answered or the mode never asks
+   * it, otherwise the end of the fallback's cooldown.
+   */
+  private retryAt: number | undefined
 
   constructor(private readonly opts: CatalogOptions = {}) {}
 
@@ -283,7 +310,8 @@ export class TraeCatalog {
   }
 
   /**
-   * Refresh once per plugin start; concurrent callers share the one attempt.
+   * Refresh once per plugin start — again after a cooldown while upstream has
+   * not answered; concurrent callers share the one attempt.
    *
    * A caller waiting on a turn never waits indefinitely: past `readyWaitMs`
    * this answers with the snapshot it already has (the built-in table on a
@@ -292,7 +320,7 @@ export class TraeCatalog {
    * deadline.
    */
   ready(signal?: AbortSignal): Promise<CatalogSnapshot> {
-    if (this.done) return Promise.resolve(this.current)
+    if (this.retryAt !== undefined && Date.now() < this.retryAt) return Promise.resolve(this.current)
     return this.race(this.refresh(), signal)
   }
 
@@ -327,9 +355,11 @@ export class TraeCatalog {
   /** Re-ask the sources now. Never downgrades a good snapshot on failure. */
   refresh(force = false): Promise<CatalogSnapshot> {
     if (this.inflight && !force) return this.inflight
-    const attempt = this.load().then((next) => {
-      this.done = true
+    const attempt = this.load().then(({ next, retryIn }) => {
       if (next) this.current = next
+      // Upstream's answer settles it, whether new or kept from an earlier
+      // refresh; only a fallback is asked again once its cooldown is over.
+      this.retryAt = retryIn === undefined || this.current.origin === 'upstream' ? Infinity : Date.now() + retryIn
       return this.current
     }).finally(() => {
       if (this.inflight === attempt) this.inflight = undefined
@@ -340,28 +370,39 @@ export class TraeCatalog {
 
   /** Next `ready()` asks again (the PAT changed, so the old answer may be wrong). */
   reset(): void {
-    this.done = false
+    this.retryAt = undefined
     this.inflight = undefined
   }
 
-  private async load(): Promise<CatalogSnapshot | undefined> {
+  /**
+   * One pass over the sources. `next` is the snapshot to serve (undefined =
+   * keep the current one); `retryIn` is how long until upstream is worth
+   * asking again, undefined when this answer settles the catalog.
+   */
+  private async load(): Promise<{ next?: CatalogSnapshot; retryIn?: number }> {
     const mode = this.opts.mode ?? 'auto'
-    if (mode === 'builtin') return BUILTIN_SNAPSHOT
+    if (mode === 'builtin') return { next: BUILTIN_SNAPSHOT }
     const notes: string[] = []
+    let retryIn: number | undefined
 
     if ((mode === 'auto' || mode === 'upstream') && this.opts.fetchUpstream) {
+      retryIn = this.opts.retryAfterMs ?? RETRY_AFTER_MS
       try {
         const timeout = this.opts.fetchTimeoutMs ?? FETCH_TIMEOUT_MS
         const models = parseDetailParams(await this.opts.fetchUpstream(AbortSignal.timeout(timeout)))
         if (models.length > 0) {
           this.opts.logger?.info(`dsh-trae2api: 模型目录已从上游刷新，共 ${models.length} 个模型`)
-          return snapshot(models, 'upstream', Date.now())
+          return { next: snapshot(models, 'upstream', Date.now()) }
         }
         notes.push('上游目录没有返回可用模型')
       } catch (error) {
+        if ((error as { code?: unknown } | undefined)?.code === MISSING_CREDENTIAL) {
+          retryIn = this.opts.retryNoCredentialMs ?? RETRY_NO_CREDENTIAL_MS
+        }
         notes.push(`上游目录拉取失败（${error instanceof Error ? error.message : String(error)}）`)
       }
     }
+    const retry = (next?: CatalogSnapshot) => ({ ...next ? { next } : {}, ...retryIn === undefined ? {} : { retryIn } })
 
     const cacheFile = this.opts.cacheFile ?? MODELS_CACHE_FILE
     if ((mode === 'auto' || mode === 'cache') && cacheFile) {
@@ -370,8 +411,9 @@ export class TraeCatalog {
         const models = parseModelsCache(JSON.parse(await read(cacheFile)))
         if (models.length > 0) {
           const note = notes.join('；')
-          this.opts.logger?.info(`dsh-trae2api: 模型目录取自 traecli 缓存 ${cacheFile}，共 ${models.length} 个模型${note ? `（${note}）` : ''}`)
-          return snapshot(models, 'cache', Date.now(), note || undefined)
+          const again = retryIn === undefined ? '' : `，${Math.round(retryIn / 1000)} 秒后再试上游`
+          this.opts.logger?.info(`dsh-trae2api: 模型目录取自 traecli 缓存 ${cacheFile}，共 ${models.length} 个模型${note ? `（${note}${again}）` : ''}`)
+          return retry(snapshot(models, 'cache', Date.now(), note || undefined))
         }
         notes.push(`${cacheFile} 里没有可用模型`)
       } catch (error) {
@@ -385,9 +427,9 @@ export class TraeCatalog {
     // the way back to the built-in table.
     if (this.current.origin !== 'builtin') {
       if (note) this.opts.logger?.warn(`dsh-trae2api: 模型目录刷新失败，继续用上次拿到的那份（${note}）`)
-      return undefined
+      return retry()
     }
     if (note) this.opts.logger?.warn(`dsh-trae2api: 模型目录沿用插件内置的那份（${note}）`)
-    return note ? snapshot(TRAE_MODELS, 'builtin', Date.now(), note) : BUILTIN_SNAPSHOT
+    return retry(note ? snapshot(TRAE_MODELS, 'builtin', Date.now(), note) : BUILTIN_SNAPSHOT)
   }
 }

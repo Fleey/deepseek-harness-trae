@@ -198,6 +198,132 @@ test('catalog store: upstream, then the cache file, then the built-in table', as
   assert.equal(kept.routes.length, 4)
 })
 
+/**
+ * The two catalog fixtures with one more model each: a dated variant the
+ * built-in table has never heard of, which upstream says takes images.
+ */
+function withNewModel() {
+  const name = 'DeepSeek-V4.1-Flash-1017'
+  const upstream = JSON.parse(readFileSync(new URL('./fixtures/detail_param.json', import.meta.url), 'utf8'))
+  const configs = upstream.function_configs[0].config_info_list
+  const live = structuredClone(configs[0])
+  live.config_name = name
+  live.display_config.display_name = name
+  live.display_config.multimodal = true
+  live.model_detail_list = live.model_detail_list.map(d => ({ ...d, model_name: d.model_name.replace('Doubao-Seed-Evolving', name) }))
+  configs.push(live)
+
+  const cache = JSON.parse(readFileSync(new URL('./fixtures/models_cache.json', import.meta.url), 'utf8'))
+  const cached = structuredClone(cache.models[0])
+  cached.slug = name
+  cached.config_name = name
+  cached.input_modalities = ['text', 'image']
+  const variants = cached.business_metadata?.variants
+  if (variants) for (const key of ['standard_key', 'max_key']) if (typeof variants[key] === 'string') variants[key] = variants[key].replace('Doubao-Seed-Evolving', name)
+  cache.models.push(cached)
+  return { name, upstream, cacheText: JSON.stringify(cache) }
+}
+
+test('catalog store: a fallback is asked again after its cooldown, and upstream settles it', async () => {
+  const { name, upstream, cacheText } = withNewModel()
+  let fetches = 0
+  let up = false
+  const store = new TraeCatalog({
+    cacheFile: '/fixture/models_cache.json',
+    retryAfterMs: 40,
+    fetchUpstream: async () => { fetches++; if (!up) throw new Error('HTTP 502'); return upstream },
+    readCacheFile: async () => cacheText,
+  })
+
+  // Upstream down: the cache carries the list, and it cannot vouch for images
+  // on a model the built-in table does not know.
+  const first = await store.ready()
+  assert.equal(first.origin, 'cache')
+  assert.equal(first.find(name).multimodal, false)
+  // Within the cooldown nobody asks again.
+  await store.ready()
+  assert.equal(fetches, 1)
+
+  // Past it, the next use asks again; upstream is back and knows better.
+  up = true
+  await new Promise(r => setTimeout(r, 60))
+  const second = await store.ready()
+  assert.equal(fetches, 2)
+  assert.equal(second.origin, 'upstream')
+  assert.equal(second.find(name).multimodal, true)
+
+  // Settled: no more asking, however long it has been.
+  await new Promise(r => setTimeout(r, 60))
+  await store.ready()
+  assert.equal(fetches, 2)
+})
+
+test('catalog store: a PAT not readable yet (host still starting) is asked again soon, not after the long cooldown', async () => {
+  const { name, upstream, cacheText } = withNewModel()
+  let fetches = 0
+  let pat = false
+  const store = new TraeCatalog({
+    cacheFile: '/fixture/models_cache.json',
+    retryAfterMs: 60_000,
+    retryNoCredentialMs: 20,
+    fetchUpstream: async () => {
+      fetches++
+      if (!pat) throw Object.assign(new Error('Trae：还没有填写个人访问令牌（PAT）。'), { code: 'MISSING_CREDENTIAL' })
+      return upstream
+    },
+    readCacheFile: async () => cacheText,
+  })
+  // The plugin's own start-up refresh, before the credential store is up.
+  assert.equal((await store.ready()).origin, 'cache')
+  await store.ready()
+  assert.equal(fetches, 1, 'not on every call either')
+
+  // Moments later the PAT reads fine, and the first real use gets upstream's answer.
+  pat = true
+  await new Promise(r => setTimeout(r, 30))
+  const snapshot = await store.ready()
+  assert.equal(fetches, 2)
+  assert.equal(snapshot.origin, 'upstream')
+  assert.equal(snapshot.find(name).multimodal, true)
+})
+
+test('catalog store: what never asks upstream is settled at once, and a failed refresh keeps a good answer settled', async () => {
+  // Pinned to the cache: nothing to retry.
+  let reads = 0
+  const cacheOnly = new TraeCatalog({
+    mode: 'cache',
+    cacheFile: '/fixture/models_cache.json',
+    retryAfterMs: 1,
+    fetchUpstream: async () => { throw new Error('never asked') },
+    readCacheFile: async () => { reads++; return readFileSync(new URL('./fixtures/models_cache.json', import.meta.url), 'utf8') },
+  })
+  await cacheOnly.ready()
+  await new Promise(r => setTimeout(r, 10))
+  await cacheOnly.ready()
+  assert.equal(reads, 1)
+
+  // Upstream answered once, then a manual refresh failed: the upstream list
+  // stays, and it is not a fallback to come back for.
+  let fetches = 0
+  let ok = true
+  const store = new TraeCatalog({
+    cacheFile: '',
+    retryAfterMs: 1,
+    fetchUpstream: async () => { fetches++; if (!ok) throw new Error('gateway'); return fixture('detail_param.json') },
+  })
+  await store.ready()
+  ok = false
+  assert.equal((await store.refresh(true)).origin, 'upstream')
+  await new Promise(r => setTimeout(r, 10))
+  await store.ready()
+  assert.equal(fetches, 2)
+
+  // A saved PAT still starts over.
+  store.reset()
+  await store.ready()
+  assert.equal(fetches, 3)
+})
+
 test('catalog store: a hung upstream never holds the turn or the stop button', async () => {
   // The store's own timers are unref'd so a pending refresh cannot delay a
   // process exit; this keeps the loop alive for the duration of the test.
