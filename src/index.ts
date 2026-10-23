@@ -192,7 +192,8 @@ export function apply(ctx: Context, config: Config): void {
    * list is asked for rather than shipped: `batch_get_detail_param` first (the
    * call traecli makes), then traecli's own cache file, then the built-in
    * table. Refreshed once per plugin start, again whenever the PAT changes,
-   * and on demand from the card's 刷新 button.
+   * and on demand through the catalog route's `?refresh`; until upstream has
+   * answered, a fallback is asked again after a cooldown (see TraeCatalog).
    */
   const catalog = new TraeCatalog({
     mode: config.catalogSource,
@@ -296,7 +297,9 @@ export function apply(ctx: Context, config: Config): void {
 
   // One catalog refresh per plugin start, without waiting for the first turn:
   // reloading the plugin is how a user asks for a fresh model list. A failure
-  // is already logged by the store, which keeps serving the previous answer.
+  // is already logged by the store, which keeps serving the previous answer
+  // and asks upstream again later — this early, the host's credential store
+  // may not be up yet, and the PAT then reads as missing.
   void catalog.ready().catch(() => { /* logged in the store */ })
 
   // Remaining quota for the card and the composer chip. A Connection route
