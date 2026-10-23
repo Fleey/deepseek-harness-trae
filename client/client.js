@@ -49,6 +49,8 @@ window.__ModuleLoader__.load({
     const QUOTA_ROUTE = '/api/dsh-trae2api/quota'
     /** How often a visible chip re-reads the quota. */
     const QUOTA_POLL_MS = 5 * 60_000
+    /** How long the "new upstream conversation next turn" notice stays up. */
+    const SWITCH_NOTICE_MS = 8_000
     /** Host route serving next-step cards (see SUGGESTION_ROUTE in src/index.ts). */
     const SUGGESTION_ROUTE = '/api/dsh-trae2api/suggestion'
     /** How long a just-ended turn waits for its cards. */
@@ -119,6 +121,9 @@ window.__ModuleLoader__.load({
       quotaChipPack: '{name}：{detail}',
       quotaChipTotal: '合计：{detail}',
       quotaChipHint: '点击刷新',
+      switchNotice: '换了模型／档位 · 下一轮重开会话',
+      switchNoticeHint: '上游是按会话绑定模型的：换了模型或思考档位，下一轮就在一条新的上游会话里跑。上一个模型的服务端状态和 prompt 缓存都不沿用，这一轮按完整 prompt 计费；换回原来的模型和档位，还是回到它自己那条会话。',
+      switchCardHint: '换模型或思考档位会在下一轮开一条新的上游会话（prompt 缓存从头建立）——上游不认同一条会话里换模型。',
       choicesDismiss: '收起',
       choicesEyebrow: '下一步',
       choicesOther: '其他建议',
@@ -177,6 +182,9 @@ window.__ModuleLoader__.load({
       quotaChipPack: '{name}: {detail}',
       quotaChipTotal: 'Total: {detail}',
       quotaChipHint: 'Click to refresh',
+      switchNotice: 'Model/level changed · new chat next turn',
+      switchNoticeHint: 'Upstream binds a chat to the model it started on: after a model or thinking-level switch, the next turn runs in a new upstream chat. None of the previous model\'s server-side state or prompt cache carries over, so that turn pays full prompt price; switching back to the earlier model and level returns to its own chat.',
+      switchCardHint: 'Switching model or thinking level starts a new upstream chat on the next turn (prompt cache starts over) — upstream does not honour a model switch inside one chat.',
       choicesDismiss: 'Dismiss',
       choicesEyebrow: 'Next step',
       choicesOther: 'Something else',
@@ -543,6 +551,10 @@ window.__ModuleLoader__.load({
             },
           }, status.message)
           : null,
+        // Switching the picker mid-conversation is not free: say so where the
+        // picker is first mentioned, so the composer notice later is a reminder
+        // rather than a surprise.
+        status.phase === 'ready' ? h('span', { style: muted }, t('switchCardHint')) : null,
         // 24 names is a wall of text in a settings card: keep it one line,
         // openable when someone actually wants to read it.
         status.phase === 'ready' && status.models.length > 0
@@ -745,6 +757,57 @@ window.__ModuleLoader__.load({
             opacity: quota.phase === 'loading' ? 0.6 : 1,
           },
         }, t('quotaChip').replace('{percent}', figures.map(formatPercent).join(' / '))),
+      )
+    }
+
+    /**
+     * Signature of a session's model selection — what a switch changes. The
+     * directory's snapshot shape belongs to the host's model picker, so the
+     * model and level fields are picked by name and the whole selection is the
+     * fallback: an unexpected shape makes the notice quiet, never wrong about
+     * which field moved.
+     */
+    function selectionKey(current) {
+      if (!current || typeof current !== 'object') return null
+      const named = Object.keys(current).filter(key => /model|effort|reasoning/i.test(key)).sort()
+      const fields = named.length > 0 ? named : Object.keys(current).sort()
+      try {
+        return JSON.stringify(fields.map(key => [key, current[key]]))
+      } catch { return null }
+    }
+
+    /**
+     * Composer notice beside the model picker: the picked model or thinking
+     * level just changed, so the next turn runs in a new upstream conversation
+     * (the host half derives the id from the variant — see `conversationUuid`
+     * in src/trae/wire.ts). Shown for a few seconds, then gone; it says what
+     * the switch costs rather than asking for anything.
+     */
+    function SwitchNotice(props) {
+      const { t } = props
+      const current = props.useTraeModel(snapshot => snapshot?.current ?? null)
+      const key = selectionKey(current)
+      const active = current?.provider === PROVIDER
+      const [shownAt, setShownAt] = React.useState(0)
+      const last = React.useRef(key)
+      React.useEffect(() => {
+        const previous = last.current
+        last.current = key
+        // Binding the session to its first model is not a switch, and neither
+        // is a selection this plugin cannot read.
+        if (!active || !key || !previous || previous === key) return undefined
+        setShownAt(Date.now())
+        const timer = setTimeout(() => { setShownAt(0) }, SWITCH_NOTICE_MS)
+        return () => { clearTimeout(timer) }
+      }, [key, active])
+      if (!active || !shownAt) return null
+      return h(P.Tooltip, { label: h('div', { style: { whiteSpace: 'pre-line' } }, t('switchNoticeHint')), side: 'top' },
+        h('span', {
+          style: {
+            padding: '2px 6px', borderRadius: 6, color: 'var(--dsw-alias-label-secondary)',
+            fontSize: 12, lineHeight: '20px', whiteSpace: 'nowrap',
+          },
+        }, t('switchNotice')),
       )
     }
 
@@ -1229,20 +1292,30 @@ window.__ModuleLoader__.load({
         // picker's service there is nothing to sit beside, so no chip.
         const noModel = createStore({ current: null })
         ctx.inject(['slots', 'modelDirectories'], (scope) => {
+          /** The session's model selection, or an empty one until it is bound. */
+          const directoryFor = (sessionId) => {
+            try { return scope.modelDirectories.directoryFor(sessionId).store } catch { return noModel }
+          }
           scope.slots.inject('conversation.input.right', () => scope.slots.register({
             name: 'conversation.input.right',
             // A list slot: every entry needs its own id, or the registry throws.
             id: 'trae-quota',
             locale: NS,
-            inject: (sessionId) => {
-              let directory = noModel
-              try { directory = scope.modelDirectories.directoryFor(sessionId).store } catch { /* no binding yet */ }
-              return {
-                hooks: { traeModel: directory, traeQuota: quota.store },
-                refresh: (force) => { void quota.load(force) },
-              }
-            },
+            inject: sessionId => ({
+              hooks: { traeModel: directoryFor(sessionId), traeQuota: quota.store },
+              refresh: (force) => { void quota.load(force) },
+            }),
           }, QuotaChip))
+          // Its own entry rather than part of the chip: the chip is absent on an
+          // unlimited or unreadable quota, and the switch still needs saying.
+          scope.slots.inject('conversation.input.right', () => scope.slots.register({
+            name: 'conversation.input.right',
+            id: 'trae-switch',
+            // Before the quota chip, where the picker it talks about sits.
+            order: -10,
+            locale: NS,
+            inject: sessionId => ({ hooks: { traeModel: directoryFor(sessionId) } }),
+          }, SwitchNotice))
         })
         // Next-step cards above the composer, one per decision the answer left open.
         ctx.effect(() => {

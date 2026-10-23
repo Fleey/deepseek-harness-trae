@@ -25,9 +25,9 @@ import { BUILTIN_SNAPSHOT, type CatalogSnapshot, type TraeCatalog } from './trae
 import {
   approxTokens,
   classify,
+  conversationUuid,
   httpCode,
   LoopDetector,
-  sessionUuid,
   TextToolCallSniffer,
   toTraeMessages,
   toTraeTools,
@@ -130,6 +130,13 @@ const REQUEST_IMAGE_MAX_BYTES = 2 * 1024 * 1024
 const OUTPUT_TOKENS = 32_000
 const MAX_OUTPUT_TOKENS = 64_000
 
+/**
+ * Sessions whose last picked variant is remembered, so a switch can be
+ * reported once. Only the log line depends on this: the conversation id itself
+ * is derived, not stored, so a forgotten session still routes correctly.
+ */
+const TRACKED_SESSIONS = 64
+
 /** The identity headers every Trae API call carries (chat and quota alike). */
 export function traeHeaders(id: TraeIdentity, token: string, accept: string): Record<string, string> {
   return {
@@ -177,6 +184,9 @@ function usageOf(data: Record<string, unknown>): TokenUsage {
 }
 
 export class TraeAdapter extends LlmAdapter {
+  /** Last variant each session ran a main-loop turn on: `{ key, label }`. */
+  private readonly variants = new Map<string, { key: string; label: string }>()
+
   constructor(private readonly opts: AdapterOptions) {
     super()
   }
@@ -238,6 +248,29 @@ export class TraeAdapter extends LlmAdapter {
 
   private headers(token: string): Record<string, string> {
     return traeHeaders(this.opts.identity, token, 'text/event-stream')
+  }
+
+  /**
+   * Remember the variant a session is running on, and say so once when it
+   * changes: that turn is the first one in a new upstream conversation, so it
+   * carries no server-side state from the previous model or level and pays
+   * full prompt price before the cache builds up again.
+   */
+  private noteVariant(sessionId: string, route: TraeRoute, effort: TraeEffort | undefined): void {
+    const current = {
+      key: `${route.key}\u0000${effort ?? ''}`,
+      label: effort ? `${route.id}（${EFFORT_NAMES[effort]}）` : route.id,
+    }
+    const previous = this.variants.get(sessionId)
+    // Re-inserted so the map stays in least-recently-used order.
+    this.variants.delete(sessionId)
+    this.variants.set(sessionId, current)
+    while (this.variants.size > TRACKED_SESSIONS) this.variants.delete(this.variants.keys().next().value!)
+    if (!previous || previous.key === current.key) return
+    this.opts.logger.info(
+      `dsh-trae2api: 这条会话换了模型或思考档位（${previous.label} → ${current.label}），`
+      + '本轮起开新的上游会话：上游按会话绑定模型，旧会话的服务端状态和 prompt 缓存都不再沿用。',
+    )
   }
 
   /** One POST; yields decoded events. Retries once with a fresh JWT on 401/403. */
@@ -359,11 +392,17 @@ export class TraeAdapter extends LlmAdapter {
       throw new LlmError(`Trae：未知模型「${options.model}」。可用：${catalog.routes.map(r => r.id).join('、')}`, 'MODEL_NOT_FOUND')
     }
     const effort = effortFor(route, options.reasoningEffort ? String(options.reasoningEffort) : undefined)
-    const session = sessionUuid(options.sessionId ? String(options.sessionId) : undefined)
+    // One upstream conversation per model variant and thinking level, not per
+    // harness session: upstream binds a conversation to the model it started
+    // on, so a switch that keeps the id is simply not honoured (wire.ts).
+    const session = conversationUuid(options.sessionId ? String(options.sessionId) : undefined, route.key, effort)
     // Only the agent loop's own requests carry tools; title, compaction and
     // other side requests in the same session neither start nor end a turn.
     const mainLoop = options.sessionId !== undefined && options.purpose === undefined && (options.tools?.length ?? 0) > 0
-    if (mainLoop) this.opts.onTurnStart?.(String(options.sessionId))
+    if (mainLoop) {
+      this.opts.onTurnStart?.(String(options.sessionId))
+      this.noteVariant(String(options.sessionId), route, effort)
+    }
     // Text-only routes keep the [image omitted] note even if an image slipped
     // through: upstream answers a text-only model handed an image with
     // `1210:messages.content.type 参数非法` wrapped in a fake rate-limit error.
@@ -537,7 +576,7 @@ export class TraeAdapter extends LlmAdapter {
       // session reports the turn over and the composer asks for it.
       if (mainLoop && reason.kind === 'stop' && text.trim()) {
         try {
-          this.opts.onTurnEnd?.({ sessionId: String(options.sessionId), model: route.id, options, answer: text })
+          this.opts.onTurnEnd?.({ sessionId: String(options.sessionId), conversation: session, model: route.id, options, answer: text })
         } catch { /* a suggestion must never fail the turn */ }
       }
       yield { type: 'finish', reason }

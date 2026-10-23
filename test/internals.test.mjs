@@ -5,7 +5,7 @@ import {
   TRAE_MODELS, TRAE_ROUTES, findModel, toRoutes,
   parseDetailParams, parseModelsCache, TraeCatalog,
   toTraeMessages, repairToolHistory, traeEvents, wireContent,
-  LoopDetector, TextToolCallSniffer, sessionUuid, classify, httpCode, approxTokens, decodeJwt, parseExpiry,
+  LoopDetector, TextToolCallSniffer, sessionUuid, conversationUuid, classify, httpCode, approxTokens, decodeJwt, parseExpiry,
   parseQuota, TraeQuota, QUOTA_PATHS, enterpriseTenant,
   parseTobQuota, TobConsole, TOB_LOGIN_PATH, TOB_QUOTA_PATH, TOB_USAGE_PATH, TOB_SESSION_COOKIE,
 } from '../lib/testing.mjs'
@@ -313,6 +313,23 @@ test('sessionUuid: passes through a real UUID, hashes anything else deterministi
   const a = sessionUuid('conversation-42')
   assert.match(a, /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
   assert.equal(a, sessionUuid('conversation-42'))
+})
+
+test('conversationUuid: one conversation per session, model variant and thinking level', () => {
+  const base = conversationUuid('s1', 'glm-5.3__max', 'high')
+  assert.match(base, /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+  assert.equal(base, conversationUuid('s1', 'glm-5.3__max', 'high'), 'same variant, same conversation')
+  assert.notEqual(base, conversationUuid('s1', 'kimi-k3__max', 'high'), 'another model is another conversation')
+  assert.notEqual(base, conversationUuid('s1', 'glm-5.3__max', 'light'), 'another level is another conversation')
+  assert.notEqual(base, conversationUuid('s1', 'glm-5.3__max', undefined), 'no level is its own conversation')
+  assert.notEqual(base, conversationUuid('s2', 'glm-5.3__max', 'high'), 'another session is another conversation')
+  // A real UUID session id no longer passes through: the variant is part of it.
+  assert.notEqual(
+    conversationUuid('2f1b9e4a-3c5b-4df0-8a4e-5c6d2f1b9e4a', 'glm-5.3__max', 'high'),
+    '2f1b9e4a-3c5b-4df0-8a4e-5c6d2f1b9e4a',
+  )
+  // A session-less side request gets a throwaway conversation each time.
+  assert.notEqual(conversationUuid(undefined, 'glm-5.3__max', 'high'), conversationUuid(undefined, 'glm-5.3__max', 'high'))
 })
 
 test('traeEvents: decodes event/data pairs across chunk boundaries', async () => {
@@ -919,7 +936,7 @@ test('suggestions: a finished turn is waited for, a new turn drops it, a failure
   })
   assert.equal(await store.get('s1', 0), null)
 
-  store.turnEnded({ sessionId: 's1', model: 'GLM-5.3', options: turnOptions(), answer: 'ok' })
+  store.turnEnded({ sessionId: 's1', conversation: 'c-s1', model: 'GLM-5.3', options: turnOptions(), answer: 'ok' })
   assert.deepEqual(asked, ['GLM-5.3'])
   const waiting = store.get('s1', 1000)
   release('[{"question": "Run them?", "choices": [{"label": "Run", "reply": "run the tests"}]}]')
@@ -930,11 +947,11 @@ test('suggestions: a finished turn is waited for, a new turn drops it, a failure
   assert.equal(await store.get('s1', 0), null)
 
   // Still in flight past the wait: answered as empty for now, not as an error.
-  store.turnEnded({ sessionId: 's1', model: 'GLM-5.3', options: turnOptions(), answer: 'ok' })
+  store.turnEnded({ sessionId: 's1', conversation: 'c-s1', model: 'GLM-5.3', options: turnOptions(), answer: 'ok' })
   assert.deepEqual((await store.get('s1', 10)).cards, [])
 
   // An empty answer suggests nothing at all.
-  store.turnEnded({ sessionId: 's2', model: 'GLM-5.3', options: turnOptions(), answer: '  ' })
+  store.turnEnded({ sessionId: 's2', conversation: 'c-s2', model: 'GLM-5.3', options: turnOptions(), answer: '  ' })
   assert.equal(await store.get('s2', 0), null)
 })
 
@@ -970,11 +987,11 @@ test('suggestions: no cards right after the host\'s own ask dialog, but later st
     complete: async () => { asked.push(1); return '[{"question": "Q?", "choices": [{"label": "Go", "reply": "go"}]}]' },
     model: '', timeoutMs: 5000, logger: { warn() {} },
   })
-  store.turnEnded({ sessionId: 's1', model: 'GLM-5.3', options: turnOptions({ messages: afterAsk }), answer: '你想用哪个方案？' })
+  store.turnEnded({ sessionId: 's1', conversation: 'c-s1', model: 'GLM-5.3', options: turnOptions({ messages: afterAsk }), answer: '你想用哪个方案？' })
   assert.equal(await store.get('s1', 0), null)
   assert.equal(asked.length, 0, 'not even asked for')
 
-  store.turnEnded({ sessionId: 's1', model: 'GLM-5.3', options: turnOptions({ messages: askedEarlier }), answer: '改好了，要跑测试吗？' })
+  store.turnEnded({ sessionId: 's1', conversation: 'c-s1', model: 'GLM-5.3', options: turnOptions({ messages: askedEarlier }), answer: '改好了，要跑测试吗？' })
   assert.equal((await store.get('s1', 1000)).cards.length, 1)
 })
 
@@ -1017,6 +1034,49 @@ test('adapter: only a main-loop turn that ends in prose reports itself; complete
   assert.equal(body.reasoning_effort_level, 'light')
   assert.notEqual(body.session_id, 's1')
   assert.deepEqual(body.messages.map(m => m.role), ['system', 'user'])
+})
+
+test('adapter: switching model or level inside a session moves the turn to a new upstream conversation, and says so once', async () => {
+  const { TraeAdapter, conversationUuid, findModel } = await import('../lib/testing.mjs')
+  const notes = []
+  const ended = []
+  const adapter = new TraeAdapter({
+    displayName: 'Trae', host: 'https://h', identity: {}, auth: stubAuth(),
+    readTimeoutMs: 1000, emptyRetries: 0, loopGuardChars: 600,
+    onTurnEnd: turn => { ended.push(turn) },
+    logger: { info: line => { notes.push(String(line)) }, warn() {} },
+  })
+  const run = async (extra) => {
+    const stub = stubFetch(() => sse([['output', { response: 'ok' }], ['done', { finish_reason: 'stop' }]]))
+    try { await drain(adapter.stream(turnOptions(extra))) } finally { stub.restore() }
+    return JSON.parse(stub.calls[0].body).session_id
+  }
+
+  const glmHigh = await run({ model: 'GLM-5.3', reasoningEffort: 'high' })
+  // Same session id upstream as long as the picker does not move.
+  assert.equal(await run({ model: 'GLM-5.3', reasoningEffort: 'high' }), glmHigh)
+  assert.deepEqual(notes, [], 'nothing to report while the variant holds')
+
+  // The level alone is enough to need a conversation of its own.
+  const glmLight = await run({ model: 'GLM-5.3', reasoningEffort: 'light' })
+  assert.notEqual(glmLight, glmHigh)
+  assert.equal(notes.length, 1)
+  assert.match(notes[0], /GLM-5\.3（High 高） → GLM-5\.3（Light 轻）/)
+  assert.match(notes[0], /新的上游会话/)
+
+  // And so is the model, which also reports which way it went.
+  const kimi = await run({ model: 'Kimi-K3', reasoningEffort: 'light' })
+  assert.notEqual(kimi, glmLight)
+  assert.equal(kimi, conversationUuid('s1', findModel('Kimi-K3').key, 'light'))
+  assert.equal(notes.length, 2)
+  assert.match(notes[1], /GLM-5\.3（Light 轻） → Kimi-K3（Light 轻）/)
+
+  // Switching back lands on the conversation that variant already had.
+  assert.equal(await run({ model: 'GLM-5.3', reasoningEffort: 'high' }), glmHigh)
+  assert.equal(notes.length, 3)
+
+  // The turn reports the conversation it ran under, so a Cue report names it.
+  assert.deepEqual(ended.map(turn => turn.conversation), [glmHigh, glmHigh, glmLight, kimi, glmHigh])
 })
 
 test('adapter: the body matches a traecli capture; the max marker rides only the keyless Max routes', async () => {
@@ -1138,7 +1198,7 @@ test('user info: GetUserInfo with x-cloudide-token, UserID as a string, PrivacyM
 })
 
 test('suggestions: shown then accept, once each, sharing one resp_id; stale ids count for nothing', async () => {
-  const { TraeSuggestions, sessionUuid } = await import('../lib/testing.mjs')
+  const { TraeSuggestions } = await import('../lib/testing.mjs')
   const reported = []
   const store = new TraeSuggestions({
     complete: async () => JSON.stringify([
@@ -1147,7 +1207,7 @@ test('suggestions: shown then accept, once each, sharing one resp_id; stale ids 
     model: '', timeoutMs: 5000, logger: { warn() {} },
     report: async (events) => { reported.push(...events); return true },
   })
-  store.turnEnded({ sessionId: 's1', model: 'GLM-5.3', options: turnOptions(), answer: 'ok' })
+  store.turnEnded({ sessionId: 's1', conversation: 'c-s1', model: 'GLM-5.3', options: turnOptions(), answer: 'ok' })
   const { id } = await store.get('s1', 1000)
 
   assert.equal(await store.record('s1', 'other-id', 'shown'), false)
@@ -1162,7 +1222,9 @@ test('suggestions: shown then accept, once each, sharing one resp_id; stale ids 
   const [shown, accept] = reported.map(e => e.payload)
   assert.equal(shown.resp_id, id)
   assert.equal(accept.resp_id, id)
-  assert.equal(accept.conversation_id, sessionUuid('s1'))
+  // The turn's own upstream conversation, as the adapter reported it — not
+  // something derived from the session id, which no longer identifies one.
+  assert.equal(accept.conversation_id, 'c-s1')
   assert.equal(accept.accept_content, 'commit it', 'the pressed button\'s reply')
   assert.equal(typeof accept.suggestion_visible_duration, 'number')
 

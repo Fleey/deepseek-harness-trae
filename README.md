@@ -72,6 +72,15 @@ v0.3 起插件自己直连 Trae 的 `llm_raw_chat` 接口（和 trae2api 的 dir
 然后在对话框右下角的模型菜单里选 **Trae** 分组下的模型，思考档位在同一个菜单里切换。
 选中 Trae 模型时，模型选择器旁边还会出现一个剩余额度小徽标（详见下文「额度显示」）。
 
+> **一条会话里换模型或换思考档位，下一轮会开一条新的上游会话。** 上游是按
+> `conversation_id` 保存服务端状态（包括 `use_prompt_cache_pool` 那份共享前缀缓存）的，
+> 而这份状态绑死在这条会话最初用的模型上：同一个 `conversation_id` 下改
+> `model_name` 或 `reasoning_effort`，上游当没改，表现就是「切了模型没反应」。所以插件
+> 给每个（会话 × 模型 × 思考档位）各发一个 `conversation_id`
+> （`conversationUuid`，`src/trae/wire.ts`）。代价是换挡那一轮没有缓存可用、按完整
+> prompt 计费；换回原来的模型和档位，又会回到它自己那条上游会话。换挡时模型选择器旁边
+> 会提示一下，宿主侧日志也会记一行。
+
 卸载：`dsh plugin --profile desktop remove dsh-trae2api`。
 
 ### 用 tgz 安装（发给别人）
@@ -241,7 +250,9 @@ X-App-Id: <appId>
 
 - 同一轮卡片的 shown / accept 共用一个 `resp_id`（每轮卡片生成时的 UUID），`accept_content`
   是被点按钮发出去的那句话（用「其他建议」自己写的不算采纳，不上报），`conversation_id`
-  是这条会话发给 `llm_raw_chat` 的 `session_id`。
+  是**产生这轮卡片的那次 `llm_raw_chat` 请求用的 `session_id`**（由适配器随回合一起交给
+  建议模块）。同一条 DSH 会话换了模型或档位就换了 `conversation_id`，所以这里不能由
+  会话 id 自己推。
 - 每轮卡片 shown、accept 各最多一次，去重和「显示了多久」（`suggestion_visible_duration`）都在
   宿主端算，浏览器只说「显示了 / 点了第几张卡片的第几个按钮」；过期的 id 一律不报。
 - `user_id` 是 IDE 登录态里的账号 id（客户端 `User.idOrDefault`），**JWT 里没有**。插件和 IDE 登录时

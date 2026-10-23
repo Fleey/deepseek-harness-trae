@@ -192,6 +192,23 @@ export function sessionUuid(sessionId: string | undefined): string {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`
 }
 
+/**
+ * Upstream conversation id for one harness session on one model variant at one
+ * thinking level.
+ *
+ * `conversation_id` is where upstream keeps a chat's server-side state — the
+ * shared prefix cache `use_prompt_cache_pool` buys among it — and that state is
+ * bound to the model the conversation started on: a turn that changes
+ * `model_name` or `reasoning_effort` under the same id is answered as if it had
+ * not, so the picker looks ignored. Each (session, model key, level) therefore
+ * gets its own upstream conversation, and switching back to a level this
+ * session already used lands on its own conversation again, cache included.
+ */
+export function conversationUuid(sessionId: string | undefined, modelKey: string, effort: string | undefined): string {
+  if (!sessionId) return randomUUID()
+  return sessionUuid(`${sessionId}\u0000${modelKey}\u0000${effort ?? ''}`)
+}
+
 // ----------------------------------------------------------------- response
 
 export interface TraeEvent { event: string; data: Record<string, unknown> }

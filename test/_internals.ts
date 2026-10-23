@@ -6,7 +6,7 @@ export {
 } from '../src/trae/catalog-source.ts'
 export {
   toTraeMessages, repairToolHistory, traeEvents, wireContent, LoopDetector, TextToolCallSniffer, CodeScanner,
-  sessionUuid, classify, httpCode, approxTokens,
+  sessionUuid, conversationUuid, classify, httpCode, approxTokens,
 } from '../src/trae/wire.ts'
 export { decodeJwt, parseExpiry } from '../src/trae/auth.ts'
 export { TraeAdapter } from '../src/adapter.ts'

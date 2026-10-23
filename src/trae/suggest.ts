@@ -13,11 +13,17 @@
 import { randomUUID } from 'node:crypto'
 import type { ContentBlock, GenerateOptions, RequestMessage } from '@deepseek-ai/dsh-llm'
 import type { CueEvent } from './cue.ts'
-import { sessionUuid } from './wire.ts'
 
 /** One finished turn, as the adapter saw it. */
 export interface FinishedTurn {
   sessionId: string
+  /**
+   * Upstream conversation id the turn ran under — what a Cue report has to
+   * name. Taken from the adapter rather than derived here: one harness session
+   * holds one conversation per model variant and thinking level, so the id
+   * does not follow from `sessionId` alone (see wire.ts `conversationUuid`).
+   */
+  conversation: string
   /** Picker id of the model that answered. */
   model: string
   /** The request that produced the final answer. */
@@ -265,7 +271,7 @@ export class TraeSuggestions {
     this.drop(turn.sessionId)
     const abort = new AbortController()
     const entry: Entry = {
-      id: randomUUID(), at: Date.now(), conversationId: sessionUuid(turn.sessionId),
+      id: randomUUID(), at: Date.now(), conversationId: turn.conversation,
       cards: [], abort, pending: Promise.resolve(), accepted: false,
     }
     entry.pending = this.generate(turn, abort.signal).then(
