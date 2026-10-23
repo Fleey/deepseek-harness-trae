@@ -1081,6 +1081,35 @@ test('suggestions: a finished turn is waited for, a new turn drops it, a failure
   assert.equal(await store.get('s2', 0), null)
 })
 
+test('suggestions: delegating to a subagent tells the suggester and the composer about it', async () => {
+  const { TraeSuggestions, suggestSystem, SUGGEST_SYSTEM, SUGGEST_SUBAGENT_RULES } = await import('../lib/testing.mjs')
+  assert.equal(suggestSystem(false), SUGGEST_SYSTEM, 'the plain prompt says nothing of subagents')
+  assert.ok(suggestSystem(true).startsWith(SUGGEST_SYSTEM))
+  assert.ok(suggestSystem(true).endsWith(SUGGEST_SUBAGENT_RULES))
+  assert.ok(SUGGEST_SUBAGENT_RULES.includes('self-contained'), 'a child that cannot see the chat needs the whole task')
+
+  const systems = []
+  const make = subagent => new TraeSuggestions({
+    complete: (_model, system) => {
+      systems.push(system)
+      return Promise.resolve('[{"question": "Run them?", "choices": [{"label": "Run", "reply": "run the tests"}]}]')
+    },
+    model: '', timeoutMs: 5000, ...subagent === undefined ? {} : { subagent }, logger: { warn() {} },
+  })
+  const turn = { sessionId: 's1', conversation: 'c-s1', model: 'GLM-5.3', options: turnOptions(), answer: 'ok' }
+
+  const on = make(true)
+  on.turnEnded(turn)
+  assert.equal((await on.get('s1', 1000)).subagent, true, 'the composer is told to hand the task over')
+
+  // Off, and absent, are the same thing: the reply is the next message as before.
+  for (const store of [make(false), make(undefined)]) {
+    store.turnEnded(turn)
+    assert.equal((await store.get('s1', 1000)).subagent, false)
+  }
+  assert.deepEqual(systems.map(s => s === suggestSystem(true)), [true, false, false])
+})
+
 test('suggestions: no cards right after the host\'s own ask dialog, but later steps of that turn still get them', async () => {
   const { TraeSuggestions, followsAsk } = await import('../lib/testing.mjs')
   const step = (name, id) => [

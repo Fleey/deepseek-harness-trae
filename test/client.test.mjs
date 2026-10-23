@@ -278,7 +278,7 @@ test('switch notice: quiet until the picked model or level moves, and only for T
  * load/clear/dismiss/close/take against the real controller, seeded through
  * its store.
  */
-function renderCards({ cards, dismissed = [], running = false, draft = '', phase = 'plain' }) {
+function renderCards({ cards, dismissed = [], subagent = false, running = false, draft = '', phase = 'plain' }) {
   const states = []
   let cursor = 0
   const react = {
@@ -307,7 +307,7 @@ function renderCards({ cards, dismissed = [], running = false, draft = '', phase
   })
   const injected = entry.inject('s1')
   const store = injected.hooks.traeChoices
-  store.set({ id: 'sug-1', cards, dismissed })
+  store.set({ id: 'sug-1', cards, dismissed, subagent })
   const sent = []
   const inputActions = {
     setDraft: (text) => { sent.push(['draft', text]) },
@@ -339,6 +339,10 @@ const choiceButtonsOf = card => actionsOf(card).filter(button => button.props['d
 const otherButtonOf = card => actionsOf(card).find(button => button.props['data-other'] === '')
 const labelOf = button => button.children.at(-1).children[0]
 const otherBoxOf = card => card.children[2]
+/** The line under the round: who does the task, and what that means. */
+const footOf = node => node.children[1]
+const whoOf = node => footOf(node).children[0]
+const noteOf = node => footOf(node).children[1].children[0]
 
 const TWO_CARDS = [
   {
@@ -377,6 +381,56 @@ test('cards: a button sends its reply as the next message and retires every card
     assert.deepEqual(events, [{ session: 's1', id: 'sug-1', action: 'accept', card: 0, choice: 1 }])
     assert.equal(render(), null)
   } finally { globalThis.fetch = original }
+})
+
+test('cards: with the host delegating, a button sends the task to a subagent and the cards say so', () => {
+  const original = globalThis.fetch
+  const events = []
+  globalThis.fetch = async (_url, init) => { events.push(JSON.parse(init.body)); return Response.json({ ok: true }) }
+  try {
+    const { node, render, sent } = renderCards({ cards: TWO_CARDS, subagent: true })
+    assert.equal(whoOf(node).props['aria-pressed'], true)
+    assert.equal(labelOf(whoOf(node)), '子会话处理')
+    assert.equal(noteOf(node), '点按钮后交给子会话去做，不占当前会话的上下文，做完回来汇报。')
+    assert.deepEqual(cardsOf(node).map(card => eyebrowOf(card)), ['下一步 · 1/2', '下一步 · 2/2'])
+
+    choiceButtonsOf(cardsOf(node)[0])[0].props.onClick()
+    const [[, text]] = sent
+    assert.ok(text.startsWith('请开一个子会话来做下面这件事：'), text)
+    assert.ok(text.includes('subagent 工具'))
+    assert.ok(text.endsWith('任务：把 README 里过时的安装路径改成 DSH NEXT.app'), text)
+    assert.deepEqual(sent[1], ['submit'])
+    // Which button was pressed is reported as before: the wrapping is the composer's.
+    assert.deepEqual(events, [{ session: 's1', id: 'sug-1', action: 'accept', card: 0, choice: 0 }])
+    assert.equal(render(), null)
+  } finally { globalThis.fetch = original }
+})
+
+test('cards: the round can be switched back to this session, and sends the reply bare again', () => {
+  const { node, render, sent } = renderCards({ cards: TWO_CARDS, subagent: true })
+  whoOf(node).props.onClick()
+  const back = render()
+  assert.equal(whoOf(back).props['aria-pressed'], false)
+  assert.equal(labelOf(whoOf(back)), '当前会话处理')
+  assert.equal(noteOf(back), '点按钮后直接在当前会话里做。')
+
+  otherButtonOf(cardsOf(back)[0]).props.onClick()
+  const typed = otherBoxOf(cardsOf(render())[0]).children[0]
+  typed.props.onChange({ target: { value: '先只改路径', style: {}, scrollHeight: 44 } })
+  otherBoxOf(cardsOf(render())[0]).children[0].props.onKeyDown({
+    key: 'Enter', shiftKey: false, keyCode: 0, nativeEvent: {}, preventDefault() {},
+  })
+  assert.deepEqual(sent, [['draft', '先只改路径'], ['submit']])
+})
+
+test('cards: the host\'s own words travel with the task when it goes to a subagent', () => {
+  const { node, sent, render } = renderCards({ cards: TWO_CARDS, subagent: true })
+  otherButtonOf(cardsOf(node)[0]).props.onClick()
+  const box = otherBoxOf(cardsOf(render())[0])
+  box.children[0].props.onChange({ target: { value: '把安装路径和配置说明一起改掉', style: {}, scrollHeight: 44 } })
+  otherBoxOf(cardsOf(render())[0]).children[1].props.onClick()
+  assert.equal(sent.length, 2)
+  assert.ok(sent[0][1].endsWith('任务：把安装路径和配置说明一起改掉'), sent[0][1])
 })
 
 test('cards: "something else" opens a box on that card; Enter sends the user\'s own words, unreported', () => {
