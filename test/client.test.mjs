@@ -94,9 +94,20 @@ function renderChip(value) {
     useTraeQuota: select => select({ phase: 'ready', value }),
     refresh: () => {},
   })
+  const button = node.children[0]
+  // The button is text, bar, text: the bar is a component the recorder leaves
+  // uncalled, so it is rendered here the way React would to read its segments.
+  const bar = button.children.find(child => child && typeof child.type === 'function')
   return {
-    label: node.children[0].children[0],
-    color: node.children[0].props.style.color,
+    label: button.props['aria-label'],
+    text: button.children.filter(child => child && typeof child.type === 'string')
+      .map(child => child.children[0]).join(' '),
+    color: button.props.style.color,
+    segments: bar.type(bar.props).children.flat().map(segment => ({
+      weight: Number(String(segment.props.style.flex).split(' ')[0]),
+      left: segment.children[0].props.style.width,
+      color: segment.children[0].props.style.background,
+    })),
     lines: node.props.label.children[0].split('\n'),
   }
 }
@@ -143,32 +154,45 @@ test('chip: several allowances are listed one by one, with the total only explai
   }), ['剩余 712.37 / 800（89%）', '已用 87.63', '点击刷新'])
 })
 
-test('chip: the label carries one figure per allowance, coloured by the emptiest', () => {
+test('chip: one figure for the total, one bar segment per allowance', () => {
   const two = renderChip({
     packs: [
-      { name: '企业版', limit: 600, used: 510, remaining: 90 },
-      { name: '加油包', limit: 200, used: 0, remaining: 200 },
+      { name: '企业版', limit: 600, used: 600, remaining: 0 },
+      { name: '加油包', limit: 200, used: 24, remaining: 176 },
     ],
-    limit: 800, used: 510, remaining: 290, dollars: false,
+    limit: 800, used: 624, remaining: 176, dollars: false,
   })
-  assert.equal(two.label, 'Trae 剩余 15% / 100%')
-  // 290 of 800 left is a comfortable 36% in total; the plan's own 15% is not,
-  // and it is the figure the colour has to follow.
-  assert.equal(two.color, 'var(--dsw-alias-state-error-primary)')
+  // "0% / 88%" read as a fraction; the chip now says what is left in total
+  // and leaves which pack is gone to the bar.
+  assert.equal(two.label, 'Trae 剩余 22%')
+  assert.equal(two.text, 'Trae 剩余 22%')
+  // The colour follows that same total: 22% left is tight, not yet empty.
+  assert.equal(two.color, 'var(--dsw-alias-state-warn-primary)')
+  // Segments are as wide as the allowance they stand for, and filled with
+  // what is left of it — the drained plan is an empty 3:1 segment.
+  assert.deepEqual(two.segments, [
+    { weight: 0.75, left: '0%', color: 'var(--dsw-alias-state-error-primary)' },
+    { weight: 0.25, left: '88%', color: 'var(--dsw-alias-state-success-primary)' },
+  ])
 
-  // One allowance, or one beside a pack with no quota of this kind, stays a
-  // single figure rather than growing a stray "/ 0%".
-  assert.equal(renderChip({
+  // A comfortable quota keeps the quiet label colour.
+  const one = renderChip({
     packs: [{ name: '企业版', limit: 800, used: 87.63, remaining: 712.37 }],
     limit: 800, used: 87.63, remaining: 712.37, dollars: false,
-  }).label, 'Trae 剩余 89%')
+  })
+  assert.equal(one.label, 'Trae 剩余 89%')
+  assert.equal(one.color, 'var(--dsw-alias-label-secondary)')
+  assert.equal(one.segments.length, 1)
+
+  // A pack with no quota of this kind (limit 0) has no share to fill, so it
+  // draws no segment rather than a stray empty one.
   assert.equal(renderChip({
     packs: [
       { name: '免费', limit: 0, used: 0, remaining: 0 },
       { name: '企业版', limit: 800, used: 87.63, remaining: 712.37 },
     ],
     limit: 800, used: 87.63, remaining: 712.37, dollars: false,
-  }).label, 'Trae 剩余 89%')
+  }).segments.length, 1)
 })
 
 /**
