@@ -4,7 +4,9 @@
  * answer leaves the user (the change it offered, the command it proposed, …)
  * and what the user could answer to each. The browser half shows every
  * decision as its own card above the composer with the model's answers as
- * buttons; a button sends its reply as the user's next message.
+ * buttons; a button sends its reply as the user's next message — or, with
+ * `subagent` on, as a message asking this session to delegate that one task to
+ * a subagent, which is what the cards then say they do.
  *
  * Kept per session in memory only; a suggestion belongs to the turn that
  * produced it and is replaced (or dropped) by the next one.
@@ -38,6 +40,13 @@ export interface SuggestionsOptions {
   /** Model to ask instead of the one that answered; empty = the same one. */
   model: string
   timeoutMs: number
+  /**
+   * A pressed button hands its task to a delegated subagent instead of doing
+   * it in this session: the composer wraps the reply in that instruction and
+   * says so on the cards, and the suggester is told to write replies a child
+   * that cannot see this chat can act on. Absent = false.
+   */
+  subagent?: boolean
   /** Report shown/accepted suggestions as Cue events (false = skipped); absent = no reporting. */
   report?: (events: CueEvent[]) => Promise<boolean>
   logger: { warn(...a: unknown[]): void }
@@ -69,6 +78,8 @@ export interface Suggestion {
   at: number
   /** Stable id of this suggestion: the `resp_id` its shown/accept events share. */
   id: string
+  /** A pressed button asks for a subagent rather than this session (see SuggestionsOptions). */
+  subagent: boolean
 }
 
 interface Entry {
@@ -141,6 +152,24 @@ export const SUGGEST_SYSTEM = [
   '',
   'No code fences, no explanation. If the answer leaves the user nothing to decide, output [].',
 ].join('\n')
+
+/**
+ * Added when a pressed button is handed to a subagent: the child starts from
+ * that one message and never sees this chat, so a reply that says "do it" or
+ * "the second one" is worthless to it.
+ */
+export const SUGGEST_SUBAGENT_RULES = [
+  '',
+  'Each "reply" is handed to a delegated subagent that cannot see this chat:',
+  '- Write it as a self-contained task: name the files, paths, commands, ids and findings it needs, instead of "it", "that file" or "the second problem".',
+  '- Keep the one thing its card is about; the subagent has no way to ask what you meant.',
+  '- "label" and "question" still speak to the user, short as before.',
+].join('\n')
+
+/** The suggester's system prompt, with the subagent rules when they apply. */
+export function suggestSystem(subagent: boolean): string {
+  return subagent ? SUGGEST_SYSTEM + SUGGEST_SUBAGENT_RULES : SUGGEST_SYSTEM
+}
 
 function textOf(content: readonly ContentBlock[]): string {
   return content.filter(b => b.type === 'text').map(b => (b as { text: string }).text).join('\n').trim()
@@ -303,7 +332,7 @@ export class TraeSuggestions {
     }
     // Replaced or dropped while waiting.
     if (this.entries.get(sessionId) !== entry) return null
-    return { cards: entry.cards, at: entry.at, id: entry.id }
+    return { cards: entry.cards, at: entry.at, id: entry.id, subagent: this.opts.subagent === true }
   }
 
   /**
@@ -359,7 +388,12 @@ export class TraeSuggestions {
   private async generate(turn: FinishedTurn, signal: AbortSignal): Promise<SuggestionCard[]> {
     const timeout = AbortSignal.timeout(this.opts.timeoutMs)
     const both = AbortSignal.any([signal, timeout])
-    const raw = await this.opts.complete(this.opts.model || turn.model, SUGGEST_SYSTEM, suggestPrompt(turn), both)
+    const raw = await this.opts.complete(
+      this.opts.model || turn.model,
+      suggestSystem(this.opts.subagent === true),
+      suggestPrompt(turn),
+      both,
+    )
     return parseSuggestions(raw)
   }
 }

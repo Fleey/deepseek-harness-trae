@@ -17,7 +17,9 @@
  *
  * After each Trae answer, cards above the composer (slot
  * `conversation.input.dock`) offer the next steps the answer left open, each
- * with the model's own answers as buttons; a button sends its reply.
+ * with the model's own answers as buttons; a button sends its reply — as a
+ * subagent task while `suggestSubagent` is on, which the line under the cards
+ * says and can switch back to this session.
  */
 window.__ModuleLoader__.load({
   id: 'dsh-trae2api',
@@ -129,6 +131,12 @@ window.__ModuleLoader__.load({
       choicesOther: '其他建议',
       choicesOtherPlaceholder: '说说你想怎么做，回车发送',
       choicesSend: '发送',
+      choicesSubagentOn: '子会话处理',
+      choicesSubagentOff: '当前会话处理',
+      choicesSubagentHint: '点按钮后交给子会话去做，不占当前会话的上下文，做完回来汇报。',
+      choicesInlineHint: '点按钮后直接在当前会话里做。',
+      choicesSubagentToggle: '切换由谁来做：子会话 / 当前会话',
+      choicesSubagentTask: '请开一个子会话来做下面这件事：用 subagent 工具把它派出去，你自己不要在当前会话里直接动手；子会话结束后把结果要点和改动过的文件告诉我。\n\n任务：{task}',
     }
     const en = {
       title: 'Trae',
@@ -190,6 +198,12 @@ window.__ModuleLoader__.load({
       choicesOther: 'Something else',
       choicesOtherPlaceholder: 'Say what you want instead — Enter to send',
       choicesSend: 'Send',
+      choicesSubagentOn: 'In a subagent',
+      choicesSubagentOff: 'In this session',
+      choicesSubagentHint: 'A button hands its task to a subagent: it stays out of this session\'s context and reports back when done.',
+      choicesInlineHint: 'A button is done in this session, right here.',
+      choicesSubagentToggle: 'Switch who does it: a subagent or this session',
+      choicesSubagentTask: 'Hand the task below to a subagent: delegate it with the subagent tool instead of doing it in this session, and tell me what it found and which files it changed once the child is done.\n\nTask: {task}',
     }
 
     /** Minimal uSES-compatible snapshot store — the shape slot `hooks` bind to. */
@@ -237,14 +251,16 @@ window.__ModuleLoader__.load({
     }
 
     /** A session without cards: before its first answer, while a turn runs, after a pick. */
-    const NO_CHOICES = Object.freeze({ id: '', cards: [], dismissed: [] })
+    const NO_CHOICES = Object.freeze({ id: '', cards: [], dismissed: [], subagent: false })
 
     /**
      * Next-step cards per session, the browser end of src/trae/suggest.ts.
-     * A session's snapshot is `{ id, cards, dismissed }`: the suggestion's id,
-     * its cards (`{ question, choices: [{ label, reply }] }`), and the indexes
-     * of cards closed without an answer. Kept for the page's lifetime, so
-     * switching back to a session shows what it had.
+     * A session's snapshot is `{ id, cards, dismissed, subagent }`: the
+     * suggestion's id, its cards (`{ question, choices: [{ label, reply }] }`),
+     * the indexes of cards closed without an answer, and whether the host asks
+     * for a pressed button to go to a subagent (config `suggestSubagent`).
+     * Kept for the page's lifetime, so switching back to a session shows what
+     * it had.
      */
     class SuggestionController {
       constructor() {
@@ -278,7 +294,9 @@ window.__ModuleLoader__.load({
             const store = this.storeFor(sessionId)
             if (!value || !Array.isArray(value.cards) || value.cards.length === 0) store.set(NO_CHOICES)
             // Read again, the same suggestion keeps the cards already closed or answered.
-            else if (store.getSnapshot().id !== value.id) store.set({ id: value.id, cards: value.cards, dismissed: [] })
+            else if (store.getSnapshot().id !== value.id) {
+              store.set({ id: value.id, cards: value.cards, dismissed: [], subagent: value.subagent === true })
+            }
           })
           .catch(() => {})
         return () => { abort.abort() }
@@ -871,6 +889,13 @@ window.__ModuleLoader__.load({
 .trae-choice-heading{flex:1;min-width:0}
 .trae-choice-eyebrow{display:flex;align-items:center;gap:4px;margin-bottom:2px;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px}
 .trae-choice-question{margin:0;font-size:14px;font-weight:500;line-height:22px;overflow-wrap:anywhere}
+.trae-choice-tag{margin-left:2px;padding:0 6px;border-radius:999px;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary);font-size:10px;line-height:15px}
+.trae-choice-foot{display:flex;align-items:center;flex-wrap:wrap;gap:4px 8px;padding:0 4px;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px}
+.trae-choice-who{flex:none;height:20px;padding:0 8px 0 6px;border:.5px solid var(--dsw-alias-border-l4);border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px;line-height:16px;cursor:pointer;display:inline-flex;align-items:center;gap:4px}
+.trae-choice-who:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.trae-choice-who[aria-pressed="true"]{border-color:transparent;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.trae-choice-who:focus-visible{outline:2px solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:2px}
+.trae-choice-note{min-width:0;flex:1}
 .trae-choice-close{flex:none;width:24px;height:24px;margin:-2px -2px 0 0;padding:0;border:none;border-radius:999px;background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer;display:grid;place-items:center}
 .trae-choice-close:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 .trae-choice-actions{display:flex;flex-wrap:wrap;gap:8px}
@@ -905,6 +930,8 @@ window.__ModuleLoader__.load({
     const ICON_CLOSE = 'M4.5 4.5l7 7M11.5 4.5l-7 7'
     const ICON_PEN = 'M10.5 3l2.5 2.5L6 12.5H3.5V10z'
     const ICON_SEND = 'M8 12.5v-9M4 7.5l4-4 4 4'
+    /** A line branching off: the task going to a child session. */
+    const ICON_BRANCH = 'M5 2.5v6a3 3 0 0 0 3 3h3M11 9l2 2.5-2 2.5'
 
     /** Grow a textarea with its text, up to the stylesheet's max-height. */
     function fitHeight(element) {
@@ -920,6 +947,11 @@ window.__ModuleLoader__.load({
      * opens a box on the card to write one's own; × closes that card without
      * sending anything. The cards step aside while the user types in the
      * composer, and go once a turn runs.
+     *
+     * With the host's `suggestSubagent` on, what a button sends is that reply
+     * wrapped in "delegate this to a subagent": the one line under the cards
+     * says so, and switches the round back to this session when the user would
+     * rather watch it happen here.
      */
     function SuggestionCards(props) {
       const { t, sessionId, inputActions } = props
@@ -929,6 +961,8 @@ window.__ModuleLoader__.load({
       const choices = props.useTraeChoices(s => s)
       // The card whose "something else" box is open, and what is typed in it.
       const [other, setOther] = React.useState(null)
+      // Who does the task: the host's answer for this round until it is switched.
+      const [delegate, setDelegate] = React.useState(null)
 
       // Ask once a turn ends (waiting while the host still works it out), and
       // once on mount so switching back to a session shows what it had.
@@ -940,8 +974,9 @@ window.__ModuleLoader__.load({
         return props.load(ended ? SUGGESTION_WAIT_MS : 0)
       }, [running, sessionId])
 
-      // A new round of cards starts with every box closed.
-      React.useEffect(() => { setOther(null) }, [choices.id])
+      // A new round of cards starts with every box closed and the host's own
+      // answer for who does the work.
+      React.useEffect(() => { setOther(null); setDelegate(null) }, [choices.id])
 
       const open = choices.cards
         .map((card, index) => ({ card, index }))
@@ -954,9 +989,12 @@ window.__ModuleLoader__.load({
       }, [visible, choices.id])
 
       if (!visible) return null
+      const toSubagent = delegate ?? choices.subagent === true
       // The editor applies a draft as one discrete update, so submit already reads it.
+      // A delegated task travels as the message asking for it: the host has no
+      // way to start a child of its own for an idle session.
       const send = (text) => {
-        inputActions.setDraft(text)
+        inputActions.setDraft(toSubagent ? t('choicesSubagentTask').replace('{task}', text) : text)
         inputActions.submit()
       }
       const pick = (card, choice) => {
@@ -988,6 +1026,7 @@ window.__ModuleLoader__.load({
                 h('div', { className: 'trae-choice-eyebrow' },
                   icon(ICON_SPARK, 12, true),
                   open.length > 1 ? `${t('choicesEyebrow')} · ${position + 1}/${open.length}` : t('choicesEyebrow'),
+                  toSubagent ? h('span', { className: 'trae-choice-tag' }, t('choicesSubagentOn')) : null,
                 ),
                 card.question ? h('p', { className: 'trae-choice-question' }, card.question) : null,
               ),
@@ -1032,6 +1071,16 @@ window.__ModuleLoader__.load({
               : null,
           )
         }),
+        // One line for the whole round: who does what a button sends, and the
+        // switch to the other one.
+        h('div', { className: 'trae-choice-foot', 'data-subagent': toSubagent ? '' : undefined },
+          h('button', {
+            type: 'button', className: 'trae-choice-who',
+            'aria-pressed': toSubagent, title: t('choicesSubagentToggle'),
+            onClick: () => { setDelegate(!toSubagent) },
+          }, icon(ICON_BRANCH, 12), h('span', null, t(toSubagent ? 'choicesSubagentOn' : 'choicesSubagentOff'))),
+          h('span', { className: 'trae-choice-note' }, t(toSubagent ? 'choicesSubagentHint' : 'choicesInlineHint')),
+        ),
       )
     }
 
