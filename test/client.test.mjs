@@ -52,9 +52,12 @@ test('client: every slot registration passes the host registry rules', () => {
   }
   plugin.apply(ctx)
   const byName = Object.fromEntries(registered.map(r => [r.name, r]))
+  const ids = name => registered.filter(r => r.name === name).map(r => r.id)
   assert.equal(byName['conversation.input.dock'].id, 'trae-choices')
   assert.equal(byName['conversation.input.overlay'], undefined, 'no Tab ghost text any more')
-  assert.equal(byName['conversation.input.right'].id, 'trae-quota')
+  // Two entries beside the model picker, each with its own id: the quota chip
+  // and the "switching reopens the upstream conversation" notice.
+  assert.deepEqual(ids('conversation.input.right'), ['trae-quota', 'trae-switch'])
   assert.ok(byName['plugins.bundle.config'] && byName['settings.models.provider-card'])
 })
 
@@ -166,6 +169,82 @@ test('chip: the label carries one figure per allowance, coloured by the emptiest
     ],
     limit: 800, used: 87.63, remaining: 712.37, dollars: false,
   }).label, 'Trae 剩余 89%')
+})
+
+/**
+ * Walk the switch notice through a sequence of model selections, running its
+ * effect between renders the way React would, and return what it showed after
+ * each one (null = nothing shown). Timers are stubbed, so the notice never
+ * expires inside the test and no handle outlives it.
+ */
+function renderNotice(selections) {
+  const slots_ = []
+  let cursor = 0
+  let effect = null
+  const react = {
+    createElement: (type, props, ...children) => ({ type, props, children }),
+    useState: (initial) => {
+      const at = cursor++
+      if (!(at in slots_)) slots_[at] = initial
+      return [slots_[at], (next) => { slots_[at] = typeof next === 'function' ? next(slots_[at]) : next }]
+    },
+    useRef: (initial) => {
+      const at = cursor++
+      if (!(at in slots_)) slots_[at] = { current: initial }
+      return slots_[at]
+    },
+    useEffect: (fn) => { effect = fn },
+  }
+  const plugin = loadClient(react)
+  let Notice, zh
+  const slots = {
+    inject: (_name, fn) => { fn(); return () => {} },
+    register: (options, component) => { if (options.id === 'trae-switch') Notice = component; return () => {} },
+  }
+  plugin.apply({
+    slots,
+    locale: { register: (_ns, dicts) => { zh = dicts.zh; return () => {} } },
+    remote: { $on: () => () => {}, credentials: { describe: async () => ({ ok: false }) } },
+    configForms: { get: () => ({ getSnapshot: () => ({}), subscribe: () => () => {} }), whileServed: (_ns, fn) => fn() },
+    effect: (fn) => { fn() },
+    inject: (_deps, cb) => { cb({ slots, modelDirectories: {} }) },
+  })
+  const timeout = globalThis.setTimeout
+  const clear = globalThis.clearTimeout
+  globalThis.setTimeout = () => 0
+  globalThis.clearTimeout = () => {}
+  const shown = []
+  try {
+    for (const current of selections) {
+      const render = () => {
+        cursor = 0
+        effect = null
+        return Notice({ t: key => zh[key], useTraeModel: select => select({ current }) })
+      }
+      render()
+      if (effect) effect()
+      // The state the effect set is only visible on the next render.
+      const node = render()
+      shown.push(node ? node.children[0].children[0] : null)
+    }
+  } finally {
+    globalThis.setTimeout = timeout
+    globalThis.clearTimeout = clear
+  }
+  return shown
+}
+
+test('switch notice: quiet until the picked model or level moves, and only for Trae', () => {
+  const glm = { provider: 'trae', modelId: 'GLM-5.3', reasoningEffort: 'high' }
+  // Binding a session to its first model is not a switch.
+  assert.deepEqual(renderNotice([glm, glm]), [null, null])
+  // The level alone is a switch: the next turn runs in a new upstream chat.
+  assert.deepEqual(renderNotice([glm, { ...glm, reasoningEffort: 'light' }]), [null, '换了模型／档位 · 下一轮重开会话'])
+  assert.deepEqual(renderNotice([glm, { ...glm, modelId: 'Kimi-K3' }]), [null, '换了模型／档位 · 下一轮重开会话'])
+  // Another provider's selection is none of this plugin's business.
+  assert.deepEqual(renderNotice([glm, { provider: 'deepseek', modelId: 'deepseek-chat' }]), [null, null])
+  // A selection this plugin cannot read keeps it quiet rather than guessing.
+  assert.deepEqual(renderNotice([null, glm]), [null, null])
 })
 
 /**
