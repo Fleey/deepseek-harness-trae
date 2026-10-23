@@ -1,6 +1,6 @@
 {
   "name": "dsh-trae2api",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "DeepSeek Harness plugin: use Trae enterprise models with just a Personal Access Token (direct llm_raw_chat, no trae2api/traecli).",
   "type": "module",
   "main": "lib/index.js",
