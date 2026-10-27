@@ -37,8 +37,15 @@
  * (the 轻/高/极高 buttons); a few models are described only by the catalog,
  * which spells the same ladder `low`/`high`/`xhigh`. Each model advertises the
  * vocabulary its own source used, which is what gets sent upstream.
+ *
+ * `medium` and `max` are in the vocabulary because the Trae client knows five
+ * rungs (`reasoning_effort.{low,medium,high,extra_high,max}`) and ships them by
+ * gray release per agent model. Measured on 2026-10-25, upstream still offers
+ * only the three middle ones, so this widens what can be *parsed*, never what
+ * is claimed: a model's ladder stays exactly the `options` its own source
+ * stated, and an unknown rung is dropped rather than rounded to a cheaper one.
  */
-export type TraeEffort = 'light' | 'low' | 'high' | 'extra_high' | 'xhigh'
+export type TraeEffort = 'light' | 'low' | 'medium' | 'high' | 'extra_high' | 'xhigh' | 'max'
 
 export interface TraeModel {
   /** Display id shown in the picker (traecli's slug). */
@@ -71,6 +78,15 @@ export interface TraeModel {
    * in a misleading "rate limited" envelope (see trae2api/direct.py).
    */
   multimodal?: boolean
+  /**
+   * The catalog `function` upstream shows this model under, carried into the
+   * chat request's `function` field. Absent = `chat`, which is every model the
+   * default catalog call returns; a model that only the extra functions list
+   * (see `catalogFunctions`) states gets pinned to the one that showed it,
+   * because asking for a model under a function that does not list it is what
+   * `4001` means.
+   */
+  wireFunction?: string
 }
 
 const LIGHT_HIGH: readonly TraeEffort[] = ['light', 'high']
@@ -109,9 +125,11 @@ export const TRAE_MODELS: readonly TraeModel[] = [
 export const EFFORT_NAMES: Record<TraeEffort, string> = {
   light: 'Light 轻',
   low: 'Low 轻',
+  medium: 'Medium 中',
   high: 'High 高',
   extra_high: 'Extra High 极高',
   xhigh: 'Extra High 极高',
+  max: 'Max 最高',
 }
 
 /** One selectable entry: one model, already in its largest available variant. */
@@ -134,6 +152,8 @@ export interface TraeRoute {
   maxMarker: boolean
   /** True when this model accepts images on user messages (upstream `image_url`). */
   multimodal: boolean
+  /** Catalog function the chat request names for this model; absent = `chat`. */
+  wireFunction?: string
   /**
    * Output cap the backend grants a turn on this variant, when the catalog
    * states it (`model_detail_list[].max_tokens`). Absent = fall back to the
@@ -162,6 +182,7 @@ export function toRoutes(models: readonly TraeModel[]): readonly TraeRoute[] {
       maxMode: max !== undefined,
       maxMarker: max !== undefined && max.key === undefined,
       multimodal: model.multimodal ?? false,
+      ...model.wireFunction ? { wireFunction: model.wireFunction } : {},
       ...(max ? max.outputTokens : model.outputTokens) !== undefined
         ? { outputTokens: (max ? max.outputTokens : model.outputTokens)! }
         : {},

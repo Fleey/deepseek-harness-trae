@@ -1388,3 +1388,296 @@ test('suggestions: shown then accept, once each, sharing one resp_id; stale ids 
   assert.equal(await store.record('s1', id, 'accept', { card: 0, choice: 0 }), false)
   assert.equal(reported.length, 2)
 })
+
+test('tool schemas: a draft-3 `required` is promoted to a draft-4 array before the wire', async () => {
+  const { normalizeToolSchema, normalizeToolSchemas, toTraeTools } = await import('../lib/testing.mjs')
+  // What dsh's schemastery writes: the flag sits *inside* the property, which
+  // is draft-3. The Zhipu backends let it through; the DeepSeek ones validate
+  // strictly and answer `4027 … properties/path/required: invalid JSON
+  // Schema`, and `tools` is validated as a batch — so one such property fails
+  // every tool in the turn.
+  const draft3 = {
+    type: 'object',
+    properties: {
+      path: { type: 'string', required: true },
+      limit: { type: 'number', required: false },
+      mode: { type: 'string' },
+    },
+  }
+  assert.deepEqual(normalizeToolSchema(draft3), {
+    type: 'object',
+    properties: { path: { type: 'string' }, limit: { type: 'number' }, mode: { type: 'string' } },
+    required: ['path'],
+  })
+  // The input is left as it was: the caller's own tool list is not rewritten.
+  assert.equal(draft3.properties.path.required, true)
+
+  // Nested anywhere a schema can hide, and merged with a required array that
+  // is already there (no duplicates, existing order first).
+  const nested = {
+    type: 'object',
+    required: ['head'],
+    properties: {
+      head: { type: 'string' },
+      edits: {
+        type: 'array',
+        items: { type: 'object', properties: { from: { type: 'string', required: true } } },
+      },
+      either: {
+        anyOf: [
+          { type: 'object', properties: { a: { type: 'string', required: true } } },
+          { type: 'null' },
+        ],
+      },
+      head2: { type: 'string', required: true },
+    },
+  }
+  const fixed = normalizeToolSchema(nested)
+  assert.deepEqual(fixed.required, ['head', 'head2'])
+  assert.deepEqual(fixed.properties.edits.items.required, ['from'])
+  assert.deepEqual(fixed.properties.either.anyOf[0].required, ['a'])
+  assert.equal('required' in fixed.properties.head2, false)
+
+  // What reaches upstream: `parameters` as a JSON string, already draft-4.
+  const [tool] = toTraeTools([{ name: 'read', description: 'read a file', parameters: draft3 }])
+  assert.deepEqual(JSON.parse(tool.function.parameters).required, ['path'])
+  assert.equal(tool.function.name, 'read')
+  assert.equal(normalizeToolSchemas(undefined).length, 0)
+})
+
+test('tool schemas: normalizing is idempotent and touches nothing else', async () => {
+  const { normalizeToolSchema } = await import('../lib/testing.mjs')
+  // Already draft-4: byte-identical back, so a legal payload is never changed.
+  const draft4 = {
+    type: 'object',
+    required: ['path'],
+    properties: { path: { type: 'string' }, deep: { type: 'object', additionalProperties: false } },
+  }
+  assert.deepEqual(normalizeToolSchema(draft4), draft4)
+  assert.deepEqual(normalizeToolSchema(normalizeToolSchema(draft4)), draft4)
+
+  // A property genuinely *named* `required`, and a boolean `required` that no
+  // parent can own: the first is a property like any other, the second cannot
+  // be expressed in draft-4 and is dropped rather than sent.
+  const named = { type: 'object', properties: { required: { type: 'boolean' } } }
+  assert.deepEqual(normalizeToolSchema(named), named)
+  assert.deepEqual(normalizeToolSchema({ type: 'string', required: true }), { type: 'string' })
+
+  // Not-a-schema values survive.
+  assert.equal(normalizeToolSchema(undefined), undefined)
+  assert.equal(normalizeToolSchema('text'), 'text')
+})
+
+test('thinking levels: five rungs, and an unoffered one is dropped rather than rounded', async () => {
+  const { effortFor } = await import('../lib/testing.mjs')
+  const route = efforts => ({ efforts })
+
+  // Exact match wins, in either vocabulary.
+  assert.equal(effortFor(route(['light', 'high', 'extra_high']), 'extra_high'), 'extra_high')
+  assert.equal(effortFor(route(['low', 'high', 'xhigh']), 'xhigh'), 'xhigh')
+  // The same rung under the other source's spelling.
+  assert.equal(effortFor(route(['light', 'high', 'extra_high']), 'xhigh'), 'extra_high')
+  assert.equal(effortFor(route(['low', 'high', 'xhigh']), 'light'), 'low')
+  assert.equal(effortFor(route(['light', 'high']), 'minimal'), 'light')
+
+  // `medium` and `max` are their own rungs now: a model that does not offer
+  // them gets *nothing* sent, so upstream answers at its own default. Rounding
+  // `medium` onto `high` would answer at a level nobody asked for and say
+  // nothing about it.
+  assert.equal(effortFor(route(['light', 'high']), 'medium'), undefined)
+  assert.equal(effortFor(route(['light', 'high']), 'max'), undefined)
+  assert.equal(effortFor(route(['medium', 'high']), 'medium'), 'medium')
+  assert.equal(effortFor(route(['high', 'max']), 'max'), 'max')
+  // Still nothing for a name no rung knows, or a model with no ladder at all.
+  assert.equal(effortFor(route(['light', 'high']), 'turbo'), undefined)
+  assert.equal(effortFor(route([]), 'high'), undefined)
+  assert.equal(effortFor(route(['light', 'high']), undefined), undefined)
+})
+
+test('thinking levels: a wider vocabulary is not a wider claim', () => {
+  // Parsing `medium` / `max` does not conjure them: a model's ladder is still
+  // exactly the `options` its own source stated. Upstream offered only the
+  // three middle rungs when this was measured (2026-10-25).
+  const answer = {
+    function_configs: [{
+      function: 'chat',
+      config_info_list: [
+        {
+          config_name: 'five-rung',
+          config_switch: true,
+          is_invisible_to_user: false,
+          context_window_tokens: { dev: 200000 },
+          display_config: { display_name: 'Five-Rung', multimodal: false },
+          reasoning_effort_config: {
+            support_thinking: true,
+            default_level: 'medium',
+            options: ['low', 'medium', 'high', 'extra_high', 'max'],
+          },
+          model_detail_list: [{ model_name: 'five-rung__dev' }],
+        },
+        {
+          config_name: 'three-rung',
+          config_switch: true,
+          is_invisible_to_user: false,
+          context_window_tokens: { dev: 200000 },
+          display_config: { display_name: 'Three-Rung', multimodal: false },
+          reasoning_effort_config: { support_thinking: true, default_level: 'high', options: ['light', 'high'] },
+          model_detail_list: [{ model_name: 'three-rung__dev' }],
+        },
+      ],
+    }],
+  }
+  const [five, three] = parseDetailParams(answer)
+  assert.deepEqual(five.efforts, ['low', 'medium', 'high', 'extra_high', 'max'])
+  assert.equal(five.defaultEffort, 'medium')
+  // No phantom rungs on a model upstream describes with three.
+  assert.deepEqual(three.efforts, ['light', 'high'])
+  assert.equal(three.defaultEffort, 'high')
+})
+
+/** A `function_configs` group with one model in it. */
+function configGroup(fn, rows) {
+  return {
+    function: fn,
+    config_info_list: rows.map(({ name, visible = true, window = 200000 }) => ({
+      config_name: name,
+      config_switch: true,
+      is_invisible_to_user: !visible,
+      context_window_tokens: { dev: window },
+      display_config: { display_name: name.toUpperCase(), multimodal: false },
+      reasoning_effort_config: { support_thinking: true, default_level: 'high', options: ['light', 'high'] },
+      model_detail_list: visible ? [{ model_name: `${name}__dev` }] : [],
+    })),
+  }
+}
+
+test('catalog source: the verdict is per (config, function) — hidden everywhere is gone, hidden here is pinned', () => {
+  const answer = {
+    function_configs: [
+      configGroup('chat', [
+        { name: 'both' },
+        { name: 'pinned', visible: false },
+        { name: 'retired', visible: false },
+      ]),
+      configGroup('solo_coder', [
+        { name: 'both', window: 111000 },
+        { name: 'pinned' },
+        { name: 'retired', visible: false },
+        { name: 'coder-only' },
+      ]),
+    ],
+  }
+  // Function priority first, response order within a function: two refreshes
+  // of one account cannot come out in two different orders.
+  const models = parseDetailParams(answer, ['chat', 'solo_coder'])
+  assert.deepEqual(models.map(m => m.configName), ['both', 'pinned', 'coder-only'])
+
+  // Listed under both: described once, by the higher-priority function, and
+  // carrying no pin — `chat` is what the chat request names anyway.
+  const both = models.find(m => m.configName === 'both')
+  assert.equal(both.contextWindow, 200_000, "the chat answer's window, not solo_coder's")
+  assert.equal(both.wireFunction, undefined)
+
+  // Hidden under chat, shelved under solo_coder: kept, and pinned to the
+  // function that shelves it. Asking for it as `chat` is what `4001` means.
+  assert.equal(models.find(m => m.configName === 'pinned').wireFunction, 'solo_coder')
+  assert.equal(models.find(m => m.configName === 'coder-only').wireFunction, 'solo_coder')
+  // Hidden under every function in the answer: gone. Silence is not a verdict,
+  // but `is_invisible_to_user` everywhere is.
+  assert.equal(models.find(m => m.configName === 'retired'), undefined)
+
+  // The pin rides into the route, and from there into the request body.
+  const routes = toRoutes(models)
+  assert.equal(routes.find(r => r.configName === 'pinned').wireFunction, 'solo_coder')
+  assert.equal(routes.find(r => r.configName === 'both').wireFunction, undefined)
+
+  // Priority is the caller's order, not the answer's.
+  const flipped = parseDetailParams(answer, ['solo_coder', 'chat'])
+  assert.equal(flipped.find(m => m.configName === 'both').contextWindow, 111_000)
+  assert.equal(flipped.find(m => m.configName === 'both').wireFunction, 'solo_coder')
+})
+
+test('catalog store: the extra functions are their own request, and losing it costs only their models', async () => {
+  const chatOnly = { function_configs: [configGroup('chat', [{ name: 'glm-5.3' }])] }
+  const extrasOnly = { function_configs: [configGroup('solo_coder', [{ name: 'coder-only' }])] }
+
+  const bodies = []
+  const ok = new TraeCatalog({
+    cacheFile: '',
+    functions: ['chat', 'solo_coder'],
+    fetchUpstream: async (_signal, body) => {
+      bodies.push(body.functions)
+      return body.functions.includes('chat') ? chatOnly : extrasOnly
+    },
+  })
+  const union = await ok.ready()
+  assert.equal(union.origin, 'upstream')
+  // `chat` is asked exactly as traecli asks it, the extras separately.
+  assert.deepEqual(bodies, [['chat'], ['solo_coder']])
+  assert.deepEqual(union.routes.map(r => r.id), ['GLM-5.3', 'CODER-ONLY'])
+  assert.equal(union.find('coder-only').wireFunction, 'solo_coder')
+
+  // The extras request fails: the chat catalog stands, and the snapshot is
+  // still an upstream one (so it is not re-asked on a cooldown).
+  const warnings = []
+  const broken = new TraeCatalog({
+    cacheFile: '',
+    functions: ['chat', 'solo_coder'],
+    fetchUpstream: async (_signal, body) => {
+      if (!body.functions.includes('chat')) throw new Error('HTTP 400：unknown function')
+      return chatOnly
+    },
+    logger: { info() {}, warn: (...a) => { warnings.push(a.join(' ')) } },
+  })
+  const kept = await broken.ready()
+  assert.equal(kept.origin, 'upstream')
+  assert.deepEqual(kept.routes.map(r => r.id), ['GLM-5.3'])
+  assert.match(warnings.join('\n'), /额外模型通道/)
+
+  // `['chat']` asks one question, the way traecli does.
+  const asked = []
+  const plain = new TraeCatalog({
+    cacheFile: '',
+    functions: ['chat'],
+    fetchUpstream: async (_signal, body) => { asked.push(body.functions); return chatOnly },
+  })
+  await plain.ready()
+  assert.deepEqual(asked, [['chat']])
+})
+
+test('context budget: a local cap moves compaction, never the shelf', async () => {
+  const { TraeAdapter } = await import('../lib/testing.mjs')
+  const options = extra => ({
+    displayName: 'Trae',
+    host: 'https://example.invalid',
+    identity: {},
+    auth: { get: async () => ({ token: 't', expiresAt: Date.now() + 3600_000 }) },
+    readTimeoutMs: 1000,
+    emptyRetries: 0,
+    loopGuardChars: 600,
+    logger: { info() {}, warn() {} },
+    ...extra,
+  })
+
+  // 0 = the model's own window, which is what shipped before this option.
+  const uncapped = new TraeAdapter(options({ contextBudgetTokens: 0 }))
+  assert.equal((await uncapped.resolveModel('trae', 'GLM-5.3')).context.contextWindow, 1_000_000)
+
+  // The half-step between a 200K default window and Max's 1M.
+  const capped = new TraeAdapter(options({ contextBudgetTokens: 500_000 }))
+  const glm = await capped.resolveModel('trae', 'GLM-5.3')
+  assert.equal(glm.context.contextWindow, 500_000)
+  // The output half is untouched: the budget is about prompt planning.
+  assert.equal(glm.defaultMaxTokens, 64_000)
+  // A model whose own window is already smaller keeps it — a budget is a cap,
+  // not a claim that the model holds that much.
+  assert.equal((await capped.resolveModel('trae', 'Doubao-Seed-Evolving')).context.contextWindow, 184_000)
+
+  // The picker says both numbers, so "1M" never reads as what this session
+  // will actually use.
+  const models = await capped.listModels('trae')
+  assert.equal(models.find(m => m.id === 'GLM-5.3').description, '1M 上下文（Max） · 本地预算 500K')
+  assert.equal(models.find(m => m.id === 'Doubao-Seed-Evolving').description, '184K 上下文')
+  const plain = await uncapped.listModels('trae')
+  assert.equal(plain.find(m => m.id === 'GLM-5.3').description, '1M 上下文（Max）')
+})

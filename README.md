@@ -33,6 +33,26 @@ v0.3 起插件自己直连 Trae 的 `llm_raw_chat` 接口（和 trae2api 的 dir
   1. **上游** `POST /api/ide/v1/batch_get_detail_param` —— traecli 自己也走这个，请求体就是
      traecli 二进制里内置的那份。它是所有事实的权威：有哪些模型、两个后端 key、两个上下文
      窗口、每个变体的输出上限、Max 是不是真的、能不能吃图、思考档位及默认档。
+
+     这个接口是**按通道（`function`）回答**的，而模型是否上架是按「配置 × 通道」判的：
+     只问一个通道，就看不到只在别的通道上架的模型。默认按 traecli 的原样只问 `chat`
+     （**实测企业版只有 chat 上架模型**，见下）；`catalogFunctions` 里多填的通道会**单独发一次
+     请求**问，两份取并集：
+     - 在所有通道都标了 `is_invisible_to_user` 的，判**退役**，移出目录（原本就是 `4023` 的来源）；
+     - 这边藏、那边上架的，**保留并钉到上架它的那个通道**（聊天请求的 `function` 字段按钉的
+       来发——拿一个通道没上架的模型去问，回的就是 `4001`）；
+     - 名册没提到的，一行不动。
+     - 冲突按通道优先级，保留优先通道的那份拼写（`enabledModelIds` 是精确匹配，改名会让已启用
+       的模型静默消失）。
+
+     > **2026-10-27 用真实 ToB 会话在 `api.enterprise.trae.cn` 上实测过**
+     > （`python3 -I tools/probe_catalog.py`）：`solo_work_remote` / `solo_work_lite` /
+     > `solo_coder` / `chat_v3` 四个名字上游都认（各回 `HTTP 200` 和一个同名 group），但
+     > **配置数全是 0**，而 `chat` 有 31 个（25 个可见）。也就是说企业席位上没有可并的东西，
+     > 多问一个通道只是每次刷新多发一次 POST——所以默认是 `['chat']`。
+     >
+     > 并集这条路留着：按通道上架的 host 把通道名填进 `catalogFunctions` 即可。额外通道始终走
+     > 第二次请求，问不到、被拒、回空都只记一行日志跳过，`chat` 那份目录照常用。
   2. **traecli 缓存** `~/.trae/cli/models_cache.json` —— 不走网络，但只有 traecli 跑过才会更新；
      它的 `input_modalities` 对每个模型都写 `["text","image"]`（Codex fork 的常量，不是能力），
      所以能不能吃图这一项取插件内置表里的标记。
@@ -41,7 +61,19 @@ v0.3 起插件自己直连 Trae 的 `llm_raw_chat` 接口（和 trae2api 的 dir
 
   拿到的目录里：**14 个模型直接按 1M 上下文（Max）提供**，不再额外列小窗口的版本；剩下 6 个
   用各自的标准窗口（Doubao 系 184K/200K，其余 200K）。**思考档位**在对话框模型菜单里选，
-  词表是 `light / high / extra_high`（界面上的 轻 / 高 / 极高）。
+  上游目前下发的是 `light / high / extra_high`（界面上的 轻 / 高 / 极高）。
+
+  > 能解析的档位词表是五档（`low|light / medium / high / extra_high|xhigh / max`，Trae 客户端
+  > 自己就是这五档，按模型灰度下发）。**词表宽不等于声称宽**：某个模型能选哪几档，仍然只看
+  > 上游为它下发的 `options`，2026-10-25 实测上游只给三档，所以这是「先备好」。
+  > 请求的档位如果这个模型没有，就**不发**，让上游用它自己的默认——把它就近折到一个便宜档
+  > 等于给出用户没要的答案，而且没有任何迹象。
+
+  **本地上下文预算**：`contextBudgetTokens` 给 dsh 规划压缩用的窗口加一个上限（0 = 用模型
+  自己的窗口；Max 模型想要默认窗口到 1M 之间的半步就填 `500000`）。它**只改压缩时机**：
+  请求体里除了 Max 标记那个 `context_window_size` 之外没有窗口字段，调低预算不会让上游
+  按更小的窗口服务、也不会便宜，只是让 dsh 更早压缩，不至于一上来就按整个 1M 的 prompt 发。
+  预算真的压到窗口以下时，模型选择器那行会同时写出两个数（`1M 上下文（Max） · 本地预算 500K`）。
 
   > 想看插件现在用的是哪一份：`GET /api/dsh-trae2api/catalog` 会返回模型列表、来源
   > （`upstream` / `cache` / `builtin`）和取到的时间；加 `?refresh` 当场重新问一次上游。
@@ -49,6 +81,13 @@ v0.3 起插件自己直连 Trae 的 `llm_raw_chat` 接口（和 trae2api 的 dir
 
 - 内置了 trae2api 里那几道兜底：工具调用历史修复（避免 `4027`）、把模型写成文本的
   `<invoke>` 工具调用捞回来、重复塌缩截断、空回合重试、上游错误码翻译。
+
+  > 另外，**工具 schema 在出口统一归一化成 draft-4**。dsh 的 schemastery 产的是 draft-3 风格
+  > ——`required: true` 写在属性**内部**；draft-4 起改成父级的字符串数组。上游是分后端校验的：
+  > 智谱系放行，DeepSeek 系按 draft-4 严校验，回 `4027 … properties/X/required: invalid JSON
+  > Schema`，而且 `tools` 是**按批校验**，一个属性不合格就整轮带工具的请求全挂。归一化是纯本地
+  > 的递归提升（`items` / `anyOf` / `oneOf` / `allOf` / `$defs` 任意嵌套，与已有 `required`
+  > 数组去重合并），**幂等**：本来就是 draft-4 的 schema 原样发出。
 
   > 「捞回来」只认模型自己发起的那一个：代码块（``` ```）和行内反引号里的、正文中间
   > 后面还有正文的、以及这一轮已经有原生 `tool_calls` 的，一律当文本留在回答里。所以
@@ -85,10 +124,10 @@ v0.3 起插件自己直连 Trae 的 `llm_raw_chat` 接口（和 trae2api 的 dir
 
 ### 用 tgz 安装（发给别人）
 
-`dsh-trae2api-0.6.0.tgz` 是预构建好的包，不需要构建权限：
+`dsh-trae2api-0.7.0.tgz` 是预构建好的包，不需要构建权限：
 
 ```sh
-dsh plugin --profile desktop add ./dsh-trae2api-0.6.0.tgz
+dsh plugin --profile desktop add ./dsh-trae2api-0.7.0.tgz
 ```
 
 装完同样去 **设置 → 模型 → Trae** 填 PAT。tgz 方式下插件自带全部代码，和项目目录无关。
@@ -113,7 +152,9 @@ dsh plugin --profile desktop add ./dsh-trae2api-0.6.0.tgz
 | `clientId` | `app_EMoamEEZ73f0CkXaXp7hrann` | PAT 兑换用的 OAuth client id（traecli 的） |
 | `appId` / `ideVersionCode` / `clientVersion` | 20260908 那一代 | 身份头，和模型名后缀（`__dev`）配对 |
 | `catalogSource` | `auto` | 模型目录来源：`auto` = 上游 → traecli 缓存 → 内置；也可锁成 `upstream` / `cache` / `builtin` |
+| `catalogFunctions` | `['chat']` | 问上游要目录的通道；多填的通道单独发一次请求，问不到就只用 `chat` 那份。企业版实测只有 `chat` 上架模型，可试的名字：`solo_work_remote` / `solo_work_lite` / `solo_coder` / `chat_v3` |
 | `modelsCacheFile` | 空 | traecli 模型缓存路径；空 = `~/.trae/cli/models_cache.json` |
+| `contextBudgetTokens` | `0` | 本地上下文预算上限（token）；0 = 用模型自己的窗口。只改压缩时机，不改上游服务的窗口 |
 | `consoleEmailEnv` | `TRAE_CONSOLE_EMAIL` | 控制台邮箱在凭据库里的引用名（卡片写这里） |
 | `consoleEmail` | 空 | 控制台邮箱的配置兜底（凭据库里没有时才用） |
 | `consolePasswordEnv` | `TRAE_CONSOLE_PASSWORD` | 控制台密码在凭据库里的引用名 |
@@ -203,6 +244,10 @@ TRAE_PAT=… TRAE_CONSOLE_EMAIL=… TRAE_CONSOLE_PASSWORD=… python3 -I tools/p
 ```sh
 python3 -I tools/probe_catalog.py
 ```
+
+它第一段就是**按通道列模型**：每个 `function` 各发一次，打出这个 host 认不认这个名字、
+该通道上架了几个配置、哪些可见。想验证 `catalogFunctions` 里那四个未取证的通道名，就看这段
+（换一批名字：`TRAE_FUNCTIONS=chat,solo_coder python3 -I tools/probe_catalog.py`）。
 
 ## 下一步选择卡片
 
@@ -326,6 +371,16 @@ npm test           # 目录、消息转换、SSE 解码、重复检测、文本�
 - `client/client.js` —— 浏览器端：Models 页和插件页里的 PAT 卡片、额度块、输入框额度徽标。
 
 已在 `@deepseek-ai/dsh@0.2.0-rc.2` 的 Web 界面里验证：Trae 卡片只有 PAT 一个字段，未填时
-连接状态显示明确提示。24 项单元测试覆盖协议转换、各项兜底、额度解析与路由注册，以及**出货
+连接状态显示明确提示。77 项单元测试覆盖协议转换、各项兜底、额度解析与路由注册，以及**出货
 bundle 里每个模型的上下文窗口和思考档位**。真实 PAT 兑换、模型调用与额度查询已在
 `api.enterprise.trae.cn` 环境用真实 PAT 验证通过。
+
+> **哪些没有实测过**：工具 schema 的 draft-4 归一化是按上游「分后端校验」的报告写的，本机没有
+> 复现过 DeepSeek 后端那条 `4027`；五档词表里的 `medium` / `max` 上游尚未下发。目录通道那条
+> 2026-10-27 已实测（四个额外通道回 200 但 0 配置，所以默认只问 `chat`）。四项改动各自做过
+> 变异验证：把实现改回原样，对应的测试就转红。
+>
+> 另外，`src/trae/catalog.ts` 那份**内置兜底表（20 个模型）已经落后于上游**：同一次实测里
+> `chat` 通道可见 23 个模型（除 `summary` 与 `custom_model_placeholder`），多出
+> `DeepSeek-V4.1-Flash-1017`、`kimi-k3.1-pro`、`minimax-m3.1-flash` 三个。兜底表只在断网或
+> 上游不可达时才用到，所以不影响正常使用。

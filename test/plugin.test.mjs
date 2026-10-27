@@ -160,15 +160,49 @@ test('apply serves the model catalog, refreshed from Trae on request', async () 
       maxMode: true, multimodal: false, efforts: ['light', 'high'],
     }])
 
-    // The startup refresh is the only call so far: a plain GET answers from it.
+    // The startup refresh is the only call so far: a plain GET answers from
+    // it. One call, not two: the extra catalog functions are off by default,
+    // because probing them on the enterprise host (2026-10-27) returned
+    // `HTTP 200` with 0 configs for every one of them — nothing to union in,
+    // one POST per refresh to pay for it.
     const asked = seen.filter(c => c.url.endsWith('/api/ide/v1/batch_get_detail_param'))
     assert.equal(asked.length, 1)
+    assert.deepEqual(plugin.Config({}).catalogFunctions, ['chat'])
     assert.equal(asked[0].headers['x-ide-version-code'], '20260908')
     assert.match(asked[0].headers.authorization, /^Cloud-IDE-JWT eyJ/)
     assert.deepEqual(JSON.parse(asked[0].body).functions, ['chat'])
     // `?refresh` is the manual path and does ask again.
     await route.fetch(new Request('http://127.0.0.1/api/dsh-trae2api/catalog?refresh=1'))
     assert.equal(seen.filter(c => c.url.endsWith('/api/ide/v1/batch_get_detail_param')).length, 2)
+  } finally { globalThis.fetch = original }
+})
+
+test('apply asks the extra catalog functions only when they are configured', async () => {
+  const routes = new Map()
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    effect() {}, on() {},
+    get: (name) => name === 'credentials' ? { resolve: async () => ({ value: 'eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQxMDI0NDQ4MDB9.c2ln' }) } : undefined,
+    inject: (deps, cb) => {
+      if (deps.includes('connection')) cb({ connection: { fetch: { register: (route) => { routes.set(route.path, route) } } } })
+    },
+    fiber: { entry: { options: { id: 'trae2api' } } },
+    llm: { registerAdapter() {}, registerConfigurableProviders() {} },
+  }
+  const original = globalThis.fetch
+  const bodies = []
+  globalThis.fetch = async (url, init) => {
+    if (String(url).endsWith('/api/ide/v1/batch_get_detail_param')) bodies.push(JSON.parse(init.body).functions)
+    return Response.json({ function_configs: [] })
+  }
+  try {
+    // The configured list has to reach the wire: a config field the catalog
+    // never reads would look exactly like a working opt-in.
+    plugin.apply(ctx, plugin.Config({ catalogFunctions: ['chat', 'solo_coder'] }))
+    const route = routes.get(plugin.CATALOG_ROUTE)
+    await route.fetch(new Request('http://127.0.0.1/api/dsh-trae2api/catalog'))
+    // `chat` as traecli asks it, then the extras in a request of their own.
+    assert.deepEqual(bodies, [['chat'], ['solo_coder']])
   } finally { globalThis.fetch = original }
 })
 

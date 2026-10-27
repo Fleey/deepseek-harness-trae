@@ -171,9 +171,85 @@ export function toTraeMessages(options: GenerateOptions, images: TraeImages | un
   return repairToolHistory(rawMessages(options, images))
 }
 
+/**
+ * Keywords whose value is itself a schema (or a list of them), so a draft-3
+ * `required` can hide arbitrarily deep.
+ */
+const SCHEMA_CHILDREN = ['items', 'additionalProperties', 'not', 'if', 'then', 'else', 'contains', 'propertyNames'] as const
+const SCHEMA_LISTS = ['anyOf', 'oneOf', 'allOf', 'prefixItems'] as const
+const SCHEMA_MAPS = ['properties', 'patternProperties', '$defs', 'definitions'] as const
+
+function isSchemaObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * Rewrite a tool's JSON Schema from draft-3 to draft-4 `required`.
+ *
+ * Draft-3 marks a property required *inside* the property (`{"type":"string",
+ * "required":true}`); draft-4 onwards moved it to a string array on the parent
+ * (`{"required":["x"]}`). Upstream validates per backend: the Zhipu models let
+ * the draft-3 form through, while the DeepSeek ones validate strictly and
+ * answer `4027 … tools.N.function.parameters/properties/X/required: invalid
+ * JSON Schema`. `tools` is validated as a batch, so one offending property
+ * fails every tool in the turn — the symptom is "any turn carrying tools dies
+ * with 400".
+ *
+ * Local only, and idempotent: a schema that is already draft-4 comes back
+ * unchanged, and a property genuinely *named* `required` (which lives under
+ * `properties`, not as a sibling flag) is left alone. The input is never
+ * mutated.
+ */
+export function normalizeToolSchema(schema: unknown): unknown {
+  if (Array.isArray(schema)) return schema.map(normalizeToolSchema)
+  if (!isSchemaObject(schema)) return schema
+
+  const out: Record<string, unknown> = { ...schema }
+  // Names this node's own `properties` children declare draft-3 style.
+  const promoted: string[] = []
+
+  for (const key of SCHEMA_MAPS) {
+    const map = out[key]
+    if (!isSchemaObject(map)) continue
+    const next: Record<string, unknown> = {}
+    for (const [name, child] of Object.entries(map)) {
+      if (isSchemaObject(child) && 'required' in child && typeof child.required === 'boolean') {
+        const { required, ...rest } = child
+        if (required && key === 'properties') promoted.push(name)
+        next[name] = normalizeToolSchema(rest)
+        continue
+      }
+      next[name] = normalizeToolSchema(child)
+    }
+    out[key] = next
+  }
+  for (const key of SCHEMA_CHILDREN) {
+    if (key in out) out[key] = normalizeToolSchema(out[key])
+  }
+  for (const key of SCHEMA_LISTS) {
+    if (Array.isArray(out[key])) out[key] = (out[key] as unknown[]).map(normalizeToolSchema)
+  }
+
+  if (promoted.length > 0) {
+    const existing = Array.isArray(out.required) ? out.required.filter(n => typeof n === 'string') as string[] : []
+    out.required = [...new Set([...existing, ...promoted])]
+  } else if (typeof out.required === 'boolean') {
+    // A draft-3 flag on a node that is not under `properties` (so no parent can
+    // own it) says nothing draft-4 can express: drop it rather than send a
+    // shape the strict backend rejects.
+    delete out.required
+  }
+  return out
+}
+
+/** The same, for every tool in a request. */
+export function normalizeToolSchemas(tools: readonly ToolSchema[] | undefined): readonly ToolSchema[] {
+  return (tools ?? []).map(t => ({ ...t, parameters: normalizeToolSchema(t.parameters ?? {}) as ToolSchema['parameters'] }))
+}
+
 /** Upstream wants the nested function shape with `parameters` as a JSON *string*. */
 export function toTraeTools(tools: readonly ToolSchema[] | undefined): unknown[] {
-  return (tools ?? []).map(t => ({
+  return normalizeToolSchemas(tools).map(t => ({
     type: 'function',
     function: { name: t.name, description: t.description, parameters: JSON.stringify(t.parameters ?? {}) },
   }))
