@@ -2,14 +2,15 @@
 // in internals.test.mjs exercise, bundled to lib/testing.mjs.
 export { TRAE_MODELS, TRAE_ROUTES, findModel, toRoutes } from '../src/trae/catalog.ts'
 export {
-  parseDetailParams, parseModelsCache, TraeCatalog, CATALOG_PATH, CATALOG_BODY, MODELS_CACHE_FILE, BUILTIN_SNAPSHOT,
+  parseDetailParams, parseModelsCache, TraeCatalog, CATALOG_PATH, CATALOG_BODY, catalogBody, CHAT_FUNCTION,
+  EXTRA_CATALOG_FUNCTIONS, MODELS_CACHE_FILE, BUILTIN_SNAPSHOT,
 } from '../src/trae/catalog-source.ts'
 export {
   toTraeMessages, repairToolHistory, traeEvents, wireContent, LoopDetector, TextToolCallSniffer, CodeScanner,
-  sessionUuid, conversationUuid, classify, httpCode, approxTokens,
+  sessionUuid, conversationUuid, classify, httpCode, approxTokens, toTraeTools, normalizeToolSchema, normalizeToolSchemas,
 } from '../src/trae/wire.ts'
 export { decodeJwt, parseExpiry } from '../src/trae/auth.ts'
-export { TraeAdapter } from '../src/adapter.ts'
+export { TraeAdapter, effortFor } from '../src/adapter.ts'
 export { parseQuota, TraeQuota, QUOTA_PATHS, enterpriseTenant } from '../src/trae/quota.ts'
 export { parseTobQuota, TobConsole, TOB_LOGIN_PATH, TOB_QUOTA_PATH, TOB_USAGE_PATH, TOB_SESSION_COOKIE } from '../src/trae/tob.ts'
 export { TraeSuggestions, suggestPrompt, parseSuggestions, followsAsk, suggestSystem, SUGGEST_SYSTEM, SUGGEST_SUBAGENT_RULES, SUGGEST_EXAMPLE, MAX_CARDS, MAX_CHOICES } from '../src/trae/suggest.ts'

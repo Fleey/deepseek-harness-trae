@@ -67,6 +67,12 @@ export interface AdapterOptions {
   /** Repetition guard span in characters; 0 disables. */
   loopGuardChars: number
   /**
+   * Local cap on the context window reported per model; 0 = the model's own.
+   * See `budget()` — it moves when the harness compacts, not what upstream
+   * serves.
+   */
+  contextBudgetTokens?: number
+  /**
    * Turn a tool call the model wrote as `<invoke>` prose into a real one.
    * Default on; false leaves every such block in the answer as text.
    */
@@ -154,17 +160,46 @@ export function traeHeaders(id: TraeIdentity, token: string, accept: string): Re
   }
 }
 
-function effortFor(route: TraeRoute, requested: string | undefined): TraeEffort | undefined {
+/**
+ * The thinking rungs in order, each with every spelling of it. The Trae client
+ * knows five (`low / medium / high / extra_high / max`) and the catalog spells
+ * the middle three `light|low / high / extra_high|xhigh`, so a level named in
+ * the other source's vocabulary still lands on the same button.
+ */
+const EFFORT_LADDER: readonly (readonly TraeEffort[])[] = [
+  ['light', 'low'],
+  ['medium'],
+  ['high'],
+  ['extra_high', 'xhigh'],
+  ['max'],
+]
+
+/** Which rung a requested level names, including the harness's own spellings. */
+const EFFORT_RUNGS: Record<string, number> = {
+  none: 0, minimal: 0, light: 0, low: 0,
+  medium: 1,
+  high: 2,
+  extra_high: 3, xhigh: 3,
+  max: 4, ultra: 4,
+}
+
+/**
+ * The level to send for a requested one, or nothing.
+ *
+ * A level this model does not offer at that rung is **dropped**, so the turn
+ * runs on upstream's own default. The alternative — rounding it to a rung the
+ * model does offer — answers at a level the user did not ask for and says
+ * nothing about it, which is worse than not offering the level at all: the
+ * ladder no longer collapses `medium` onto `high` the way a three-rung table
+ * had to.
+ */
+export function effortFor(route: TraeRoute, requested: string | undefined): TraeEffort | undefined {
   if (!requested || route.efforts.length === 0) return undefined
   const lower = requested.toLowerCase()
   if (route.efforts.includes(lower as TraeEffort)) return lower as TraeEffort
-  // A level named in the other source's vocabulary still lands on the right
-  // button: the two ladders (light/high/extra_high and low/high/xhigh) are the
-  // same three steps under different names.
-  const rung = ({ none: 0, minimal: 0, light: 0, low: 0, medium: 1, high: 1, extra_high: 2, xhigh: 2, max: 2, ultra: 2 } as Record<string, number>)[lower]
+  const rung = EFFORT_RUNGS[lower]
   if (rung === undefined) return undefined
-  const ladder: readonly TraeEffort[][] = [['light', 'low'], ['high'], ['extra_high', 'xhigh']]
-  return ladder[rung]!.find(name => route.efforts.includes(name))
+  return EFFORT_LADDER[rung]!.find(name => route.efforts.includes(name))
 }
 
 function usageOf(data: Record<string, unknown>): TokenUsage {
@@ -205,6 +240,30 @@ export class TraeAdapter extends LlmAdapter {
   }
 
   /**
+   * The window a turn is planned against: the model's own, unless a local
+   * budget caps it.
+   *
+   * The budget is **local**. The request body carries no window field (the Max
+   * marker's `context_window_size` aside, which asks for the shelf Max opens,
+   * not a budget), so lowering it cannot make upstream serve less or charge
+   * less per token — it only makes the harness compact earlier, which is the
+   * point: the jump from a 200K default window to Max's 1M is five times the
+   * prompt, and a session that does not need 1M should not pay a full 1M
+   * prompt before the first compaction. 500_000 is the half-step worth having.
+   */
+  private budget(window: number): number {
+    const cap = this.opts.contextBudgetTokens ?? 0
+    return cap > 0 ? Math.min(window, cap) : window
+  }
+
+  /** The picker's one-line description: the shelf, plus the budget when it bites. */
+  private describe(route: TraeRoute): string {
+    const window = route.maxMode ? '1M 上下文（Max）' : `${Math.round(route.contextWindow / 1000)}K 上下文`
+    const budget = this.budget(route.contextWindow)
+    return budget < route.contextWindow ? `${window} · 本地预算 ${Math.round(budget / 1000)}K` : window
+  }
+
+  /**
    * Listing also proves the PAT works: an unconfigured or rejected PAT makes
    * the model picker show the reason instead of a silently missing group.
    */
@@ -213,7 +272,7 @@ export class TraeAdapter extends LlmAdapter {
     const { routes } = await this.catalog()
     return routes.map(r => ({
       provider, id: r.id, name: r.id,
-      description: r.maxMode ? '1M 上下文（Max）' : `${Math.round(r.contextWindow / 1000)}K 上下文`,
+      description: this.describe(r),
       inputModalities: (r.multimodal ? ['text', 'image'] : ['text']) as readonly ('text' | 'image')[],
     }))
   }
@@ -226,8 +285,9 @@ export class TraeAdapter extends LlmAdapter {
       name: known?.id ?? model,
       inputModalities: (known?.multimodal ? ['text', 'image'] : ['text']) as readonly ('text' | 'image')[],
       // Per model from the catalog, so the loop plans compaction against the
-      // window the backend actually enforces.
-      context: { contextWindow: known?.contextWindow ?? 200_000 },
+      // window the backend actually enforces — or against the local budget,
+      // when one caps it (see `budget`).
+      context: { contextWindow: this.budget(known?.contextWindow ?? 200_000) },
       // The output half of that window: switching a route to its `__max` key
       // doubles what the backend lets the model write. llm_raw_chat itself
       // ignores `max_tokens`, so this is also the only cap `stream` can hold
@@ -328,7 +388,10 @@ export class TraeAdapter extends LlmAdapter {
   /** The llm_raw_chat request body: one route, one thinking level, one upstream session. */
   private requestBody(route: TraeRoute, effort: TraeEffort | undefined, session: string, messages: unknown[], tools: unknown[]): Record<string, unknown> {
     const body: Record<string, unknown> = {
-      function: 'chat',
+      // The function upstream shelves this model under: `chat` for everything
+      // traecli's own catalog call returns, the pinned one for a model only an
+      // extra function listed (catalog-source.ts).
+      function: route.wireFunction ?? 'chat',
       config_name: route.configName,
       model_name: route.key,
       user_input: '',

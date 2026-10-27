@@ -37,8 +37,33 @@ import {
   type TraeRoute,
 } from './catalog.ts'
 
-/** The ToB catalog call: one POST, the whole `chat` function's model list. */
+/** The ToB catalog call: one POST, one function's model list. */
 export const CATALOG_PATH = '/api/ide/v1/batch_get_detail_param'
+
+/** The function traecli asks for, and the one the chat request names by default. */
+export const CHAT_FUNCTION = 'chat'
+
+/**
+ * Functions that can be asked for besides `chat` — **off by default**, and
+ * measured to be empty on the enterprise host.
+ *
+ * The endpoint answers per function, and a model's shelf is per (config,
+ * function), so a catalog built from one function can hide whatever is only
+ * shelved elsewhere. These four names are the conversational functions seen in
+ * Trae's CN client. Probed on 2026-10-27 against `api.enterprise.trae.cn` with
+ * a real ToB session (`tools/probe_catalog.py`): all four answer `HTTP 200`
+ * with a group of their own name and **0 configs**, while `chat` carries 31
+ * (25 visible). So on a ToB seat there is nothing to union in, and asking
+ * costs one more POST per refresh — hence `['chat']`, exactly traecli's own
+ * question, is the default.
+ *
+ * The union stays available for a host that does shelf per function: put any
+ * of these in `catalogFunctions`. They are asked in a second request whose
+ * failure is logged and skipped, and a model only they list is pinned to the
+ * function that listed it (`wireFunction`), since the chat request has to name
+ * the function upstream shelves it under.
+ */
+export const EXTRA_CATALOG_FUNCTIONS: readonly string[] = ['solo_work_remote', 'solo_work_lite', 'solo_coder', 'chat_v3']
 
 /**
  * The body traecli sends, with `current_config_name` /
@@ -46,16 +71,21 @@ export const CATALOG_PATH = '/api/ide/v1/batch_get_detail_param'
  * object its wire struct names. `access_type: 4` is the enterprise seat and
  * `mode_type: 0` the chat surface — the same pair the chat request carries.
  */
-export const CATALOG_BODY: Record<string, unknown> = {
-  functions: ['chat'],
-  agent_type: 'chat',
-  current_config_info: { config_name: '', is_custom_model: false },
-  mode_type: 0,
-  access_type: 4,
-  ab_force_vids: '',
-  ab_autotest_advanced_mode: 0,
-  show_custom_model: true,
+export function catalogBody(functions: readonly string[]): Record<string, unknown> {
+  return {
+    functions: [...functions],
+    agent_type: 'chat',
+    current_config_info: { config_name: '', is_custom_model: false },
+    mode_type: 0,
+    access_type: 4,
+    ab_force_vids: '',
+    ab_autotest_advanced_mode: 0,
+    show_custom_model: true,
+  }
 }
+
+/** The body as traecli itself sends it: the `chat` function alone. */
+export const CATALOG_BODY: Record<string, unknown> = catalogBody([CHAT_FUNCTION])
 
 /** Where traecli keeps its own copy. */
 export const MODELS_CACHE_FILE = join(homedir(), '.trae', 'cli', 'models_cache.json')
@@ -66,7 +96,14 @@ export const MODELS_CACHE_FILE = join(homedir(), '.trae', 'cli', 'models_cache.j
  */
 const NOT_MODELS = new Set(['summary', 'custom_model_placeholder'])
 
-const EFFORT_NAMES = new Set<string>(['light', 'low', 'high', 'extra_high', 'xhigh'])
+/**
+ * The rungs a source may name. `medium` and `max` are here because the Trae
+ * client knows five and rolls them out per model; upstream offered only the
+ * three middle ones when this was measured (2026-10-25), so parsing them
+ * changes nothing until upstream states them — and a rung outside this set is
+ * still dropped, never rounded (see `effortFor` in adapter.ts).
+ */
+const EFFORT_NAMES = new Set<string>(['light', 'low', 'medium', 'high', 'extra_high', 'xhigh', 'max'])
 
 function asEffort(value: unknown): TraeEffort | undefined {
   return typeof value === 'string' && EFFORT_NAMES.has(value) ? value as TraeEffort : undefined
@@ -96,19 +133,41 @@ const BUILTIN_MULTIMODAL = new Map(TRAE_MODELS.map(m => [m.configName.toLowerCas
  * retired are still *present* in the response, flagged
  * `is_invisible_to_user: true` with no detail list at all, which is exactly
  * what makes them unusable upstream.
+ *
+ * Visibility is per (config, function), so the answer is read as a union with
+ * that as the verdict: a model hidden under every function in the response is
+ * dropped, and one hidden here but shelved there is kept and pinned to the
+ * function that shelves it. `functions` sets the priority order (a model
+ * listed under several is described by the first); default is the response's
+ * own order. Within one function the response order is preserved, so two
+ * refreshes of one account produce the same list.
  */
-export function parseDetailParams(payload: unknown): TraeModel[] {
+export function parseDetailParams(payload: unknown, functions?: readonly string[]): TraeModel[] {
   const root = record(payload)
-  const configs = array(root?.function_configs)
+  const groups = array(root?.function_configs)
     .map(record)
-    .filter((fc): fc is Record<string, unknown> => fc?.function === 'chat')
-    .flatMap(fc => array(fc.config_info_list).map(record))
+    .filter((fc): fc is Record<string, unknown> => !!fc)
+  const rank = (name: string): number => {
+    const at = functions?.indexOf(name) ?? -1
+    return at < 0 ? Number.MAX_SAFE_INTEGER : at
+  }
+  const ordered = functions
+    ? [...groups].sort((a, b) => rank(String(a.function)) - rank(String(b.function)))
+    : groups
+  const configs = ordered.flatMap((fc) => {
+    const fn = typeof fc.function === 'string' ? fc.function : CHAT_FUNCTION
+    return array(fc.config_info_list).map(record).map(config => ({ fn, config }))
+  })
   const models: TraeModel[] = []
-  for (const config of configs) {
+  const seen = new Set<string>()
+  for (const { fn, config } of configs) {
     if (!config) continue
     const configName = typeof config.config_name === 'string' ? config.config_name : ''
     if (!configName || NOT_MODELS.has(configName)) continue
     if (config.config_switch === false || config.is_invisible_to_user === true) continue
+    // Already described by a higher-priority function; the spelling that
+    // function used is the one the picker and `enabledModelIds` keep.
+    if (seen.has(configName.toLowerCase())) continue
     const display = record(config.display_config) ?? {}
     if (display.is_custom_model === true) continue
 
@@ -137,6 +196,9 @@ export function parseDetailParams(payload: unknown): TraeModel[] {
       ...defaultEffort && efforts.includes(defaultEffort) ? { defaultEffort } : {},
       multimodal: display.multimodal === true,
       ...positive(standard?.max_tokens) !== undefined ? { outputTokens: positive(standard?.max_tokens)! } : {},
+      // `chat` is what the request names anyway, so only a model shelved
+      // elsewhere carries a pin.
+      ...fn && fn !== CHAT_FUNCTION ? { wireFunction: fn } : {},
     }
     // Max counts only when the backend both flags it and gives it a bigger
     // window; Doubao-Seed-Evolving ships a `__max` key whose window is the
@@ -149,6 +211,7 @@ export function parseDetailParams(payload: unknown): TraeModel[] {
       }
     }
     models.push(model)
+    seen.add(configName.toLowerCase())
   }
   return models
 }
@@ -246,8 +309,14 @@ export interface CatalogOptions {
   mode?: CatalogOrigin | 'auto'
   /** traecli's cache file; empty disables that step. */
   cacheFile?: string
+  /**
+   * Catalog functions to ask for, `chat` first. Anything beyond `chat` is a
+   * second, best-effort request (see `EXTRA_CATALOG_FUNCTIONS`); `['chat']`
+   * asks exactly what traecli asks.
+   */
+  functions?: readonly string[]
   /** The upstream call, injected so tests and the builtin mode stay offline. */
-  fetchUpstream?: (signal: AbortSignal) => Promise<unknown>
+  fetchUpstream?: (signal: AbortSignal, body: Record<string, unknown>) => Promise<unknown>
   /** Overridable for tests. */
   readCacheFile?: (file: string) => Promise<string>
   /**
@@ -389,10 +458,46 @@ export class TraeCatalog {
       retryIn = this.opts.retryAfterMs ?? RETRY_AFTER_MS
       try {
         const timeout = this.opts.fetchTimeoutMs ?? FETCH_TIMEOUT_MS
-        const models = parseDetailParams(await this.opts.fetchUpstream(AbortSignal.timeout(timeout)))
-        if (models.length > 0) {
-          this.opts.logger?.info(`dsh-trae2api: 模型目录已从上游刷新，共 ${models.length} 个模型`)
-          return { next: snapshot(models, 'upstream', Date.now()) }
+        const fetchUpstream = this.opts.fetchUpstream
+        const models = parseDetailParams(
+          await fetchUpstream(AbortSignal.timeout(timeout), catalogBody([CHAT_FUNCTION])),
+          [CHAT_FUNCTION],
+        )
+        // Extra functions are a second request on purpose: they are unverified
+        // on this host, and a 400 on one name must not take the `chat` list —
+        // the list that has always worked — down with it.
+        const extras = (this.opts.functions ?? [CHAT_FUNCTION]).filter(fn => fn && fn !== CHAT_FUNCTION)
+        const added: TraeModel[] = []
+        if (extras.length > 0) {
+          try {
+            const answer = await fetchUpstream(AbortSignal.timeout(timeout), catalogBody(extras))
+            const known = new Set(models.map(m => m.configName.toLowerCase()))
+            for (const model of parseDetailParams(answer, extras)) {
+              if (known.has(model.configName.toLowerCase())) continue
+              known.add(model.configName.toLowerCase())
+              added.push(model)
+            }
+            if (added.length > 0) {
+              const by = new Map<string, number>()
+              for (const model of added) {
+                const fn = model.wireFunction ?? CHAT_FUNCTION
+                by.set(fn, (by.get(fn) ?? 0) + 1)
+              }
+              const where = [...by].map(([fn, n]) => `${fn} ${n} 个`).join('、')
+              this.opts.logger?.info(`dsh-trae2api: 另有 ${added.length} 个模型只在额外通道上架（${where}），已并入目录`)
+            }
+          } catch (error) {
+            // Losing the extras costs their models, never the catalog.
+            this.opts.logger?.warn(
+              `dsh-trae2api: 额外模型通道（${extras.join('、')}）没问到，本次只用 chat 通道的目录`
+              + `（${error instanceof Error ? error.message : String(error)}）`,
+            )
+          }
+        }
+        const merged = [...models, ...added]
+        if (merged.length > 0) {
+          this.opts.logger?.info(`dsh-trae2api: 模型目录已从上游刷新，共 ${merged.length} 个模型`)
+          return { next: snapshot(merged, 'upstream', Date.now()) }
         }
         notes.push('上游目录没有返回可用模型')
       } catch (error) {

@@ -129,8 +129,40 @@ def outline(value, depth: int = 0, path: str = "") -> None:
             outline(value[0], depth + 1, f"{path}[0]")
 
 
+# The functions the plugin asks for: `chat` is traecli's own question, the rest
+# are the conversational functions seen in Trae's CN client and are NOT verified
+# on the enterprise host. This probe is how to verify them: a name this host
+# does not know shows up as a non-200, or as a 200 with no group for it.
+FUNCTIONS = [f for f in os.environ.get(
+    "TRAE_FUNCTIONS", "chat,solo_work_remote,solo_work_lite,solo_coder,chat_v3",
+).split(",") if f.strip()]
+
+
+def shelves(token: str) -> None:
+    """Per function: does this host answer for it, and what does it shelve?"""
+    print("\n=== model shelves per function — POST %s" % BATCH_PATH)
+    for function in FUNCTIONS:
+        body = dict(BODY, functions=[function.strip()])
+        status, text = post(BATCH_PATH, body, token)
+        try:
+            groups = (json.loads(text) or {}).get("function_configs") or []
+        except Exception:
+            print(f"{function:>18}: HTTP {status}, unparseable — {text[:120]}")
+            continue
+        if status != 200 or not groups:
+            print(f"{function:>18}: HTTP {status}, no group — {text[:120]}")
+            continue
+        for group in groups:
+            rows = group.get("config_info_list") or []
+            visible = [r.get("config_name") for r in rows if not r.get("is_invisible_to_user")]
+            print(f"{function:>18}: HTTP {status}, group {group.get('function')!r}, "
+                  f"{len(rows)} configs, {len(visible)} visible")
+            print(f"{'':>20}{', '.join(str(name) for name in visible) or '(none)'}")
+
+
 def main() -> None:
     token = jwt()
+    shelves(token)
     for label, path, body in (
         ("ToB batch (nested current_config_info)", BATCH_PATH, BODY),
         ("ToB batch (flat template)", BATCH_PATH, BODY_FLAT),

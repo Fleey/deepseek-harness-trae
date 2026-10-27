@@ -18,7 +18,9 @@ import type {} from '@deepseek-ai/dsh-llm'
 import Schema from '@deepseek-ai/schemastery'
 import { TraeAdapter, traeHeaders, type TraeIdentity } from './adapter.ts'
 import { CLI_CLIENT_ID, TRAE_HOST, TraeAuth } from './trae/auth.ts'
-import { CATALOG_BODY, CATALOG_PATH, MODELS_CACHE_FILE, TraeCatalog, type CatalogOrigin } from './trae/catalog-source.ts'
+import {
+  CATALOG_PATH, CHAT_FUNCTION, EXTRA_CATALOG_FUNCTIONS, MODELS_CACHE_FILE, TraeCatalog, type CatalogOrigin,
+} from './trae/catalog-source.ts'
 import { TraeCueReporter } from './trae/cue.ts'
 import { TraeUserInfo } from './trae/user.ts'
 import { TraeQuota } from './trae/quota.ts'
@@ -67,8 +69,21 @@ export interface Config {
    * file, then the built-in table; the other values pin it to one source.
    */
   catalogSource: CatalogOrigin | 'auto'
+  /**
+   * Catalog functions to ask upstream for. `chat` is what traecli asks and is
+   * always the first request; the rest are asked in a second, best-effort one,
+   * so a name this host rejects costs only its own models. `['chat']` keeps the
+   * catalog to exactly traecli's question.
+   */
+  catalogFunctions: string[]
   /** traecli's model cache; empty = `~/.trae/cli/models_cache.json`. */
   modelsCacheFile: string
+  /**
+   * Local cap on the context window reported to the harness; 0 = each model's
+   * own window. Only moves when compaction happens — upstream serves the same
+   * window either way.
+   */
+  contextBudgetTokens: number
   readTimeoutMs: number
   emptyRetries: number
   loopGuardChars: number
@@ -115,8 +130,12 @@ export const Config: Schema<Config> = Schema.object({
   clientVersion: Schema.string().default(CLIENT_VERSION),
   catalogSource: Schema.union(['auto', 'upstream', 'cache', 'builtin'] as const).default('auto')
     .description('模型目录来源：auto = 上游 → traecli 缓存 → 内置'),
+  catalogFunctions: Schema.array(Schema.string()).default([CHAT_FUNCTION])
+    .description(`问上游要目录的通道（function）；chat 之外的那些单独发一次请求，问不到就只用 chat 的那份。企业版实测只有 chat 上架模型，想试别的填 ${EXTRA_CATALOG_FUNCTIONS.join(' / ')}`),
   modelsCacheFile: Schema.string().default('')
     .description('traecli 模型缓存路径；空 = ~/.trae/cli/models_cache.json'),
+  contextBudgetTokens: Schema.natural().default(0)
+    .description('本地上下文预算上限（token）；0 = 用模型自己的窗口。只改压缩时机，不改上游服务的窗口（Max 模型想要半步就填 500000）'),
   readTimeoutMs: Schema.natural().default(300_000),
   emptyRetries: Schema.natural().default(1),
   loopGuardChars: Schema.natural().default(600),
@@ -207,9 +226,10 @@ export function apply(ctx: Context, config: Config): void {
   const catalog = new TraeCatalog({
     mode: config.catalogSource,
     cacheFile: config.modelsCacheFile || MODELS_CACHE_FILE,
+    functions: config.catalogFunctions.length > 0 ? config.catalogFunctions : [CHAT_FUNCTION],
     ...config.catalogSource === 'builtin' ? {} : {
-      fetchUpstream: async (signal) => {
-        const body = JSON.stringify(CATALOG_BODY)
+      fetchUpstream: async (signal, payload) => {
+        const body = JSON.stringify(payload)
         let session = await auth.get()
         for (let attempt = 0; ; attempt++) {
           const res = await fetch(`${host}${CATALOG_PATH}`, {
@@ -270,6 +290,7 @@ export function apply(ctx: Context, config: Config): void {
     readTimeoutMs: config.readTimeoutMs,
     emptyRetries: config.emptyRetries,
     loopGuardChars: config.loopGuardChars,
+    contextBudgetTokens: config.contextBudgetTokens,
     recoverTextToolCalls: config.recoverTextToolCalls,
     // The attachment store that turns durable image references into request
     // bytes; `ctx.get` throws when absent, so guard with optional chaining on
