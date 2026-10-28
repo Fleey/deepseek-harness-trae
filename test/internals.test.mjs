@@ -8,6 +8,7 @@ import {
   LoopDetector, TextToolCallSniffer, sessionUuid, conversationUuid, classify, httpCode, approxTokens, decodeJwt, parseExpiry,
   parseQuota, TraeQuota, QUOTA_PATHS, enterpriseTenant,
   parseTobQuota, TobConsole, TOB_LOGIN_PATH, TOB_QUOTA_PATH, TOB_USAGE_PATH, TOB_SESSION_COOKIE,
+  traeDebugLine, traeDebugTime, traceOf,
 } from '../lib/testing.mjs'
 
 test('catalog: the built-in table matches the live catalog it was synced with', () => {
@@ -1680,4 +1681,41 @@ test('context budget: a local cap moves compaction, never the shelf', async () =
   assert.equal(models.find(m => m.id === 'Doubao-Seed-Evolving').description, '184K 上下文')
   const plain = await uncapped.listModels('trae')
   assert.equal(plain.find(m => m.id === 'GLM-5.3').description, '1M 上下文（Max）')
+})
+
+test('support line: Trae\'s own copy format, with no_* where the raw endpoint has nothing', () => {
+  // The sample TRAE SOLO CN 0.1.61 copies, field for field:
+  //   userId:traceId_chatSession.messageId.replyId:app.version.sid.ppe.T(time)
+  const at = new Date(2026, 9, 28, 15, 49, 49).getTime()
+  assert.equal(traeDebugTime(at), '2026/10/28 15:49:49')
+  assert.equal(traeDebugLine({
+    userId: '312308224',
+    traceId: 'a9e925a547e92654a0aafc4cc316839c',
+    sessionId: '6ae1a91d1e74509552096bff',
+    messageId: '6ae1a91d1e74509552096c02',
+    replyId: '6ae1a91d1e74509552096c00',
+    appName: 'TraeWork CN',
+    appVersion: '0.1.61',
+    at,
+  }), '312308224:a9e925a547e92654a0aafc4cc316839c_6ae1a91d1e74509552096bff.6ae1a91d1e74509552096c02'
+    + '.6ae1a91d1e74509552096c00:TraeWork CN.0.1.61.no_sid.no_ppe.T(2026/10/28 15:49:49)')
+
+  // llm_raw_chat carries no message ids and this deployment has no region, so
+  // those fields keep the format's own placeholders rather than invented ids.
+  assert.equal(traeDebugLine({
+    sessionId: 'c0ffee00-1111-5222-8333-444455556666',
+    appName: 'codex_exec',
+    appVersion: '0.206.1-tob',
+  }), 'no_uid:no_trace_c0ffee00-1111-5222-8333-444455556666.no_mid.no_mid:codex_exec.0.206.1-tob.no_sid.no_ppe')
+
+  // A region prefixes the line, as it does for a non-CN account.
+  assert.match(traeDebugLine({ region: 'sg', userId: '42', sessionId: 's', appName: 'a', appVersion: '1' }), /^sg\.42:/)
+
+  // The trace is upstream's own name for the request where it sends one, and
+  // the id this plugin sent otherwise.
+  const headers = (init) => new Headers(init)
+  assert.equal(traceOf(headers({ 'x-tt-logid': '2026102800' }), 'sent'), '2026102800')
+  assert.equal(traceOf(headers({ 'x-trace-id': 'tid' }), 'sent'), 'tid')
+  assert.equal(traceOf(headers({}), 'sent'), 'sent')
+  assert.equal(traceOf(headers({})), undefined)
 })

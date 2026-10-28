@@ -251,25 +251,76 @@ python3 -I tools/probe_catalog.py
 
 ## 会话 ID（查看 / 复制）
 
-选中 Trae 模型时，**对话框右下角额度徽标旁边**会多一个 `ID xxxxxxxx` 的小徽标，显示当前会话 ID 的前 8 位：
+选中 Trae 模型时，**会话标题栏右侧**会多一个「会话 ID」按钮；点开是**右侧边栏里一个自己的标签页**，
+三项各占一行、各有自己的复制按钮：
 
-- **鼠标悬停**：完整的会话 ID、这条会话上一轮跑在哪条上游会话里（后面括号写明用的模型和思考档位），
-  以及复制提示。
-- **点一下**：把**完整会话 ID** 复制到剪贴板，徽标短暂变成「已复制」。
-- **按住 Alt 点**：复制**上游会话 ID**（还没发过一轮时退回复制会话 ID）。
+| 行 | 内容 |
+| --- | --- |
+| 会话 ID | dsh 这边的会话 ID |
+| 上游会话 | 这条会话上一轮跑在哪条上游会话里，下面写明用的模型和思考档位 |
+| 排查串 | 按 Trae 客户端给客服那套格式拼好的一整行（见下） |
+
+**只有选中 Trae 模型的会话才有那个按钮**，别的来源的会话里不出现。还没发过一轮时，后两行写「这条会话还没发过一轮」，
+不给空的复制按钮。
 
 两个 ID 不是一回事，提 bug、查日志时要的往往是后一个：上游按「会话 × 模型 × 思考档位」分别开
 conversation（见 `conversationUuid`），所以上游那条 ID 是从会话 ID 派生出来的，**不等于也猜不出**
-会话 ID；换模型或换档位后同一条会话会有多个上游 ID，徽标显示的是**最近一轮主循环请求真的发出去的那个**。
+会话 ID；换模型或换档位后同一条会话会有多个上游 ID，标签页里显示的是**最近一轮主循环请求真的发出去的那个**。
 标题生成、上下文压缩这类旁路请求用自己的临时 ID，不计入。
 
-实现方式：宿主端记住最近 64 条会话各自上一轮的变体和上游 ID，经同样走登录态隔离的
+### 排查串（Trae 客户端自己那套格式）
+
+TRAE SOLO CN 0.1.61 在回答的头部双击会复制一串给客服用的排查信息，外部账号拿到的是这个格式：
+
+```
+312308224:a9e9…839c_6ae1a91d…6bff.6ae1a91d…6c02.6ae1a91d…6c00:TraeWork CN.0.1.61.no_sid.no_ppe.T(2026/10/28 15:49:49)
+└ userId  └ traceId     └ 会话 ID  └ 消息 ID    └ 被回复消息 ID  └ 应用名     └ 版本  └ Slardar └ PPE └ 本地时间
+```
+
+拼接规则（`region` 有值才带前缀，缺字段用 `no_sid` / `no_ppe` 这类占位符；字节内部账号拿到的是 JSON 不是这串）：
+
+```
+`${region ? region + '.' : ''}${userId}:${traceId}_${sessionId}.${messageId}.${replyId}:${appName}.${appVersion}.${sid}.${ppe}`
+```
+
+串里那三个 24 位十六进制是 MongoDB ObjectId，由 Trae 的聊天服务生成（前 4 字节是时间戳，和末尾 `T(...)` 对得上），
+客户端只负责拼。
+
+本插件直连 `llm_raw_chat`——这是聊天服务**下面一层**，根本没有 message id，所以这串按「有什么填什么、
+没有的保留格式自己的 `no_*` 占位符」来拼，不编 ID（见 [src/trae/debug.ts](src/trae/debug.ts)）：
+
+| 字段 | 这里填什么 |
+| --- | --- |
+| `userId` | `GetUserInfo` 的 `UserInfo.UserID`，和 IDE 上报用的是同一个；读不到填 `no_uid` |
+| `traceId` | 上游回包里的 trace 头（`x-tt-logid` / `x-tt-trace-id` / `x-trace-id`），没有就用本插件这轮发出去的 `x-request-id`——两者都在上游访问日志里 |
+| `sessionId` | 上游会话 ID（`conversationUuid`），这里是 UUID，不是 ObjectId |
+| `messageId` / `replyId` | `no_mid`，裸接口没有这两个 |
+| `appName` / `appVersion` | 本插件身份头里的 `originator` 和版本（`codex_exec` / `0.206.1-tob`），也就是上游给这次请求记下的那个，不冒充 `TraeWork CN` |
+| `sid` / `ppe` | `no_sid` / `no_ppe`：没有 Slardar 会话，也没走 PPE |
+| `T(...)` | 这一轮的本地时间 |
+
+实现方式：宿主端记住最近 64 条会话各自上一轮的变体、上游 ID 和 trace，经同样走登录态隔离的
 `/api/dsh-trae2api/session?session=<会话 ID>` 路由给浏览器端，返回
-`{ session, conversation, model, effort, at }`；还没发过一轮的会话 `conversation` 为 `null`。
-浏览器端在挂载、换模型／档位、一轮结束和每次点击时各读一次，不轮询。
+`{ session, conversation, model, effort, trace, at, debug }`；还没发过一轮的会话 `conversation`、`debug` 都是 `null`。
+浏览器端在挂载、换模型／档位、一轮结束和每次点复制时各读一次，不轮询。
+
+标签页按宿主自己那套两段式注册：先 `ctx.sidebarRightTabs.register({ id, kind: 'trae-session', priority: 'extension', title })`
+声明类型（不带 `patterns`，所以是按 kind 打开的「页」而不是资源地址），再把页面体注册到
+`sidebar.right.pane.tab`、key 用同一个 id；入口是 `conversation.session.header.utilities` 里的一个按钮，
+点它调 `ctx.sidebarRight.openTab('trae-session')`。按钮自己判断当前会话的模型是不是 Trae。
+样式用宿主的设计变量，跟着亮色 / 暗色主题走。
 
 > 剪贴板优先用 `navigator.clipboard`，拿不到权限（非安全来源之类）时退回老的选区复制；
-> 两条都失败时悬停提示会改成「复制失败」，ID 仍然可以从提示里手抄。
+> 两条都失败时按钮写「复制失败」，ID 本身就在页面上，可以直接选中复制。
+
+> trace 头是实测过的：2026-10-28 对 api.enterprise.trae.cn 发一轮，`llm_raw_chat` 回的是
+> `x-tt-logid: 2026102816265801000315823240915B1`，没有别的 trace 头（`ExchangeToken` 还把它写进了
+> `access-control-expose-header`），所以 `traceOf()` 选的就是它；列表里其余几个是同系网关的别的写法，
+> 留作兜底。想自己再测一次：`TRAE_PAT=<你的 PAT> node tools/probe_trace.mjs`，它把响应头全打出来并说明
+> 会选哪个，PAT 和 JWT 都不打印。
+>
+> 注意这个 `x-tt-logid` 和 Trae 自家排查串里那个 32 位 `traceId` 不是一回事：后者是**上面一层**聊天服务的
+> trace，裸接口这边没有；这里填的是网关给这次请求记的名字，也正是能拿去查这次请求的那个。
 
 ## 下一步选择卡片
 

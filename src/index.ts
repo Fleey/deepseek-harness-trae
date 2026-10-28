@@ -22,6 +22,7 @@ import {
   CATALOG_PATH, CHAT_FUNCTION, EXTRA_CATALOG_FUNCTIONS, MODELS_CACHE_FILE, TraeCatalog, type CatalogOrigin,
 } from './trae/catalog-source.ts'
 import { TraeCueReporter } from './trae/cue.ts'
+import { traeDebugLine } from './trae/debug.ts'
 import { TraeUserInfo } from './trae/user.ts'
 import { TraeQuota } from './trae/quota.ts'
 import { TraeSuggestions } from './trae/suggest.ts'
@@ -392,6 +393,10 @@ export function apply(ctx: Context, config: Config): void {
     // upstream complaint is answerable only with the conversation id, which is
     // derived per model variant and level rather than equal to the harness id
     // (wire.ts `conversationUuid`). `conversation: null` = no turn yet.
+    //
+    // `debug` is the same facts as the one line Trae's own client copies for
+    // support (src/trae/debug.ts), so a ticket can be opened in the format
+    // that side already reads.
     try {
       child.connection.fetch.register({
         path: SESSION_ROUTE,
@@ -401,6 +406,13 @@ export function apply(ctx: Context, config: Config): void {
           const sessionId = new URL(request.url).searchParams.get('session') ?? ''
           if (!sessionId) return Response.json({ ok: false, error: 'expected ?session=<id>' }, { status: 400 })
           const turn = adapter.sessionInfo(sessionId)
+          // The account id only matters for the diagnostic line, and reading it
+          // must never cost the answer: GetUserInfo is asked once per JWT and
+          // its failure leaves the line's `no_uid` in place.
+          let userId = ''
+          if (turn) {
+            try { userId = (await userInfo.get()).userId } catch { /* no_uid */ }
+          }
           return Response.json({
             ok: true,
             value: {
@@ -408,7 +420,21 @@ export function apply(ctx: Context, config: Config): void {
               conversation: turn?.conversation ?? null,
               model: turn?.model ?? null,
               effort: turn?.effort ?? null,
+              trace: turn?.trace ?? null,
               at: turn?.at ?? null,
+              // One line in Trae's own support format (see src/trae/debug.ts),
+              // for pasting into a Trae ticket. Only once a turn has run:
+              // before that there is no conversation, no trace and no time.
+              debug: turn
+                ? traeDebugLine({
+                  userId,
+                  ...turn.trace ? { traceId: turn.trace } : {},
+                  sessionId: turn.conversation,
+                  appName: identity.originator,
+                  appVersion: identity.clientVersion,
+                  at: turn.at,
+                })
+                : null,
             },
           })
         },
