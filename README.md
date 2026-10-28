@@ -251,8 +251,7 @@ python3 -I tools/probe_catalog.py
 
 ## 会话 ID（查看 / 复制）
 
-选中 Trae 模型时，**会话标题栏右侧**会多一个「会话 ID」按钮；点开是**右侧边栏里一个自己的标签页**，
-三项各占一行、各有自己的复制按钮：
+会话顶上那排标签（对话 / 轨迹 / 上下文 / …）里多一个「**会话 ID**」，三项各占一行、各有自己的复制按钮：
 
 | 行 | 内容 |
 | --- | --- |
@@ -260,8 +259,11 @@ python3 -I tools/probe_catalog.py
 | 上游会话 | 这条会话上一轮跑在哪条上游会话里，下面写明用的模型和思考档位 |
 | 排查串 | 按 Trae 客户端给客服那套格式拼好的一整行（见下） |
 
-**只有选中 Trae 模型的会话才有那个按钮**，别的来源的会话里不出现。还没发过一轮时，后两行写「这条会话还没发过一轮」，
-不给空的复制按钮。
+还没发过一轮时，后两行写「这条会话还没发过一轮」，不给空的复制按钮。
+
+> 标签行是**全局注册表**：宿主用 `slots.entries('conversation.view')` 拼这一排，没有「按会话过滤」这档事
+> （唯一的例外是「轨迹」跟着开发者模式走，那是宿主自己写死的）。所以非 Trae 会话里这个标签也在，
+> 点进去第一行就写明「这条会话现在选的不是 Trae 模型」，会话 ID 那行照常可用。
 
 两个 ID 不是一回事，提 bug、查日志时要的往往是后一个：上游按「会话 × 模型 × 思考档位」分别开
 conversation（见 `conversationUuid`），所以上游那条 ID 是从会话 ID 派生出来的，**不等于也猜不出**
@@ -295,7 +297,7 @@ TRAE SOLO CN 0.1.61 在回答的头部双击会复制一串给客服用的排查
 | `traceId` | 上游回包里的 trace 头（`x-tt-logid` / `x-tt-trace-id` / `x-trace-id`），没有就用本插件这轮发出去的 `x-request-id`——两者都在上游访问日志里 |
 | `sessionId` | 上游会话 ID（`conversationUuid`），这里是 UUID，不是 ObjectId |
 | `messageId` / `replyId` | `no_mid`，裸接口没有这两个 |
-| `appName` / `appVersion` | 本插件身份头里的 `originator` 和版本（`codex_exec` / `0.206.1-tob`），也就是上游给这次请求记下的那个，不冒充 `TraeWork CN` |
+| `appName` / `appVersion` | 照客户端自己的规则：`isCN ? (platform === 'trae-ide' ? 'TraeCode CN' : 'TraeWork CN') : (platform === 'trae-ide' ? 'TraeCode' : 'TraeWork')`——本插件不是 IDE 端，host 是 `.cn`，所以是 `TraeWork CN`；版本写死 `0.1.61`（读出这套格式的那个 SOLO 版本）。上游实际给这次请求记的身份是 `codex_exec` + traecli 版本，两者不一样，把这行和真实请求对上的是 `traceId` |
 | `sid` / `ppe` | `no_sid` / `no_ppe`：没有 Slardar 会话，也没走 PPE |
 | `T(...)` | 这一轮的本地时间 |
 
@@ -304,11 +306,8 @@ TRAE SOLO CN 0.1.61 在回答的头部双击会复制一串给客服用的排查
 `{ session, conversation, model, effort, trace, at, debug }`；还没发过一轮的会话 `conversation`、`debug` 都是 `null`。
 浏览器端在挂载、换模型／档位、一轮结束和每次点复制时各读一次，不轮询。
 
-标签页按宿主自己那套两段式注册：先 `ctx.sidebarRightTabs.register({ id, kind: 'trae-session', priority: 'extension', title })`
-声明类型（不带 `patterns`，所以是按 kind 打开的「页」而不是资源地址），再把页面体注册到
-`sidebar.right.pane.tab`、key 用同一个 id；入口是 `conversation.session.header.utilities` 里的一个按钮，
-点它调 `ctx.sidebarRight.openTab('trae-session')`。按钮自己判断当前会话的模型是不是 Trae。
-样式用宿主的设计变量，跟着亮色 / 暗色主题走。
+标签注册在 `conversation.view`（列表槽、会话作用域）上，`id: 'trae-session'`、`order: 100`（排在宿主自带的几个后面）、
+`label` 用 thunk 所以跟着语言走。样式用宿主的设计变量，跟着亮色 / 暗色主题走。
 
 > 剪贴板优先用 `navigator.clipboard`，拿不到权限（非安全来源之类）时退回老的选区复制；
 > 两条都失败时按钮写「复制失败」，ID 本身就在页面上，可以直接选中复制。

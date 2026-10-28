@@ -22,7 +22,7 @@ import {
   CATALOG_PATH, CHAT_FUNCTION, EXTRA_CATALOG_FUNCTIONS, MODELS_CACHE_FILE, TraeCatalog, type CatalogOrigin,
 } from './trae/catalog-source.ts'
 import { TraeCueReporter } from './trae/cue.ts'
-import { traeDebugLine } from './trae/debug.ts'
+import { isCnHost, traeAppName, traeDebugLine, TRAE_APP_VERSION } from './trae/debug.ts'
 import { TraeUserInfo } from './trae/user.ts'
 import { TraeQuota } from './trae/quota.ts'
 import { TraeSuggestions } from './trae/suggest.ts'
@@ -430,8 +430,11 @@ export function apply(ctx: Context, config: Config): void {
                   userId,
                   ...turn.trace ? { traceId: turn.trace } : {},
                   sessionId: turn.conversation,
-                  appName: identity.originator,
-                  appVersion: identity.clientVersion,
+                  // The client's own naming rule and the TRAE SOLO version the
+                  // format was read from, so support reads a line in the shape
+                  // it knows; `traceId` is what ties it to the real request.
+                  appName: traeAppName(isCnHost(host)),
+                  appVersion: TRAE_APP_VERSION,
                   at: turn.at,
                 })
                 : null,

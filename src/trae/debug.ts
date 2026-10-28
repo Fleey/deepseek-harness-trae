@@ -28,10 +28,38 @@
  * - `sessionId` — the upstream conversation the turn ran in (wire.ts
  *   `conversationUuid`): a UUID here, not an ObjectId.
  * - `messageId` / `replyId` — `no_mid`: the raw endpoint has neither.
- * - `appName` / `appVersion` — the originator and version this plugin sends in
- *   its identity headers, which is what upstream logged for the request, not
- *   `TraeWork CN`.
+ * - `appName` / `appVersion` — the client's own rule (`traeAppName`) and the
+ *   TRAE SOLO version the format was read from, so the line reads the way the
+ *   support side expects it. What upstream actually logged for the request is
+ *   this plugin's identity headers (`codex_exec`, traecli's version); the two
+ *   differ, and the trace id is what ties the line to the real request.
  */
+
+/**
+ * The application name Trae's own client puts in the line, by its own rule:
+ *
+ *   isCN ? (platform === 'trae-ide' ? 'TraeCode CN' : 'TraeWork CN')
+ *        : (platform === 'trae-ide' ? 'TraeCode'    : 'TraeWork')
+ *
+ * `cn` follows the host the turn ran against (the enterprise deployment is
+ * `api.enterprise.trae.cn`), and `ide` is the `trae-ide` platform — which this
+ * plugin is not, so it takes the same branch TRAE SOLO takes.
+ */
+export function traeAppName(cn: boolean, ide = false): string {
+  return cn ? (ide ? 'TraeCode CN' : 'TraeWork CN') : (ide ? 'TraeCode' : 'TraeWork')
+}
+
+/** Client version the line carries: the TRAE SOLO build this format was read from. */
+export const TRAE_APP_VERSION = '0.1.61'
+
+/** Whether a Trae host is the CN deployment, for `traeAppName`. */
+export function isCnHost(host: string): boolean {
+  try {
+    return /\.cn$/i.test(new URL(host).hostname)
+  } catch {
+    return /\.cn(?:[/:]|$)/i.test(host)
+  }
+}
 
 /** Placeholders the format itself uses for a field that is not there. */
 export const DEBUG_MISSING = {
