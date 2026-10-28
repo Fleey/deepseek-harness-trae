@@ -19,6 +19,7 @@ import {
   type ToolCallId,
 } from '@deepseek-ai/dsh-llm'
 import type { TraeAuth } from './trae/auth.ts'
+import { traceOf } from './trae/debug.ts'
 import type { FinishedTurn } from './trae/suggest.ts'
 import { EFFORT_NAMES, type TraeEffort, type TraeRoute } from './trae/catalog.ts'
 import { BUILTIN_SNAPSHOT, type CatalogSnapshot, type TraeCatalog } from './trae/catalog-source.ts'
@@ -119,6 +120,11 @@ export interface SessionTurn {
   model: string
   /** Thinking level sent with it, if any. */
   effort?: TraeEffort
+  /**
+   * How upstream named the turn's request — its own trace header, else the
+   * `x-request-id` sent with it. Absent until upstream has answered once.
+   */
+  trace?: string
   /** When that turn started, in ms. */
   at: number
 }
@@ -356,6 +362,17 @@ export class TraeAdapter extends LlmAdapter {
   }
 
   /**
+   * How upstream named the turn that is running, once it has answered. Kept
+   * against the conversation it belongs to, so a trace arriving late for a
+   * session that has since switched models is dropped rather than filed under
+   * the new conversation.
+   */
+  private noteTrace(sessionId: string, conversation: string, trace: string): void {
+    const current = this.variants.get(sessionId)
+    if (current?.conversation === conversation) current.trace = trace
+  }
+
+  /**
    * Which upstream conversation a harness session's last agent-loop turn ran
    * in, and on what. Only those turns are remembered — a title or compaction
    * request runs under its own id and would say nothing about the chat — and
@@ -369,17 +386,23 @@ export class TraeAdapter extends LlmAdapter {
       conversation: current.conversation,
       model: current.model,
       ...current.effort ? { effort: current.effort } : {},
+      ...current.trace ? { trace: current.trace } : {},
       at: current.at,
     }
   }
 
-  /** One POST; yields decoded events. Retries once with a fresh JWT on 401/403. */
-  private async *once(body: string, signal: AbortSignal): AsyncIterable<TraeEvent> {
+  /**
+   * One POST; yields decoded events. Retries once with a fresh JWT on 401/403.
+   * `onTrace` is told how upstream names the request as soon as it answers,
+   * refused turns included — that name is what a bug report is answerable by.
+   */
+  private async *once(body: string, signal: AbortSignal, onTrace?: (trace: string) => void): AsyncIterable<TraeEvent> {
     let session = await this.opts.auth.get()
     for (let attempt = 0; ; attempt++) {
       let res: Response
+      const headers = this.headers(session.token)
       try {
-        res = await fetch(`${this.opts.host}${CHAT_PATH}`, { method: 'POST', headers: this.headers(session.token), body, signal })
+        res = await fetch(`${this.opts.host}${CHAT_PATH}`, { method: 'POST', headers, body, signal })
       } catch (error) {
         if (signal.aborted) throw error
         // A refused or dropped connection is the host's `TRANSPORT`: the next
@@ -390,6 +413,10 @@ export class TraeAdapter extends LlmAdapter {
         await res.body?.cancel()
         session = await this.opts.auth.get(true)
         continue
+      }
+      if (onTrace) {
+        const trace = traceOf(res.headers, headers['x-request-id'])
+        if (trace) onTrace(trace)
       }
       if (!res.ok) {
         const detail = (await res.text()).slice(0, 400)
@@ -574,7 +601,7 @@ export class TraeAdapter extends LlmAdapter {
         }
         arm()
         try {
-          for await (const ev of this.once(payload, controller.signal)) {
+          for await (const ev of this.once(payload, controller.signal, mainLoop ? trace => this.noteTrace(String(options.sessionId), session, trace) : undefined)) {
             arm()
             const data = ev.data
             if (ev.event === 'output') {

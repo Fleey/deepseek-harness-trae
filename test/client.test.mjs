@@ -284,7 +284,7 @@ const UPSTREAM = 'c0ffee00-1111-5222-8333-444455556666'
  * on the clipboard. The clipboard and `fetch` are stubbed for the call and put
  * back after it.
  */
-async function renderSessionChip(value, { alt = false, provider = 'trae', sessionId = SESSION } = {}) {
+async function renderSessionChip(value, { alt = false, shift = false, provider = 'trae', sessionId = SESSION } = {}) {
   const cells = []
   let cursor = 0
   let effects = []
@@ -343,7 +343,7 @@ async function renderSessionChip(value, { alt = false, provider = 'trae', sessio
     const button = tooltip.children[0]
     const label = button.children.find(child => child?.props?.className === 'trae-stat-label')
     // Effects of this render are left unrun, so the "copied" timer never starts.
-    button.props.onClick({ altKey: alt })
+    button.props.onClick({ altKey: alt, shiftKey: shift })
     await settle()
     return {
       node,
@@ -362,9 +362,11 @@ async function renderSessionChip(value, { alt = false, provider = 'trae', sessio
   }
 }
 
+const SUPPORT = `312308224:2026102815494900_${UPSTREAM}.no_mid.no_mid:codex_exec.0.206.1-tob.no_sid.no_ppe.T(2026/10/28 15:49:49)`
+
 test('session chip: the session id, the upstream chat behind it, and a click that copies', async () => {
   const ran = await renderSessionChip({
-    session: SESSION, conversation: UPSTREAM, model: 'GLM-5.3', effort: 'high', at: 1,
+    session: SESSION, conversation: UPSTREAM, model: 'GLM-5.3', effort: 'high', at: 1, debug: SUPPORT,
   })
   // The chip is short; the whole id is in the tooltip and on the clipboard.
   assert.equal(ran.text, 'ID f3a9c1d2')
@@ -374,7 +376,8 @@ test('session chip: the session id, the upstream chat behind it, and a click tha
   assert.deepEqual(ran.lines, [
     `会话 ID：${SESSION}`,
     `上游会话：${UPSTREAM}（GLM-5.3 · high）`,
-    '点击复制会话 ID；按住 Alt 点击复制上游会话 ID',
+    `排查串：${SUPPORT}`,
+    '点击复制会话 ID；Alt 点击复制上游会话 ID；Shift 点击复制排查串（Trae 客服那套格式）',
   ])
   assert.equal(ran.asked[0], `api/dsh-trae2api/session?session=${SESSION}`)
   assert.deepEqual(ran.copied, [SESSION])
@@ -389,11 +392,19 @@ test('session chip: the session id, the upstream chat behind it, and a click tha
   assert.equal(altClick.lines[1], `上游会话：${UPSTREAM}（Kimi-K3）`)
   assert.deepEqual(altClick.copied, [UPSTREAM])
 
-  // Before the first answer there is no upstream chat yet, and Alt falls back
-  // to the one id that does exist.
+  // Shift copies the whole support line, the one Trae's own client hands out.
+  const shifted = await renderSessionChip({
+    session: SESSION, conversation: UPSTREAM, model: 'GLM-5.3', effort: 'high', at: 1, debug: SUPPORT,
+  }, { shift: true })
+  assert.deepEqual(shifted.copied, [SUPPORT])
+
+  // Before the first answer there is no upstream chat and no support line, so
+  // both modifiers fall back to the one id that does exist, and the tooltip
+  // has no support row to show.
   const fresh = await renderSessionChip({
-    session: SESSION, conversation: null, model: null, effort: null, at: null,
-  }, { alt: true })
+    session: SESSION, conversation: null, model: null, effort: null, at: null, debug: null,
+  }, { alt: true, shift: true })
+  assert.equal(fresh.lines.length, 3)
   assert.equal(fresh.lines[1], '上游会话：这条会话还没发过一轮，发一轮就有了')
   assert.deepEqual(fresh.copied, [SESSION])
 

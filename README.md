@@ -255,19 +255,51 @@ python3 -I tools/probe_catalog.py
 里会多一个 `ID xxxxxxxx`，和宿主自己的统计长一个样（同样的图标 + 文字、同样的悬停底色）。显示的是会话 ID 里
 真正能区分会话的那 8 位——`session-` 这种每条会话都一样的前缀会跳过：
 
-- **鼠标悬停**：完整的会话 ID、这条会话上一轮跑在哪条上游会话里（后面括号写明用的模型和思考档位），
-  以及复制提示。
+- **鼠标悬停**：完整的会话 ID、这条会话上一轮跑在哪条上游会话里（后面括号写明用的模型和思考档位）、
+  按 Trae 客服格式拼好的**排查串**，以及复制提示。
 - **点一下**：把**完整会话 ID** 复制到剪贴板，徽标短暂变成「已复制」。
 - **按住 Alt 点**：复制**上游会话 ID**（还没发过一轮时退回复制会话 ID）。
+- **按住 Shift 点**：复制**排查串**（同上，没有就退回会话 ID）。
 
 两个 ID 不是一回事，提 bug、查日志时要的往往是后一个：上游按「会话 × 模型 × 思考档位」分别开
 conversation（见 `conversationUuid`），所以上游那条 ID 是从会话 ID 派生出来的，**不等于也猜不出**
 会话 ID；换模型或换档位后同一条会话会有多个上游 ID，徽标显示的是**最近一轮主循环请求真的发出去的那个**。
 标题生成、上下文压缩这类旁路请求用自己的临时 ID，不计入。
 
-实现方式：宿主端记住最近 64 条会话各自上一轮的变体和上游 ID，经同样走登录态隔离的
+### 排查串（Trae 客户端自己那套格式）
+
+TRAE SOLO CN 0.1.61 在回答的头部双击会复制一串给客服用的排查信息，外部账号拿到的是这个格式：
+
+```
+312308224:a9e9…839c_6ae1a91d…6bff.6ae1a91d…6c02.6ae1a91d…6c00:TraeWork CN.0.1.61.no_sid.no_ppe.T(2026/10/28 15:49:49)
+└ userId  └ traceId     └ 会话 ID  └ 消息 ID    └ 被回复消息 ID  └ 应用名     └ 版本  └ Slardar └ PPE └ 本地时间
+```
+
+拼接规则（`region` 有值才带前缀，缺字段用 `no_sid` / `no_ppe` 这类占位符；字节内部账号拿到的是 JSON 不是这串）：
+
+```
+`${region ? region + '.' : ''}${userId}:${traceId}_${sessionId}.${messageId}.${replyId}:${appName}.${appVersion}.${sid}.${ppe}`
+```
+
+串里那三个 24 位十六进制是 MongoDB ObjectId，由 Trae 的聊天服务生成（前 4 字节是时间戳，和末尾 `T(...)` 对得上），
+客户端只负责拼。
+
+本插件直连 `llm_raw_chat`——这是聊天服务**下面一层**，根本没有 message id，所以这串按「有什么填什么、
+没有的保留格式自己的 `no_*` 占位符」来拼，不编 ID（见 [src/trae/debug.ts](src/trae/debug.ts)）：
+
+| 字段 | 这里填什么 |
+| --- | --- |
+| `userId` | `GetUserInfo` 的 `UserInfo.UserID`，和 IDE 上报用的是同一个；读不到填 `no_uid` |
+| `traceId` | 上游回包里的 trace 头（`x-tt-logid` / `x-tt-trace-id` / `x-trace-id`），没有就用本插件这轮发出去的 `x-request-id`——两者都在上游访问日志里 |
+| `sessionId` | 上游会话 ID（`conversationUuid`），这里是 UUID，不是 ObjectId |
+| `messageId` / `replyId` | `no_mid`，裸接口没有这两个 |
+| `appName` / `appVersion` | 本插件身份头里的 `originator` 和版本（`codex_exec` / `0.206.1-tob`），也就是上游给这次请求记下的那个，不冒充 `TraeWork CN` |
+| `sid` / `ppe` | `no_sid` / `no_ppe`：没有 Slardar 会话，也没走 PPE |
+| `T(...)` | 这一轮的本地时间 |
+
+实现方式：宿主端记住最近 64 条会话各自上一轮的变体、上游 ID 和 trace，经同样走登录态隔离的
 `/api/dsh-trae2api/session?session=<会话 ID>` 路由给浏览器端，返回
-`{ session, conversation, model, effort, at }`；还没发过一轮的会话 `conversation` 为 `null`。
+`{ session, conversation, model, effort, trace, at, debug }`；还没发过一轮的会话 `conversation`、`debug` 都是 `null`。
 浏览器端在挂载、换模型／档位、一轮结束和每次点击时各读一次，不轮询。徽标挂在输入框下方统计行那个插槽
 （`conversation.composer.dock`，宿主自己的 `activity` 排 0、`usage` 排 1，这个排 2），
 带 `data-composer-stat="trae-session"`，样式用宿主的设计变量，跟着亮色 / 暗色主题走。

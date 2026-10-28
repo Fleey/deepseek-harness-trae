@@ -236,17 +236,21 @@ test('apply serves the session id and the upstream chat its last turn ran in', a
   assert.equal(none.status, 400)
   assert.equal(none.body.ok, false)
 
-  // A session that has not answered yet has an id but no upstream chat.
+  // A session that has not answered yet has an id but no upstream chat, no
+  // trace and no support line.
   assert.deepEqual((await ask('?session=s1')).body, {
     ok: true,
-    value: { session: 's1', conversation: null, model: null, effort: null, at: null },
+    value: { session: 's1', conversation: null, model: null, effort: null, trace: null, at: null, debug: null },
   })
 
   const original = globalThis.fetch
   const bodies = []
   globalThis.fetch = async (url, init) => {
+    if (String(url).endsWith('/GetUserInfo')) return Response.json({ code: 0, Data: { UserInfo: { UserID: '312308224' } } })
     bodies.push(JSON.parse(init.body))
-    return new Response('event: output\ndata: {"response":"Done."}\n\n', { status: 200 })
+    // Upstream names the request in its answer; that name is what a Trae
+    // ticket is answerable by.
+    return new Response('event: output\ndata: {"response":"Done."}\n\n', { status: 200, headers: { 'x-tt-logid': '2026102815494900' } })
   }
   try {
     for await (const _ of adapters.trae.stream({
@@ -254,19 +258,28 @@ test('apply serves the session id and the upstream chat its last turn ran in', a
       tools: [{ name: 'bash', description: '', parameters: {} }],
       messages: [{ role: 'user', content: [{ type: 'text', text: 'fix it' }] }],
     })) { /* consume */ }
+    // After a turn, the route names the conversation that turn actually sent —
+    // the id an upstream complaint has to quote, which is derived per model
+    // variant and level rather than equal to the harness session id.
+    const ran = (await ask('?session=s1')).body.value
+    assert.equal(ran.session, 's1')
+    assert.equal(ran.conversation, bodies[0].conversation_id)
+    assert.notEqual(ran.conversation, 's1')
+    assert.deepEqual([ran.model, ran.effort], ['GLM-5.3', 'high'])
+    assert.ok(ran.at > 0)
+    // Upstream's own name for the request, not the one we sent.
+    assert.equal(ran.trace, '2026102815494900')
+    // And the whole thing as Trae's support format wants it: the account id
+    // from GetUserInfo, that trace, the conversation, `no_mid` where the raw
+    // endpoint has no message ids, and this plugin's own originator/version.
+    assert.equal(
+      ran.debug.split('.T(')[0],
+      `312308224:2026102815494900_${ran.conversation}.no_mid.no_mid:codex_exec.0.206.1-tob.no_sid.no_ppe`,
+    )
+    assert.match(ran.debug, /\.T\(\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}\)$/)
+    // Another session is not this one, however recently it ran.
+    assert.equal((await ask('?session=s2')).body.value.conversation, null)
   } finally { globalThis.fetch = original }
-
-  // After a turn, the route names the conversation that turn actually sent —
-  // the id an upstream complaint has to quote, which is derived per model
-  // variant and level rather than equal to the harness session id.
-  const ran = (await ask('?session=s1')).body.value
-  assert.equal(ran.session, 's1')
-  assert.equal(ran.conversation, bodies[0].conversation_id)
-  assert.notEqual(ran.conversation, 's1')
-  assert.deepEqual([ran.model, ran.effort], ['GLM-5.3', 'high'])
-  assert.ok(ran.at > 0)
-  // Another session is not this one, however recently it ran.
-  assert.equal((await ask('?session=s2')).body.value.conversation, null)
 })
 
 test('apply serves next-step cards for finished Trae turns', async () => {
