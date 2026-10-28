@@ -42,7 +42,19 @@ export const DEBUG_MISSING = {
   ppe: 'no_ppe',
 } as const
 
-/** Response headers that name the request in upstream's own logs, best first. */
+/**
+ * Response headers that name the request in upstream's own logs, best first.
+ *
+ * Measured against api.enterprise.trae.cn on 2026-10-28 (tools/probe_trace.mjs):
+ * `llm_raw_chat` answers with `x-tt-logid`
+ * (`2026102816265801000315823240915B1`) and no other trace header, and
+ * `ExchangeToken` even lists it in `access-control-expose-header`. The rest
+ * are the gateway family's other spellings, kept as fallbacks; none was seen.
+ *
+ * It is not the `traceId` Trae's chat service puts in its own support line
+ * (a 32-hex `trace_id` on the layer above this one) — it is the name the
+ * gateway logged for this request, which is the one answerable here.
+ */
 const TRACE_HEADERS = ['x-tt-logid', 'x-tt-trace-id', 'x-trace-id', 'x-request-id'] as const
 
 export interface TraeDebugParts {

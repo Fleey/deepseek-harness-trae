@@ -313,9 +313,14 @@ TRAE SOLO CN 0.1.61 在回答的头部双击会复制一串给客服用的排查
 > 剪贴板优先用 `navigator.clipboard`，拿不到权限（非安全来源之类）时退回老的选区复制；
 > 两条都失败时按钮写「复制失败」，ID 本身就在页面上，可以直接选中复制。
 
-> trace 头的名字是按字节系网关惯例排的（`x-tt-logid` 优先），想实测确认跑
-> `TRAE_PAT=<你的 PAT> node tools/probe_trace.mjs`：它发一轮最小请求，把响应头全打出来，
-> 并说明 `traceOf()` 会选哪个。PAT 和 JWT 都不会打印。
+> trace 头是实测过的：2026-10-28 对 api.enterprise.trae.cn 发一轮，`llm_raw_chat` 回的是
+> `x-tt-logid: 2026102816265801000315823240915B1`，没有别的 trace 头（`ExchangeToken` 还把它写进了
+> `access-control-expose-header`），所以 `traceOf()` 选的就是它；列表里其余几个是同系网关的别的写法，
+> 留作兜底。想自己再测一次：`TRAE_PAT=<你的 PAT> node tools/probe_trace.mjs`，它把响应头全打出来并说明
+> 会选哪个，PAT 和 JWT 都不打印。
+>
+> 注意这个 `x-tt-logid` 和 Trae 自家排查串里那个 32 位 `traceId` 不是一回事：后者是**上面一层**聊天服务的
+> trace，裸接口这边没有；这里填的是网关给这次请求记的名字，也正是能拿去查这次请求的那个。
 
 ## 下一步选择卡片
 

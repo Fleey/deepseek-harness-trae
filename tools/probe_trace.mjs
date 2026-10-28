@@ -5,9 +5,14 @@
  * The support line this plugin copies (src/trae/debug.ts) carries a `traceId`.
  * `traceOf()` looks for upstream's own name for the request in the response —
  * `x-tt-logid`, `x-tt-trace-id`, `x-trace-id` — and falls back to the
- * `x-request-id` the turn sent. That list is the ByteDance-gateway convention,
- * not something measured: this probe runs one real, tiny turn and prints every
- * response header so the list can be confirmed or corrected.
+ * `x-request-id` the turn sent. This probe runs one real, tiny turn and prints
+ * every response header, so that list answers to a measurement rather than to
+ * convention.
+ *
+ * Run on 2026-10-28 against api.enterprise.trae.cn: `llm_raw_chat` answered
+ * with `x-tt-logid: 2026102816265801000315823240915B1` and no other trace
+ * header, so `traceOf()` picked it. Worth re-running whenever upstream's
+ * gateway changes.
  *
  *   TRAE_PAT=<your PAT> node tools/probe_trace.mjs [model]
  *
@@ -47,12 +52,18 @@ function dumpHeaders(label, headers) {
   }
 }
 
+/** The same envelope walk as src/trae/auth.ts: the token sits under an
+ * `OauthToken` / `Token` object on some deployments and directly on `Data` as
+ * a string on others, so a nested object is only stepped into when it is one. */
 function unwrapToken(body) {
+  const isObject = value => typeof value === 'object' && value !== null && !Array.isArray(value)
   for (const candidate of [body?.Result, body?.Data, body?.data, body?.result, body]) {
-    if (typeof candidate !== 'object' || candidate === null) continue
-    const inner = candidate.OauthToken ?? candidate.Token ?? candidate
+    if (!isObject(candidate)) continue
+    const inner = isObject(candidate.OauthToken) ? candidate.OauthToken
+      : isObject(candidate.Token) ? candidate.Token
+        : candidate
     for (const key of ['Token', 'token', 'AccessToken', 'access_token', 'accessToken']) {
-      if (typeof inner?.[key] === 'string' && inner[key].length > 20) return inner[key]
+      if (typeof inner[key] === 'string' && inner[key].length > 20) return inner[key]
     }
   }
   return undefined
