@@ -35,6 +35,8 @@ const CLIENT_VERSION = '0.206.1-tob'
 export const QUOTA_ROUTE = '/api/dsh-trae2api/quota'
 /** Host route serving the model catalog and its origin; `?refresh` re-asks upstream. */
 export const CATALOG_ROUTE = '/api/dsh-trae2api/catalog'
+/** Host route the browser half reads a session's own id — and its upstream one — from. */
+export const SESSION_ROUTE = '/api/dsh-trae2api/session'
 /** Host route the browser half reads a session's next-step choices from. */
 export const SUGGESTION_ROUTE = '/api/dsh-trae2api/suggestion'
 /** Longest a suggestion request may wait for one still being generated. */
@@ -384,6 +386,34 @@ export function apply(ctx: Context, config: Config): void {
         },
       })
     } catch (error) { logger.warn('dsh-trae2api: catalog route unavailable', error) }
+    // `?session=<id>`: that harness session's id as the plugin sees it, plus
+    // the upstream conversation its last Trae turn ran in and the variant it
+    // ran on. For the composer's session-id chip and for bug reports — an
+    // upstream complaint is answerable only with the conversation id, which is
+    // derived per model variant and level rather than equal to the harness id
+    // (wire.ts `conversationUuid`). `conversation: null` = no turn yet.
+    try {
+      child.connection.fetch.register({
+        path: SESSION_ROUTE,
+        methods: ['GET'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          const sessionId = new URL(request.url).searchParams.get('session') ?? ''
+          if (!sessionId) return Response.json({ ok: false, error: 'expected ?session=<id>' }, { status: 400 })
+          const turn = adapter.sessionInfo(sessionId)
+          return Response.json({
+            ok: true,
+            value: {
+              session: sessionId,
+              conversation: turn?.conversation ?? null,
+              model: turn?.model ?? null,
+              effort: turn?.effort ?? null,
+              at: turn?.at ?? null,
+            },
+          })
+        },
+      })
+    } catch (error) { logger.warn('dsh-trae2api: session route unavailable', error) }
     // `?session=<id>&wait=<ms>`: the session's next-step choices, waiting for
     // ones still in flight. `{ ok: true, value: null }` = nothing to suggest.
     try {

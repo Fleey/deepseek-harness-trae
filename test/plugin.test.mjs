@@ -206,6 +206,69 @@ test('apply asks the extra catalog functions only when they are configured', asy
   } finally { globalThis.fetch = original }
 })
 
+test('apply serves the session id and the upstream chat its last turn ran in', async () => {
+  const routes = new Map()
+  const adapters = {}
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    effect() {}, on() {},
+    get: (name) => name === 'credentials' ? { resolve: async () => ({ value: 'eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQxMDI0NDQ4MDB9.c2ln' }) } : undefined,
+    inject: (deps, cb) => {
+      if (deps.includes('connection')) cb({ connection: { fetch: { register: (route) => { routes.set(route.path, route) } } } })
+    },
+    fiber: { entry: { options: { id: 'trae2api' } } },
+    llm: { registerAdapter: (r, a) => { for (const k of r) adapters[k] = a }, registerConfigurableProviders() {} },
+  }
+  // `builtin` keeps these tests off the network and off whatever traecli last
+  // cached on the machine running them; the live sources have their own tests.
+  plugin.apply(ctx, plugin.Config({ catalogSource: 'builtin', suggestions: false }))
+  const route = routes.get(plugin.SESSION_ROUTE)
+  assert.ok(route, 'session route registered')
+  assert.equal(plugin.SESSION_ROUTE, '/api/dsh-trae2api/session')
+  assert.deepEqual(route.methods, ['GET'])
+  const ask = async (query) => {
+    const response = await route.fetch(new Request(`http://127.0.0.1${plugin.SESSION_ROUTE}${query}`))
+    return { status: response.status, body: await response.json() }
+  }
+
+  // Which session is being asked about is the whole question.
+  const none = await ask('')
+  assert.equal(none.status, 400)
+  assert.equal(none.body.ok, false)
+
+  // A session that has not answered yet has an id but no upstream chat.
+  assert.deepEqual((await ask('?session=s1')).body, {
+    ok: true,
+    value: { session: 's1', conversation: null, model: null, effort: null, at: null },
+  })
+
+  const original = globalThis.fetch
+  const bodies = []
+  globalThis.fetch = async (url, init) => {
+    bodies.push(JSON.parse(init.body))
+    return new Response('event: output\ndata: {"response":"Done."}\n\n', { status: 200 })
+  }
+  try {
+    for await (const _ of adapters.trae.stream({
+      model: 'GLM-5.3', sessionId: 's1', reasoningEffort: 'high',
+      tools: [{ name: 'bash', description: '', parameters: {} }],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'fix it' }] }],
+    })) { /* consume */ }
+  } finally { globalThis.fetch = original }
+
+  // After a turn, the route names the conversation that turn actually sent —
+  // the id an upstream complaint has to quote, which is derived per model
+  // variant and level rather than equal to the harness session id.
+  const ran = (await ask('?session=s1')).body.value
+  assert.equal(ran.session, 's1')
+  assert.equal(ran.conversation, bodies[0].conversation_id)
+  assert.notEqual(ran.conversation, 's1')
+  assert.deepEqual([ran.model, ran.effort], ['GLM-5.3', 'high'])
+  assert.ok(ran.at > 0)
+  // Another session is not this one, however recently it ran.
+  assert.equal((await ask('?session=s2')).body.value.conversation, null)
+})
+
 test('apply serves next-step cards for finished Trae turns', async () => {
   const routes = new Map()
   const adapters = {}
