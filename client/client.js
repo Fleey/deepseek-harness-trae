@@ -953,6 +953,73 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Whether the View tab row carries this plugin's tab at all.
+     *
+     * The row is global — the host builds it from every `conversation.view`
+     * registration, with no per-session filter — so the tab is registered only
+     * while a session on screen is running a Trae model, and dropped again
+     * when the last one goes. The host subscribes to the slot, so the row
+     * updates itself; `restoreView` then falls back to Chat if the tab the
+     * user was on has just left.
+     *
+     * Several sessions can be mounted at once (a split view): the tab stays
+     * while any of them is on Trae, which is the only answer a global row
+     * allows.
+     */
+    class TabPresence {
+      constructor(register) {
+        this.register = register
+        this.sessions = new Map()
+        this.registered = undefined
+      }
+
+      set(sessionId, isTrae) {
+        if (this.sessions.get(sessionId) === isTrae) return
+        this.sessions.set(sessionId, isTrae)
+        this.sync()
+      }
+
+      drop(sessionId) {
+        if (!this.sessions.delete(sessionId)) return
+        this.sync()
+      }
+
+      sync() {
+        const wanted = [...this.sessions.values()].some(Boolean)
+        if (wanted === (this.registered !== undefined)) return
+        if (wanted) this.registered = this.register()
+        else {
+          const dispose = this.registered
+          this.registered = undefined
+          if (typeof dispose === 'function') dispose()
+        }
+      }
+
+      dispose() {
+        this.sessions.clear()
+        this.sync()
+      }
+    }
+
+    /**
+     * Renders nothing; it is there to say which sessions are on screen and
+     * whether they are on a Trae model, which is what decides whether the View
+     * tab is registered at all. It sits beside the composer because that is
+     * where this plugin already has a per-session seat that mounts for every
+     * session, Trae or not.
+     */
+    function SessionWatch(props) {
+      const provider = props.useTraeModel(snapshot => snapshot?.current?.provider)
+      // Two effects on purpose: the first follows the picked model, and the
+      // second runs only on unmount. One effect with a cleanup would drop and
+      // re-add the session on every switch, and a tab that leaves and comes
+      // back loses the user's place in it.
+      React.useEffect(() => { props.watch(provider === PROVIDER) }, [provider])
+      React.useEffect(() => () => { props.unwatch() }, [])
+      return null
+    }
+
+    /**
      * This session's ids, read from the host route: the harness session id, the
      * upstream conversation its last Trae turn ran in, and Trae's own support
      * line. Shared by the tab and the header button that opens it.
@@ -1027,10 +1094,10 @@ window.__ModuleLoader__.load({
      *
      * A tab rather than a composer chip, because this is read once in a while
      * and read in full — the ids are long, and the support line is a whole
-     * line. The tab row itself is a global registry (the host builds it from
-     * `conversation.view` registrations, with no per-session filter), so a
-     * session on another provider gets the tab too and is told here that the
-     * last two rows are not about it.
+     * line. The tab is only on the row while a session on screen is on a Trae
+     * model (TabPresence); in a split view with one Trae session and one on
+     * another provider, the other session reads a line saying the last two
+     * rows are not about it.
      */
     function SessionTab(props) {
       const { t, sessionId } = props
@@ -1614,16 +1681,16 @@ window.__ModuleLoader__.load({
               refresh: (force) => { void quota.load(force) },
             }),
           }, QuotaChip))
-          // The session's ids live in their own right-sidebar tab (below), and
-          // this is the way in: one utility in the session header, there only
-          // while the session's model is a Trae one.
           // The ids are a view of the session, so they are one of the session's
-          // own tabs (对话 / 轨迹 / 上下文 / …), after the shipped ones. The host
-          // builds that row from the `conversation.view` registry, which is
-          // global: a tab cannot be registered per session, so the body is what
-          // tells a session on another provider that there is nothing here.
+          // own tabs (对话 / 轨迹 / 上下文 / …), after the shipped ones.
+          //
+          // That row is a global registry — the host builds it from
+          // `slots.entries('conversation.view')` and filters nothing per
+          // session — so the tab is registered and dropped as Trae sessions
+          // come and go on screen instead (see TabPresence). The host
+          // subscribes to the slot, so the row follows along.
           const t = bindLocale(ctx)
-          scope.slots.inject('conversation.view', () => scope.slots.register({
+          const presence = new TabPresence(() => scope.slots.inject('conversation.view', () => scope.slots.register({
             name: 'conversation.view',
             id: TAB_ID,
             // After the shipped views, which sit at their own low orders.
@@ -1631,7 +1698,20 @@ window.__ModuleLoader__.load({
             label: () => t('sessionTabTitle'),
             locale: NS,
             inject: sessionId => ({ sessionId, hooks: { traeModel: directoryFor(sessionId) } }),
-          }, SessionTab))
+          }, SessionTab)))
+          scope.effect(() => () => { presence.dispose() }, 'dsh-trae2api: session tab presence')
+          // What tells it which sessions are on screen and what they picked:
+          // one entry beside the composer that renders nothing at all.
+          scope.slots.inject('conversation.input.right', () => scope.slots.register({
+            name: 'conversation.input.right',
+            id: 'trae-session-watch',
+            locale: NS,
+            inject: sessionId => ({
+              hooks: { traeModel: directoryFor(sessionId) },
+              watch: (isTrae) => { presence.set(sessionId, isTrae) },
+              unwatch: () => { presence.drop(sessionId) },
+            }),
+          }, SessionWatch))
           // Its own entry rather than part of the chip: the chip is absent on an
           // unlimited or unreadable quota, and the switch still needs saying.
           scope.slots.inject('conversation.input.right', () => scope.slots.register({
