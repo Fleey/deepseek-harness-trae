@@ -35,13 +35,23 @@ function loadClient(react = { createElement: () => null }) {
  * hands back the context itself, so a nested injection — the sidebar tab
  * inside the model-directory scope — reaches the same recorders.
  */
-function hostCtx({ register = () => {}, openTab = () => {}, locale = () => {} } = {}) {
+function hostCtx({ register = () => {}, locale = () => {} } = {}) {
   const registered = []
-  const tabTypes = []
+  // A registration the client disposed again, so a test can see the View tab
+  // leave the row as well as arrive.
+  const live = new Set()
   let dictionaries
   const slots = {
-    inject: (_name, fn) => { fn(); return () => {} },
-    register: (options, component) => { registered.push(options); register(options, component); return () => {} },
+    inject: (_name, fn) => {
+      const dispose = fn()
+      return () => { if (typeof dispose === 'function') dispose() }
+    },
+    register: (options, component) => {
+      registered.push(options)
+      live.add(options)
+      register(options, component)
+      return () => { live.delete(options) }
+    },
   }
   const ctx = {
     slots,
@@ -53,16 +63,20 @@ function hostCtx({ register = () => {}, openTab = () => {}, locale = () => {} } 
     configForms: { get: () => ({ getSnapshot: () => ({}), subscribe: () => () => {} }), whileServed: (_ns, fn) => fn() },
     effect: (fn) => { fn() },
     modelDirectories: {},
-    sidebarRight: { openTab },
-    sidebarRightTabs: { register: (definition) => { tabTypes.push(definition); return () => {} } },
     inject: (_deps, cb) => { cb(ctx) },
   }
-  return { ctx, registered, tabTypes }
+  return {
+    ctx,
+    registered,
+    /** Entries the client has registered and not disposed. */
+    liveIds: name => [...live].filter(options => options.name === name).map(options => options.id),
+    entry: (name, id) => registered.find(options => options.name === name && (id === undefined || options.id === id)),
+  }
 }
 
 test('client: every slot registration passes the host registry rules', () => {
   const plugin = loadClient()
-  const { ctx, registered, tabTypes } = hostCtx({
+  const { ctx, registered, liveIds, entry } = hostCtx({
     register: (options) => {
       if (LIST_SLOTS.has(options.name) && !options.id) throw new Error(`list slot "${options.name}" requires options.id`)
       if (KEYED_SLOTS.has(options.name) && !options.key) throw new Error(`keyed slot "${options.name}" requires options.key`)
@@ -73,22 +87,34 @@ test('client: every slot registration passes the host registry rules', () => {
   const ids = name => registered.filter(r => r.name === name).map(r => r.id)
   assert.equal(byName['conversation.input.dock'].id, 'trae-choices')
   assert.equal(byName['conversation.input.overlay'], undefined, 'no Tab ghost text any more')
-  // Two entries beside the model picker: the quota chip and the "switching
-  // reopens the upstream conversation" notice.
-  assert.deepEqual(ids('conversation.input.right'), ['trae-quota', 'trae-switch'])
+  // Three entries beside the model picker: the quota chip, the "switching
+  // reopens the upstream conversation" notice, and the invisible watcher that
+  // reports which sessions are on screen.
+  assert.deepEqual(ids('conversation.input.right'), ['trae-quota', 'trae-session-watch', 'trae-switch'])
   // The session ids are a tab of their own, not a composer reading.
   assert.equal(byName['conversation.composer.dock'], undefined)
-  // Stage one of a tab type: a page type, opened by kind, named for the user.
-  assert.equal(tabTypes.length, 1)
-  assert.equal(tabTypes[0].kind, 'trae-session')
-  assert.equal(tabTypes[0].id, 'dsh-trae2api/session')
-  assert.equal(tabTypes[0].priority, 'extension')
-  assert.equal(tabTypes[0].patterns, undefined, 'a page type matches no resource address')
-  assert.equal(tabTypes[0].title(), '会话 ID')
-  // Stage two: its body registers under that same id, and the way in is one
-  // session-header utility.
-  assert.equal(byName['sidebar.right.pane.tab'].key, tabTypes[0].id)
-  assert.deepEqual(ids('conversation.session.header.utilities'), ['trae-session'])
+  // The View tab row is global, so the tab is not on it until a session on
+  // screen says it is running Trae.
+  assert.deepEqual(liveIds('conversation.view'), [])
+  const watch = entry('conversation.input.right', 'trae-session-watch').inject('s1')
+  watch.watch(true)
+  assert.deepEqual(liveIds('conversation.view'), ['trae-session'])
+  const tab = entry('conversation.view')
+  // After the shipped views, with a label that follows the active locale.
+  assert.equal(tab.order, 100)
+  assert.equal(tab.label(), '会话 ID')
+  // A second Trae session does not register it twice, and the tab stays while
+  // either of them is still on screen.
+  entry('conversation.input.right', 'trae-session-watch').inject('s2').watch(true)
+  assert.deepEqual(liveIds('conversation.view'), ['trae-session'])
+  watch.unwatch()
+  assert.deepEqual(liveIds('conversation.view'), ['trae-session'])
+  // Switching the last one to another provider takes the tab off the row.
+  entry('conversation.input.right', 'trae-session-watch').inject('s2').watch(false)
+  assert.deepEqual(liveIds('conversation.view'), [])
+  // Nothing in the right sidebar or the session header any more.
+  assert.equal(byName['sidebar.right.pane.tab'], undefined)
+  assert.equal(byName['conversation.session.header.utilities'], undefined)
   assert.ok(byName['plugins.bundle.config'] && byName['settings.models.provider-card'])
 })
 
@@ -294,10 +320,10 @@ const UPSTREAM = 'c0ffee00-1111-5222-8333-444455556666'
 const SUPPORT = `312308224:2026102815494900_${UPSTREAM}.no_mid.no_mid:codex_exec.0.206.1-tob.no_sid.no_ppe.T(2026/10/28 15:49:49)`
 
 /**
- * Render the session-ids tab (or the header button that opens it) against one
- * answer from the host's session route, running effects the way React would,
- * then press the row's copy button and report what landed on the clipboard.
- * The clipboard and `fetch` are stubbed for the call and put back after it.
+ * Render the session-ids View tab against one answer from the host's session
+ * route, running effects the way React would, then press one row's copy button
+ * and report what landed on the clipboard. The clipboard and `fetch` are
+ * stubbed for the call and put back after it.
  */
 async function renderSessionTab(value, { provider = 'trae', sessionId = SESSION, copyRow = 0 } = {}) {
   const cells = []
@@ -313,17 +339,16 @@ async function renderSessionTab(value, { provider = 'trae', sessionId = SESSION,
     useEffect: (fn) => { effects.push(fn) },
   }
   const plugin = loadClient(react)
-  let Tab, Button, buttonEntry, zh
-  const opened = []
-  const { ctx } = hostCtx({
-    register: (options, component) => {
-      if (options.key === 'dsh-trae2api/session') Tab = component
-      if (options.name === 'conversation.session.header.utilities') { Button = component; buttonEntry = options }
-    },
-    openTab: kind => { opened.push(kind) },
+  let Tab, zh
+  const { ctx, entry } = hostCtx({
+    register: (options, component) => { if (options.name === 'conversation.view') Tab = component },
     locale: (dicts) => { zh = dicts.zh },
   })
   plugin.apply(ctx)
+  // The tab only exists once a session on screen reports a Trae model; a
+  // non-Trae `provider` here is then the split-view case, where the tab is on
+  // the row for another session.
+  entry('conversation.input.right', 'trae-session-watch').inject('trae-session-on-screen').watch(true)
   const asked = []
   const copied = []
   const realFetch = globalThis.fetch
@@ -334,13 +359,10 @@ async function renderSessionTab(value, { provider = 'trae', sessionId = SESSION,
     configurable: true,
     value: { clipboard: { writeText: async (text) => { copied.push(text) } } },
   })
-  // The button's own `openTab` comes from the registration, so what the test
-  // presses is the wiring the host would use.
   const props = {
     t: key => zh[key],
     sessionId,
     useTraeModel: select => select({ current: { provider, modelId: 'GLM-5.3' } }),
-    openTab: buttonEntry.inject(sessionId).openTab,
   }
   const render = (Component) => {
     cursor = 0
@@ -348,7 +370,6 @@ async function renderSessionTab(value, { provider = 'trae', sessionId = SESSION,
     return Component(props)
   }
   try {
-    const button = render(Button)
     // The whole tab is rendered row by row: the recorder leaves child
     // components uncalled, so each row is rendered the way React would.
     render(Tab)
@@ -373,9 +394,8 @@ async function renderSessionTab(value, { provider = 'trae', sessionId = SESSION,
     if (pressed.copy) pressed.copy.props.onClick()
     await settle()
     return {
-      // The header button renders nothing at all outside a Trae session.
-      button: button === null ? null : button.children[0],
-      openedBy: () => { button.children[0].props.onClick(); return opened },
+      // The line a session on another provider is told, when there is one.
+      note: tab.children.find(child => child?.props?.className === 'trae-id-note')?.children?.[0] ?? null,
       rows,
       asked,
       copied,
@@ -399,8 +419,8 @@ test('session tab: one row per id, each copied on its own, and no tab outside Tr
   // the other two move with every turn.
   assert.deepEqual(ran.copied, [SESSION])
   assert.equal(ran.asked.length, 2)
-  // The header button is the way in, and it opens this plugin's own tab kind.
-  assert.deepEqual(ran.openedBy(), ['trae-session'])
+  // On a Trae session the tab is only the rows.
+  assert.equal(ran.note, null)
 
   const upstreamRow = await renderSessionTab({
     session: SESSION, conversation: UPSTREAM, model: 'Kimi-K3', effort: null, at: 1, debug: SUPPORT,
@@ -421,9 +441,14 @@ test('session tab: one row per id, each copied on its own, and no tab outside Tr
   assert.deepEqual(fresh.rows.map(row => row.copy === null), [false, true, true])
   assert.deepEqual(fresh.copied, [])
 
-  // Another provider's session gets no way in at all.
-  const other = await renderSessionTab({ session: SESSION }, { provider: 'deepseek' })
-  assert.equal(other.button, null)
+  // The View tab row is a global registry, so another provider's session has
+  // this tab too: it says the last two rows are not about it, and still shows
+  // the one id that is.
+  const other = await renderSessionTab({
+    session: SESSION, conversation: null, model: null, effort: null, at: null, debug: null,
+  }, { provider: 'deepseek' })
+  assert.equal(other.note, '这条会话现在选的不是 Trae 模型，下面两项说的是它上一轮跑 Trae 时的情况。')
+  assert.equal(other.rows[0].value, SESSION)
 })
 
 /**

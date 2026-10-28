@@ -271,10 +271,11 @@ test('apply serves the session id and the upstream chat its last turn ran in', a
     assert.equal(ran.trace, '2026102815494900')
     // And the whole thing as Trae's support format wants it: the account id
     // from GetUserInfo, that trace, the conversation, `no_mid` where the raw
-    // endpoint has no message ids, and this plugin's own originator/version.
+    // endpoint has no message ids, and the client's own name for itself --
+    // the CN host and a non-IDE platform, so `TraeWork CN`.
     assert.equal(
       ran.debug.split('.T(')[0],
-      `312308224:2026102815494900_${ran.conversation}.no_mid.no_mid:codex_exec.0.206.1-tob.no_sid.no_ppe`,
+      `312308224:2026102815494900_${ran.conversation}.no_mid.no_mid:TraeWork CN.0.1.61.no_sid.no_ppe`,
     )
     assert.match(ran.debug, /\.T\(\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}\)$/)
     // Another session is not this one, however recently it ran.

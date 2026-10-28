@@ -8,7 +8,7 @@ import {
   LoopDetector, TextToolCallSniffer, sessionUuid, conversationUuid, classify, httpCode, approxTokens, decodeJwt, parseExpiry,
   parseQuota, TraeQuota, QUOTA_PATHS, enterpriseTenant,
   parseTobQuota, TobConsole, TOB_LOGIN_PATH, TOB_QUOTA_PATH, TOB_USAGE_PATH, TOB_SESSION_COOKIE,
-  traeDebugLine, traeDebugTime, traceOf,
+  traeDebugLine, traeDebugTime, traceOf, traeAppName, isCnHost, TRAE_APP_VERSION,
 } from '../lib/testing.mjs'
 
 test('catalog: the built-in table matches the live catalog it was synced with', () => {
@@ -1704,9 +1704,19 @@ test('support line: Trae\'s own copy format, with no_* where the raw endpoint ha
   // those fields keep the format's own placeholders rather than invented ids.
   assert.equal(traeDebugLine({
     sessionId: 'c0ffee00-1111-5222-8333-444455556666',
-    appName: 'codex_exec',
-    appVersion: '0.206.1-tob',
-  }), 'no_uid:no_trace_c0ffee00-1111-5222-8333-444455556666.no_mid.no_mid:codex_exec.0.206.1-tob.no_sid.no_ppe')
+    appName: traeAppName(true),
+    appVersion: TRAE_APP_VERSION,
+  }), 'no_uid:no_trace_c0ffee00-1111-5222-8333-444455556666.no_mid.no_mid:TraeWork CN.0.1.61.no_sid.no_ppe')
+
+  // The client's own naming rule, both branches of both conditions.
+  assert.equal(traeAppName(true), 'TraeWork CN')
+  assert.equal(traeAppName(true, true), 'TraeCode CN')
+  assert.equal(traeAppName(false), 'TraeWork')
+  assert.equal(traeAppName(false, true), 'TraeCode')
+  // CN is read off the host the turn ran against.
+  assert.equal(isCnHost('https://api.enterprise.trae.cn'), true)
+  assert.equal(isCnHost('https://api.trae.ai'), false)
+  assert.equal(isCnHost('api.enterprise.trae.cn'), true)
 
   // A region prefixes the line, as it does for a non-CN account.
   assert.match(traeDebugLine({ region: 'sg', userId: '42', sessionId: 's', appName: 'a', appVersion: '1' }), /^sg\.42:/)

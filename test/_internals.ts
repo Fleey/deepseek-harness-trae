@@ -10,7 +10,7 @@ export {
   sessionUuid, conversationUuid, classify, httpCode, approxTokens, toTraeTools, normalizeToolSchema, normalizeToolSchemas,
 } from '../src/trae/wire.ts'
 export { decodeJwt, parseExpiry } from '../src/trae/auth.ts'
-export { traeDebugLine, traeDebugTime, traceOf, DEBUG_MISSING } from '../src/trae/debug.ts'
+export { traeDebugLine, traeDebugTime, traceOf, traeAppName, isCnHost, DEBUG_MISSING, TRAE_APP_VERSION } from '../src/trae/debug.ts'
 export { TraeAdapter, effortFor } from '../src/adapter.ts'
 export { parseQuota, TraeQuota, QUOTA_PATHS, enterpriseTenant } from '../src/trae/quota.ts'
 export { parseTobQuota, TobConsole, TOB_LOGIN_PATH, TOB_QUOTA_PATH, TOB_USAGE_PATH, TOB_SESSION_COOKIE } from '../src/trae/tob.ts'
