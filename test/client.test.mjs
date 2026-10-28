@@ -6,7 +6,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 
 /** Slot kinds as the host declares them (dsh-client-ui-conversation / settings). */
-const LIST_SLOTS = new Set(['conversation.input.right', 'conversation.input.dock'])
+const LIST_SLOTS = new Set(['conversation.input.right', 'conversation.input.dock', 'conversation.composer.dock'])
 const KEYED_SLOTS = new Set(['plugins.bundle.config', 'settings.models.provider-card'])
 
 function loadClient(react = { createElement: () => null }) {
@@ -55,10 +55,13 @@ test('client: every slot registration passes the host registry rules', () => {
   const ids = name => registered.filter(r => r.name === name).map(r => r.id)
   assert.equal(byName['conversation.input.dock'].id, 'trae-choices')
   assert.equal(byName['conversation.input.overlay'], undefined, 'no Tab ghost text any more')
-  // Three entries beside the model picker, each with its own id: the quota
-  // chip, this session's id, and the "switching reopens the upstream
-  // conversation" notice.
-  assert.deepEqual(ids('conversation.input.right'), ['trae-quota', 'trae-session', 'trae-switch'])
+  // Two entries beside the model picker: the quota chip and the "switching
+  // reopens the upstream conversation" notice.
+  assert.deepEqual(ids('conversation.input.right'), ['trae-quota', 'trae-switch'])
+  // The session id is a stat, so it goes in the row under the composer, after
+  // the host's own `activity` (0) and `usage` (1) entries.
+  assert.deepEqual(ids('conversation.composer.dock'), ['trae-session'])
+  assert.equal(byName['conversation.composer.dock'].order, 2)
   assert.ok(byName['plugins.bundle.config'] && byName['settings.models.provider-card'])
 })
 
@@ -281,7 +284,7 @@ const UPSTREAM = 'c0ffee00-1111-5222-8333-444455556666'
  * on the clipboard. The clipboard and `fetch` are stubbed for the call and put
  * back after it.
  */
-async function renderSessionChip(value, { alt = false, provider = 'trae' } = {}) {
+async function renderSessionChip(value, { alt = false, provider = 'trae', sessionId = SESSION } = {}) {
   const cells = []
   let cursor = 0
   let effects = []
@@ -323,7 +326,7 @@ async function renderSessionChip(value, { alt = false, provider = 'trae' } = {})
     effects = []
     return Chip({
       t: key => zh[key],
-      sessionId: SESSION,
+      sessionId,
       useTraeModel: select => select({ current: { provider, modelId: 'GLM-5.3' } }),
     })
   }
@@ -333,17 +336,23 @@ async function renderSessionChip(value, { alt = false, provider = 'trae' } = {})
     await settle()
     // Nothing to show for another provider's session: no chip, no request.
     if (!first) return { node: null, asked, copied }
+    // The pill is the host's own stat shape: an anchor span, a tooltip, then
+    // the button with its icon and label.
     const node = render()
-    const button = node.children[0]
+    const tooltip = node.children[0]
+    const button = tooltip.children[0]
+    const label = button.children.find(child => child?.props?.className === 'trae-stat-label')
     // Effects of this render are left unrun, so the "copied" timer never starts.
     button.props.onClick({ altKey: alt })
     await settle()
     return {
       node,
-      text: button.children[0],
+      stat: node.props['data-composer-stat'],
+      text: label.children[0],
       label: button.props['aria-label'],
-      lines: node.props.label.children[0].split('\n'),
-      after: render().children[0].children[0],
+      lines: tooltip.props.label.children[0].split('\n'),
+      after: render().children[0].children[0].children
+        .find(child => child?.props?.className === 'trae-stat-label').children[0],
       asked,
       copied,
     }
@@ -360,6 +369,8 @@ test('session chip: the session id, the upstream chat behind it, and a click tha
   // The chip is short; the whole id is in the tooltip and on the clipboard.
   assert.equal(ran.text, 'ID f3a9c1d2')
   assert.equal(ran.label, `当前会话 ID ${SESSION}，点击复制`)
+  // It carries its id the way the host's own stats do, so the row treats it as one.
+  assert.equal(ran.stat, 'trae-session')
   assert.deepEqual(ran.lines, [
     `会话 ID：${SESSION}`,
     `上游会话：${UPSTREAM}（GLM-5.3 · high）`,
@@ -385,6 +396,14 @@ test('session chip: the session id, the upstream chat behind it, and a click tha
   }, { alt: true })
   assert.equal(fresh.lines[1], '上游会话：这条会话还没发过一轮，发一轮就有了')
   assert.deepEqual(fresh.copied, [SESSION])
+
+  // A harness id is a fixed word plus a UUID, and the word tells two sessions
+  // apart from nothing: the chip skips it and shows the part that does.
+  const prefixed = await renderSessionChip({
+    session: 'session-9c2f9c16-a6fd-4104-a01f-5a225d1daab4', conversation: UPSTREAM, model: 'GLM-5.3', effort: null, at: 1,
+  }, { sessionId: 'session-9c2f9c16-a6fd-4104-a01f-5a225d1daab4' })
+  assert.equal(prefixed.text, 'ID 9c2f9c16')
+  assert.deepEqual(prefixed.copied, ['session-9c2f9c16-a6fd-4104-a01f-5a225d1daab4'])
 
   // Another provider's session is none of this plugin's business.
   const other = await renderSessionChip({ session: SESSION }, { provider: 'deepseek' })

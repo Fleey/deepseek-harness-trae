@@ -251,7 +251,9 @@ python3 -I tools/probe_catalog.py
 
 ## 会话 ID（查看 / 复制）
 
-选中 Trae 模型时，**对话框右下角额度徽标旁边**会多一个 `ID xxxxxxxx` 的小徽标，显示当前会话 ID 的前 8 位：
+选中 Trae 模型时，**输入框下面那行统计**（「N 轮 N 步 · tok/s」「token 总量 · 缓存命中」「上下文百分比」那一行）
+里会多一个 `ID xxxxxxxx`，和宿主自己的统计长一个样（同样的图标 + 文字、同样的悬停底色）。显示的是会话 ID 里
+真正能区分会话的那 8 位——`session-` 这种每条会话都一样的前缀会跳过：
 
 - **鼠标悬停**：完整的会话 ID、这条会话上一轮跑在哪条上游会话里（后面括号写明用的模型和思考档位），
   以及复制提示。
@@ -266,7 +268,9 @@ conversation（见 `conversationUuid`），所以上游那条 ID 是从会话 ID
 实现方式：宿主端记住最近 64 条会话各自上一轮的变体和上游 ID，经同样走登录态隔离的
 `/api/dsh-trae2api/session?session=<会话 ID>` 路由给浏览器端，返回
 `{ session, conversation, model, effort, at }`；还没发过一轮的会话 `conversation` 为 `null`。
-浏览器端在挂载、换模型／档位、一轮结束和每次点击时各读一次，不轮询。
+浏览器端在挂载、换模型／档位、一轮结束和每次点击时各读一次，不轮询。徽标挂在输入框下方统计行那个插槽
+（`conversation.composer.dock`，宿主自己的 `activity` 排 0、`usage` 排 1，这个排 2），
+带 `data-composer-stat="trae-session"`，样式用宿主的设计变量，跟着亮色 / 暗色主题走。
 
 > 剪贴板优先用 `navigator.clipboard`，拿不到权限（非安全来源之类）时退回老的选区复制；
 > 两条都失败时悬停提示会改成「复制失败」，ID 仍然可以从提示里手抄。
