@@ -30,26 +30,44 @@ function loadClient(react = { createElement: () => null }) {
   return module.factory((name) => stubs[name] ?? {})
 }
 
-test('client: every slot registration passes the host registry rules', () => {
-  const plugin = loadClient()
+/**
+ * A stub host context carrying the services this client injects. `inject`
+ * hands back the context itself, so a nested injection — the sidebar tab
+ * inside the model-directory scope — reaches the same recorders.
+ */
+function hostCtx({ register = () => {}, openTab = () => {}, locale = () => {} } = {}) {
   const registered = []
+  const tabTypes = []
+  let dictionaries
   const slots = {
     inject: (_name, fn) => { fn(); return () => {} },
-    register: (options) => {
-      if (LIST_SLOTS.has(options.name) && !options.id) throw new Error(`list slot "${options.name}" requires options.id`)
-      if (KEYED_SLOTS.has(options.name) && !options.key) throw new Error(`keyed slot "${options.name}" requires options.key`)
-      registered.push(options)
-      return () => {}
-    },
+    register: (options, component) => { registered.push(options); register(options, component); return () => {} },
   }
   const ctx = {
     slots,
-    locale: { register: () => () => {} },
+    locale: {
+      register: (_ns, dicts) => { dictionaries = dicts; locale(dicts); return () => {} },
+      bind: () => key => dictionaries?.zh?.[key] ?? key,
+    },
     remote: { $on: () => () => {}, credentials: { describe: async () => ({ ok: false }) } },
     configForms: { get: () => ({ getSnapshot: () => ({}), subscribe: () => () => {} }), whileServed: (_ns, fn) => fn() },
     effect: (fn) => { fn() },
-    inject: (_deps, cb) => { cb({ slots, modelDirectories: {} }) },
+    modelDirectories: {},
+    sidebarRight: { openTab },
+    sidebarRightTabs: { register: (definition) => { tabTypes.push(definition); return () => {} } },
+    inject: (_deps, cb) => { cb(ctx) },
   }
+  return { ctx, registered, tabTypes }
+}
+
+test('client: every slot registration passes the host registry rules', () => {
+  const plugin = loadClient()
+  const { ctx, registered, tabTypes } = hostCtx({
+    register: (options) => {
+      if (LIST_SLOTS.has(options.name) && !options.id) throw new Error(`list slot "${options.name}" requires options.id`)
+      if (KEYED_SLOTS.has(options.name) && !options.key) throw new Error(`keyed slot "${options.name}" requires options.key`)
+    },
+  })
   plugin.apply(ctx)
   const byName = Object.fromEntries(registered.map(r => [r.name, r]))
   const ids = name => registered.filter(r => r.name === name).map(r => r.id)
@@ -58,10 +76,19 @@ test('client: every slot registration passes the host registry rules', () => {
   // Two entries beside the model picker: the quota chip and the "switching
   // reopens the upstream conversation" notice.
   assert.deepEqual(ids('conversation.input.right'), ['trae-quota', 'trae-switch'])
-  // The session id is a stat, so it goes in the row under the composer, after
-  // the host's own `activity` (0) and `usage` (1) entries.
-  assert.deepEqual(ids('conversation.composer.dock'), ['trae-session'])
-  assert.equal(byName['conversation.composer.dock'].order, 2)
+  // The session ids are a tab of their own, not a composer reading.
+  assert.equal(byName['conversation.composer.dock'], undefined)
+  // Stage one of a tab type: a page type, opened by kind, named for the user.
+  assert.equal(tabTypes.length, 1)
+  assert.equal(tabTypes[0].kind, 'trae-session')
+  assert.equal(tabTypes[0].id, 'dsh-trae2api/session')
+  assert.equal(tabTypes[0].priority, 'extension')
+  assert.equal(tabTypes[0].patterns, undefined, 'a page type matches no resource address')
+  assert.equal(tabTypes[0].title(), '会话 ID')
+  // Stage two: its body registers under that same id, and the way in is one
+  // session-header utility.
+  assert.equal(byName['sidebar.right.pane.tab'].key, tabTypes[0].id)
+  assert.deepEqual(ids('conversation.session.header.utilities'), ['trae-session'])
   assert.ok(byName['plugins.bundle.config'] && byName['settings.models.provider-card'])
 })
 
@@ -80,18 +107,11 @@ function renderChip(value) {
   const plugin = loadClient(react)
   let Chip
   let zh
-  const slots = {
-    inject: (_name, fn) => { fn(); return () => {} },
-    register: (options, component) => { if (options.id === 'trae-quota') Chip = component; return () => {} },
-  }
-  plugin.apply({
-    slots,
-    locale: { register: (_ns, dicts) => { zh = dicts.zh; return () => {} } },
-    remote: { $on: () => () => {}, credentials: { describe: async () => ({ ok: false }) } },
-    configForms: { get: () => ({ getSnapshot: () => ({}), subscribe: () => () => {} }), whileServed: (_ns, fn) => fn() },
-    effect: (fn) => { fn() },
-    inject: (_deps, cb) => { cb({ slots, modelDirectories: {} }) },
+  const { ctx } = hostCtx({
+    register: (options, component) => { if (options.id === 'trae-quota') Chip = component },
+    locale: (dicts) => { zh = dicts.zh },
   })
+  plugin.apply(ctx)
   const node = Chip({
     t: key => zh[key],
     useTraeModel: select => select({ current: { provider: 'trae' } }),
@@ -225,18 +245,11 @@ function renderNotice(selections) {
   }
   const plugin = loadClient(react)
   let Notice, zh
-  const slots = {
-    inject: (_name, fn) => { fn(); return () => {} },
-    register: (options, component) => { if (options.id === 'trae-switch') Notice = component; return () => {} },
-  }
-  plugin.apply({
-    slots,
-    locale: { register: (_ns, dicts) => { zh = dicts.zh; return () => {} } },
-    remote: { $on: () => () => {}, credentials: { describe: async () => ({ ok: false }) } },
-    configForms: { get: () => ({ getSnapshot: () => ({}), subscribe: () => () => {} }), whileServed: (_ns, fn) => fn() },
-    effect: (fn) => { fn() },
-    inject: (_deps, cb) => { cb({ slots, modelDirectories: {} }) },
+  const { ctx } = hostCtx({
+    register: (options, component) => { if (options.id === 'trae-switch') Notice = component },
+    locale: (dicts) => { zh = dicts.zh },
   })
+  plugin.apply(ctx)
   const timeout = globalThis.setTimeout
   const clear = globalThis.clearTimeout
   globalThis.setTimeout = () => 0
@@ -278,13 +291,15 @@ test('switch notice: quiet until the picked model or level moves, and only for T
 const SESSION = 'f3a9c1d2-7b44-4e55-9a66-0b1122334455'
 const UPSTREAM = 'c0ffee00-1111-5222-8333-444455556666'
 
+const SUPPORT = `312308224:2026102815494900_${UPSTREAM}.no_mid.no_mid:codex_exec.0.206.1-tob.no_sid.no_ppe.T(2026/10/28 15:49:49)`
+
 /**
- * Render the session-id chip against one answer from the host's session route,
- * running its effect the way React would, then click it and report what landed
- * on the clipboard. The clipboard and `fetch` are stubbed for the call and put
- * back after it.
+ * Render the session-ids tab (or the header button that opens it) against one
+ * answer from the host's session route, running effects the way React would,
+ * then press the row's copy button and report what landed on the clipboard.
+ * The clipboard and `fetch` are stubbed for the call and put back after it.
  */
-async function renderSessionChip(value, { alt = false, shift = false, provider = 'trae', sessionId = SESSION } = {}) {
+async function renderSessionTab(value, { provider = 'trae', sessionId = SESSION, copyRow = 0 } = {}) {
   const cells = []
   let cursor = 0
   let effects = []
@@ -298,19 +313,17 @@ async function renderSessionChip(value, { alt = false, shift = false, provider =
     useEffect: (fn) => { effects.push(fn) },
   }
   const plugin = loadClient(react)
-  let Chip, zh
-  const slots = {
-    inject: (_name, fn) => { fn(); return () => {} },
-    register: (options, component) => { if (options.id === 'trae-session') Chip = component; return () => {} },
-  }
-  plugin.apply({
-    slots,
-    locale: { register: (_ns, dicts) => { zh = dicts.zh; return () => {} } },
-    remote: { $on: () => () => {}, credentials: { describe: async () => ({ ok: false }) } },
-    configForms: { get: () => ({ getSnapshot: () => ({}), subscribe: () => () => {} }), whileServed: (_ns, fn) => fn() },
-    effect: (fn) => { fn() },
-    inject: (_deps, cb) => { cb({ slots, modelDirectories: {} }) },
+  let Tab, Button, buttonEntry, zh
+  const opened = []
+  const { ctx } = hostCtx({
+    register: (options, component) => {
+      if (options.key === 'dsh-trae2api/session') Tab = component
+      if (options.name === 'conversation.session.header.utilities') { Button = component; buttonEntry = options }
+    },
+    openTab: kind => { opened.push(kind) },
+    locale: (dicts) => { zh = dicts.zh },
   })
+  plugin.apply(ctx)
   const asked = []
   const copied = []
   const realFetch = globalThis.fetch
@@ -321,38 +334,49 @@ async function renderSessionChip(value, { alt = false, shift = false, provider =
     configurable: true,
     value: { clipboard: { writeText: async (text) => { copied.push(text) } } },
   })
-  const render = () => {
+  // The button's own `openTab` comes from the registration, so what the test
+  // presses is the wiring the host would use.
+  const props = {
+    t: key => zh[key],
+    sessionId,
+    useTraeModel: select => select({ current: { provider, modelId: 'GLM-5.3' } }),
+    openTab: buttonEntry.inject(sessionId).openTab,
+  }
+  const render = (Component) => {
     cursor = 0
     effects = []
-    return Chip({
-      t: key => zh[key],
-      sessionId,
-      useTraeModel: select => select({ current: { provider, modelId: 'GLM-5.3' } }),
-    })
+    return Component(props)
   }
   try {
-    const first = render()
+    const button = render(Button)
+    // The whole tab is rendered row by row: the recorder leaves child
+    // components uncalled, so each row is rendered the way React would.
+    render(Tab)
     for (const effect of effects) effect()
     await settle()
-    // Nothing to show for another provider's session: no chip, no request.
-    if (!first) return { node: null, asked, copied }
-    // The pill is the host's own stat shape: an anchor span, a tooltip, then
-    // the button with its icon and label.
-    const node = render()
-    const tooltip = node.children[0]
-    const button = tooltip.children[0]
-    const label = button.children.find(child => child?.props?.className === 'trae-stat-label')
-    // Effects of this render are left unrun, so the "copied" timer never starts.
-    button.props.onClick({ altKey: alt, shiftKey: shift })
+    const tab = render(Tab)
+    const rows = tab.children.filter(child => child && typeof child.type === 'function').map((row) => {
+      cursor = 0
+      effects = []
+      const node = row.type(row.props)
+      const head = node.children[0]
+      const body = node.children[1]
+      return {
+        label: head.children[0].children[0],
+        copy: head.children[1],
+        value: body.props.className === 'trae-id-value' ? body.children[0] : null,
+        empty: body.props.className === 'trae-id-empty' ? body.children[0] : null,
+        hint: node.children[2]?.children?.[0] ?? null,
+      }
+    })
+    const pressed = rows[copyRow]
+    if (pressed.copy) pressed.copy.props.onClick()
     await settle()
     return {
-      node,
-      stat: node.props['data-composer-stat'],
-      text: label.children[0],
-      label: button.props['aria-label'],
-      lines: tooltip.props.label.children[0].split('\n'),
-      after: render().children[0].children[0].children
-        .find(child => child?.props?.className === 'trae-stat-label').children[0],
+      // The header button renders nothing at all outside a Trae session.
+      button: button === null ? null : button.children[0],
+      openedBy: () => { button.children[0].props.onClick(); return opened },
+      rows,
       asked,
       copied,
     }
@@ -362,64 +386,44 @@ async function renderSessionChip(value, { alt = false, shift = false, provider =
   }
 }
 
-const SUPPORT = `312308224:2026102815494900_${UPSTREAM}.no_mid.no_mid:codex_exec.0.206.1-tob.no_sid.no_ppe.T(2026/10/28 15:49:49)`
-
-test('session chip: the session id, the upstream chat behind it, and a click that copies', async () => {
-  const ran = await renderSessionChip({
+test('session tab: one row per id, each copied on its own, and no tab outside Trae', async () => {
+  const ran = await renderSessionTab({
     session: SESSION, conversation: UPSTREAM, model: 'GLM-5.3', effort: 'high', at: 1, debug: SUPPORT,
   })
-  // The chip is short; the whole id is in the tooltip and on the clipboard.
-  assert.equal(ran.text, 'ID f3a9c1d2')
-  assert.equal(ran.label, `当前会话 ID ${SESSION}，点击复制`)
-  // It carries its id the way the host's own stats do, so the row treats it as one.
-  assert.equal(ran.stat, 'trae-session')
-  assert.deepEqual(ran.lines, [
-    `会话 ID：${SESSION}`,
-    `上游会话：${UPSTREAM}（GLM-5.3 · high）`,
-    `排查串：${SUPPORT}`,
-    '点击复制会话 ID；Alt 点击复制上游会话 ID；Shift 点击复制排查串（Trae 客服那套格式）',
-  ])
+  assert.deepEqual(ran.rows.map(row => row.label), ['会话 ID', '上游会话', '排查串'])
+  assert.deepEqual(ran.rows.map(row => row.value), [SESSION, UPSTREAM, SUPPORT])
+  // The row says which variant that upstream chat belongs to.
+  assert.equal(ran.rows[1].hint, '上一轮跑在：GLM-5.3 · high')
   assert.equal(ran.asked[0], `api/dsh-trae2api/session?session=${SESSION}`)
+  // Pressing copy on the first row copies the whole session id, and re-reads:
+  // the other two move with every turn.
   assert.deepEqual(ran.copied, [SESSION])
-  assert.equal(ran.after, '已复制')
-  // A click also re-reads: the upstream id moves with the picked model.
   assert.equal(ran.asked.length, 2)
+  // The header button is the way in, and it opens this plugin's own tab kind.
+  assert.deepEqual(ran.openedBy(), ['trae-session'])
 
-  // Alt copies the upstream id — what an upstream complaint is about.
-  const altClick = await renderSessionChip({
-    session: SESSION, conversation: UPSTREAM, model: 'Kimi-K3', effort: null, at: 1,
-  }, { alt: true })
-  assert.equal(altClick.lines[1], `上游会话：${UPSTREAM}（Kimi-K3）`)
-  assert.deepEqual(altClick.copied, [UPSTREAM])
-
-  // Shift copies the whole support line, the one Trae's own client hands out.
-  const shifted = await renderSessionChip({
+  const upstreamRow = await renderSessionTab({
+    session: SESSION, conversation: UPSTREAM, model: 'Kimi-K3', effort: null, at: 1, debug: SUPPORT,
+  }, { copyRow: 1 })
+  assert.deepEqual(upstreamRow.copied, [UPSTREAM])
+  assert.equal(upstreamRow.rows[1].hint, '上一轮跑在：Kimi-K3')
+  const supportRow = await renderSessionTab({
     session: SESSION, conversation: UPSTREAM, model: 'GLM-5.3', effort: 'high', at: 1, debug: SUPPORT,
-  }, { shift: true })
-  assert.deepEqual(shifted.copied, [SUPPORT])
+  }, { copyRow: 2 })
+  assert.deepEqual(supportRow.copied, [SUPPORT])
 
-  // Before the first answer there is no upstream chat and no support line, so
-  // both modifiers fall back to the one id that does exist, and the tooltip
-  // has no support row to show.
-  const fresh = await renderSessionChip({
+  // Before the first answer there is no upstream chat and no support line: the
+  // rows say so instead of offering an empty copy.
+  const fresh = await renderSessionTab({
     session: SESSION, conversation: null, model: null, effort: null, at: null, debug: null,
-  }, { alt: true, shift: true })
-  assert.equal(fresh.lines.length, 3)
-  assert.equal(fresh.lines[1], '上游会话：这条会话还没发过一轮，发一轮就有了')
-  assert.deepEqual(fresh.copied, [SESSION])
+  }, { copyRow: 1 })
+  assert.deepEqual(fresh.rows.map(row => row.empty), [null, '这条会话还没发过一轮，发一轮就有了', '这条会话还没发过一轮，发一轮就有了'])
+  assert.deepEqual(fresh.rows.map(row => row.copy === null), [false, true, true])
+  assert.deepEqual(fresh.copied, [])
 
-  // A harness id is a fixed word plus a UUID, and the word tells two sessions
-  // apart from nothing: the chip skips it and shows the part that does.
-  const prefixed = await renderSessionChip({
-    session: 'session-9c2f9c16-a6fd-4104-a01f-5a225d1daab4', conversation: UPSTREAM, model: 'GLM-5.3', effort: null, at: 1,
-  }, { sessionId: 'session-9c2f9c16-a6fd-4104-a01f-5a225d1daab4' })
-  assert.equal(prefixed.text, 'ID 9c2f9c16')
-  assert.deepEqual(prefixed.copied, ['session-9c2f9c16-a6fd-4104-a01f-5a225d1daab4'])
-
-  // Another provider's session is none of this plugin's business.
-  const other = await renderSessionChip({ session: SESSION }, { provider: 'deepseek' })
-  assert.equal(other.node, null)
-  assert.deepEqual(other.asked, [])
+  // Another provider's session gets no way in at all.
+  const other = await renderSessionTab({ session: SESSION }, { provider: 'deepseek' })
+  assert.equal(other.button, null)
 })
 
 /**
@@ -444,18 +448,11 @@ function renderCards({ cards, dismissed = [], subagent = false, running = false,
   }
   const plugin = loadClient(react)
   let Cards, entry, zh
-  const slots = {
-    inject: (_name, fn) => { fn(); return () => {} },
-    register: (options, component) => { if (options.id === 'trae-choices') { Cards = component; entry = options } return () => {} },
-  }
-  plugin.apply({
-    slots,
-    locale: { register: (_ns, dicts) => { zh = dicts.zh; return () => {} } },
-    remote: { $on: () => () => {}, credentials: { describe: async () => ({ ok: false }) } },
-    configForms: { get: () => ({ getSnapshot: () => ({}), subscribe: () => () => {} }), whileServed: (_ns, fn) => fn() },
-    effect: (fn) => { fn() },
-    inject: (_deps, cb) => { cb({ slots, modelDirectories: {} }) },
+  const { ctx } = hostCtx({
+    register: (options, component) => { if (options.id === 'trae-choices') { Cards = component; entry = options } },
+    locale: (dicts) => { zh = dicts.zh },
   })
+  plugin.apply(ctx)
   const injected = entry.inject('s1')
   const store = injected.hooks.traeChoices
   store.set({ id: 'sug-1', cards, dismissed, subagent })
