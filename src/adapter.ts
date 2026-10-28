@@ -105,6 +105,24 @@ export interface AttachmentStoreLike {
   ): Promise<{ data: Uint8Array; mediaType: string; bytes: number; width: number; height: number }>
 }
 
+/**
+ * What a harness session's last agent-loop turn ran on, as the session-id
+ * route reports it. One harness session holds one upstream conversation per
+ * model variant and thinking level (wire.ts `conversationUuid`), so the
+ * upstream id cannot be derived from the harness session id alone — it is the
+ * one the last turn actually sent.
+ */
+export interface SessionTurn {
+  /** Upstream conversation id (sent as both `session_id` and `conversation_id`). */
+  conversation: string
+  /** Picker id of the model that turn ran on. */
+  model: string
+  /** Thinking level sent with it, if any. */
+  effort?: TraeEffort
+  /** When that turn started, in ms. */
+  at: number
+}
+
 const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms))
 
 type ImageBlock = Extract<ContentBlock, { type: 'image' }>
@@ -219,8 +237,8 @@ function usageOf(data: Record<string, unknown>): TokenUsage {
 }
 
 export class TraeAdapter extends LlmAdapter {
-  /** Last variant each session ran a main-loop turn on: `{ key, label }`. */
-  private readonly variants = new Map<string, { key: string; label: string }>()
+  /** Last variant each session ran a main-loop turn on, with that turn's upstream ids. */
+  private readonly variants = new Map<string, { key: string; label: string } & SessionTurn>()
 
   constructor(private readonly opts: AdapterOptions) {
     super()
@@ -316,10 +334,14 @@ export class TraeAdapter extends LlmAdapter {
    * carries no server-side state from the previous model or level and pays
    * full prompt price before the cache builds up again.
    */
-  private noteVariant(sessionId: string, route: TraeRoute, effort: TraeEffort | undefined): void {
+  private noteVariant(sessionId: string, route: TraeRoute, effort: TraeEffort | undefined, conversation: string): void {
     const current = {
       key: `${route.key}\u0000${effort ?? ''}`,
       label: effort ? `${route.id}（${EFFORT_NAMES[effort]}）` : route.id,
+      conversation,
+      model: route.id,
+      ...effort ? { effort } : {},
+      at: Date.now(),
     }
     const previous = this.variants.get(sessionId)
     // Re-inserted so the map stays in least-recently-used order.
@@ -331,6 +353,24 @@ export class TraeAdapter extends LlmAdapter {
       `dsh-trae2api: 这条会话换了模型或思考档位（${previous.label} → ${current.label}），`
       + '本轮起开新的上游会话：上游按会话绑定模型，旧会话的服务端状态和 prompt 缓存都不再沿用。',
     )
+  }
+
+  /**
+   * Which upstream conversation a harness session's last agent-loop turn ran
+   * in, and on what. Only those turns are remembered — a title or compaction
+   * request runs under its own id and would say nothing about the chat — and
+   * only the most recent `TRACKED_SESSIONS` of them; everything else, and a
+   * session that has not answered yet, reads as nothing.
+   */
+  sessionInfo(sessionId: string): SessionTurn | undefined {
+    const current = this.variants.get(sessionId)
+    if (!current) return undefined
+    return {
+      conversation: current.conversation,
+      model: current.model,
+      ...current.effort ? { effort: current.effort } : {},
+      at: current.at,
+    }
   }
 
   /** One POST; yields decoded events. Retries once with a fresh JWT on 401/403. */
@@ -464,7 +504,7 @@ export class TraeAdapter extends LlmAdapter {
     const mainLoop = options.sessionId !== undefined && options.purpose === undefined && (options.tools?.length ?? 0) > 0
     if (mainLoop) {
       this.opts.onTurnStart?.(String(options.sessionId))
-      this.noteVariant(String(options.sessionId), route, effort)
+      this.noteVariant(String(options.sessionId), route, effort, session)
     }
     // Text-only routes keep the [image omitted] note even if an image slipped
     // through: upstream answers a text-only model handed an image with

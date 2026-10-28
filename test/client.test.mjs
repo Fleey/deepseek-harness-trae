@@ -55,9 +55,10 @@ test('client: every slot registration passes the host registry rules', () => {
   const ids = name => registered.filter(r => r.name === name).map(r => r.id)
   assert.equal(byName['conversation.input.dock'].id, 'trae-choices')
   assert.equal(byName['conversation.input.overlay'], undefined, 'no Tab ghost text any more')
-  // Two entries beside the model picker, each with its own id: the quota chip
-  // and the "switching reopens the upstream conversation" notice.
-  assert.deepEqual(ids('conversation.input.right'), ['trae-quota', 'trae-switch'])
+  // Three entries beside the model picker, each with its own id: the quota
+  // chip, this session's id, and the "switching reopens the upstream
+  // conversation" notice.
+  assert.deepEqual(ids('conversation.input.right'), ['trae-quota', 'trae-session', 'trae-switch'])
   assert.ok(byName['plugins.bundle.config'] && byName['settings.models.provider-card'])
 })
 
@@ -269,6 +270,126 @@ test('switch notice: quiet until the picked model or level moves, and only for T
   assert.deepEqual(renderNotice([glm, { provider: 'deepseek', modelId: 'deepseek-chat' }]), [null, null])
   // A selection this plugin cannot read keeps it quiet rather than guessing.
   assert.deepEqual(renderNotice([null, glm]), [null, null])
+})
+
+const SESSION = 'f3a9c1d2-7b44-4e55-9a66-0b1122334455'
+const UPSTREAM = 'c0ffee00-1111-5222-8333-444455556666'
+
+/**
+ * Render the session-id chip against one answer from the host's session route,
+ * running its effect the way React would, then click it and report what landed
+ * on the clipboard. The clipboard and `fetch` are stubbed for the call and put
+ * back after it.
+ */
+async function renderSessionChip(value, { alt = false, provider = 'trae' } = {}) {
+  const cells = []
+  let cursor = 0
+  let effects = []
+  const react = {
+    createElement: (type, props, ...children) => ({ type, props, children }),
+    useState: (initial) => {
+      const at = cursor++
+      if (!(at in cells)) cells[at] = initial
+      return [cells[at], (next) => { cells[at] = typeof next === 'function' ? next(cells[at]) : next }]
+    },
+    useEffect: (fn) => { effects.push(fn) },
+  }
+  const plugin = loadClient(react)
+  let Chip, zh
+  const slots = {
+    inject: (_name, fn) => { fn(); return () => {} },
+    register: (options, component) => { if (options.id === 'trae-session') Chip = component; return () => {} },
+  }
+  plugin.apply({
+    slots,
+    locale: { register: (_ns, dicts) => { zh = dicts.zh; return () => {} } },
+    remote: { $on: () => () => {}, credentials: { describe: async () => ({ ok: false }) } },
+    configForms: { get: () => ({ getSnapshot: () => ({}), subscribe: () => () => {} }), whileServed: (_ns, fn) => fn() },
+    effect: (fn) => { fn() },
+    inject: (_deps, cb) => { cb({ slots, modelDirectories: {} }) },
+  })
+  const asked = []
+  const copied = []
+  const realFetch = globalThis.fetch
+  const realNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  const settle = () => new Promise(resolve => setTimeout(resolve, 0))
+  globalThis.fetch = async (url) => { asked.push(String(url)); return Response.json({ ok: true, value }) }
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { clipboard: { writeText: async (text) => { copied.push(text) } } },
+  })
+  const render = () => {
+    cursor = 0
+    effects = []
+    return Chip({
+      t: key => zh[key],
+      sessionId: SESSION,
+      useTraeModel: select => select({ current: { provider, modelId: 'GLM-5.3' } }),
+    })
+  }
+  try {
+    const first = render()
+    for (const effect of effects) effect()
+    await settle()
+    // Nothing to show for another provider's session: no chip, no request.
+    if (!first) return { node: null, asked, copied }
+    const node = render()
+    const button = node.children[0]
+    // Effects of this render are left unrun, so the "copied" timer never starts.
+    button.props.onClick({ altKey: alt })
+    await settle()
+    return {
+      node,
+      text: button.children[0],
+      label: button.props['aria-label'],
+      lines: node.props.label.children[0].split('\n'),
+      after: render().children[0].children[0],
+      asked,
+      copied,
+    }
+  } finally {
+    globalThis.fetch = realFetch
+    if (realNavigator) Object.defineProperty(globalThis, 'navigator', realNavigator)
+  }
+}
+
+test('session chip: the session id, the upstream chat behind it, and a click that copies', async () => {
+  const ran = await renderSessionChip({
+    session: SESSION, conversation: UPSTREAM, model: 'GLM-5.3', effort: 'high', at: 1,
+  })
+  // The chip is short; the whole id is in the tooltip and on the clipboard.
+  assert.equal(ran.text, 'ID f3a9c1d2')
+  assert.equal(ran.label, `当前会话 ID ${SESSION}，点击复制`)
+  assert.deepEqual(ran.lines, [
+    `会话 ID：${SESSION}`,
+    `上游会话：${UPSTREAM}（GLM-5.3 · high）`,
+    '点击复制会话 ID；按住 Alt 点击复制上游会话 ID',
+  ])
+  assert.equal(ran.asked[0], `api/dsh-trae2api/session?session=${SESSION}`)
+  assert.deepEqual(ran.copied, [SESSION])
+  assert.equal(ran.after, '已复制')
+  // A click also re-reads: the upstream id moves with the picked model.
+  assert.equal(ran.asked.length, 2)
+
+  // Alt copies the upstream id — what an upstream complaint is about.
+  const altClick = await renderSessionChip({
+    session: SESSION, conversation: UPSTREAM, model: 'Kimi-K3', effort: null, at: 1,
+  }, { alt: true })
+  assert.equal(altClick.lines[1], `上游会话：${UPSTREAM}（Kimi-K3）`)
+  assert.deepEqual(altClick.copied, [UPSTREAM])
+
+  // Before the first answer there is no upstream chat yet, and Alt falls back
+  // to the one id that does exist.
+  const fresh = await renderSessionChip({
+    session: SESSION, conversation: null, model: null, effort: null, at: null,
+  }, { alt: true })
+  assert.equal(fresh.lines[1], '上游会话：这条会话还没发过一轮，发一轮就有了')
+  assert.deepEqual(fresh.copied, [SESSION])
+
+  // Another provider's session is none of this plugin's business.
+  const other = await renderSessionChip({ session: SESSION }, { provider: 'deepseek' })
+  assert.equal(other.node, null)
+  assert.deepEqual(other.asked, [])
 })
 
 /**
