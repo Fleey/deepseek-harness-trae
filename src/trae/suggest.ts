@@ -145,6 +145,7 @@ export const SUGGEST_SYSTEM = [
   `- "choices": 1 to ${MAX_CHOICES} answers, recommended first. They need not be yes/no — name the concrete options when there are several.`,
   '- "label": the button text, 1 to 6 words (at most ~10 Chinese characters).',
   '- "reply": the message sent when the button is pressed, written as the user, specific enough to act on by itself.',
+  '- A bare agreement is not a reply: never "改吧", "是的", "yes", "do it" or "the second one". Name the thing to do and where — "把 README 里过时的安装路径改成 DSH NEXT.app", not "改吧". The question above it is context the reply must not depend on.',
   '- Write everything in the same language the user writes in.',
   '',
   'Example — the answer reported an outdated install path and a missing note on when config changes apply:',

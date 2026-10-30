@@ -543,16 +543,31 @@ test('cards: one card per decision, the model\'s own answers as buttons, its pic
   assert.equal(eyebrowOf(cardsOf(renderCards({ cards: TWO_CARDS.slice(0, 1) }).node)[0]), '下一步')
 })
 
-test('cards: a button sends its reply as the next message and retires every card', () => {
+test('cards: a button sends its reply as the next message, under the question it answers', () => {
   const original = globalThis.fetch
   const events = []
   globalThis.fetch = async (_url, init) => { events.push(JSON.parse(init.body)); return Response.json({ ok: true }) }
   try {
     const { node, render, sent } = renderCards({ cards: TWO_CARDS })
     choiceButtonsOf(cardsOf(node)[0])[1].props.onClick()
-    assert.deepEqual(sent, [['draft', '先查一下实际的可执行文件名，再改路径'], ['submit']])
+    // The chat never saw the question — it came from a side completion — so the
+    // answer alone would leave the model guessing which decision it settles.
+    assert.deepEqual(sent, [
+      ['draft', '关于「要把 README 里过时的安装路径改掉吗？」：先查一下实际的可执行文件名，再改路径'],
+      ['submit'],
+    ])
     assert.deepEqual(events, [{ session: 's1', id: 'sug-1', action: 'accept', card: 0, choice: 1 }])
     assert.equal(render(), null)
+  } finally { globalThis.fetch = original }
+})
+
+test('cards: a card the model gave no question sends the reply as it is', () => {
+  const original = globalThis.fetch
+  globalThis.fetch = async () => Response.json({ ok: true })
+  try {
+    const { node, sent } = renderCards({ cards: [{ question: '', choices: [{ label: '跑测试', reply: '跑一下测试' }] }] })
+    choiceButtonsOf(cardsOf(node)[0])[0].props.onClick()
+    assert.deepEqual(sent, [['draft', '跑一下测试'], ['submit']])
   } finally { globalThis.fetch = original }
 })
 
@@ -571,6 +586,8 @@ test('cards: with the host delegating, a button sends the task to a subagent and
     const [[, text]] = sent
     assert.ok(text.startsWith('请开一个子会话来做下面这件事：'), text)
     assert.ok(text.includes('subagent 工具'))
+    // The child cannot see the chat at all, so the question travels as context.
+    assert.ok(text.includes('背景：上一轮结束时待定的问题是「要把 README 里过时的安装路径改掉吗？」。'), text)
     assert.ok(text.endsWith('任务：把 README 里过时的安装路径改成 DSH NEXT.app'), text)
     assert.deepEqual(sent[1], ['submit'])
     // Which button was pressed is reported as before: the wrapping is the composer's.
@@ -593,7 +610,7 @@ test('cards: the round can be switched back to this session, and sends the reply
   otherBoxOf(cardsOf(render())[0]).children[0].props.onKeyDown({
     key: 'Enter', shiftKey: false, keyCode: 0, nativeEvent: {}, preventDefault() {},
   })
-  assert.deepEqual(sent, [['draft', '先只改路径'], ['submit']])
+  assert.deepEqual(sent, [['draft', '关于「要把 README 里过时的安装路径改掉吗？」：先只改路径'], ['submit']])
 })
 
 test('cards: the host\'s own words travel with the task when it goes to a subagent', () => {
@@ -603,6 +620,7 @@ test('cards: the host\'s own words travel with the task when it goes to a subage
   box.children[0].props.onChange({ target: { value: '把安装路径和配置说明一起改掉', style: {}, scrollHeight: 44 } })
   otherBoxOf(cardsOf(render())[0]).children[1].props.onClick()
   assert.equal(sent.length, 2)
+  assert.ok(sent[0][1].includes('背景：上一轮结束时待定的问题是「要把 README 里过时的安装路径改掉吗？」。'), sent[0][1])
   assert.ok(sent[0][1].endsWith('任务：把安装路径和配置说明一起改掉'), sent[0][1])
 })
 
@@ -638,7 +656,7 @@ test('cards: "something else" opens a box on that card; Enter sends the user\'s 
     assert.deepEqual(sent, [])
 
     typed.props.onKeyDown(key('Enter'))
-    assert.deepEqual(sent, [['draft', '先只改路径，配置说明下次再补'], ['submit']])
+    assert.deepEqual(sent, [['draft', '关于「要补上配置何时生效的说明吗？」：先只改路径，配置说明下次再补'], ['submit']])
     assert.deepEqual(events, [], 'the user\'s own words are no suggestion of Trae\'s')
     assert.equal(render(), null, 'answered: every card is done')
   } finally { globalThis.fetch = original }
