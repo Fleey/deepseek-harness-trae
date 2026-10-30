@@ -160,7 +160,9 @@ window.__ModuleLoader__.load({
       choicesSubagentHint: '点按钮后交给子会话去做，不占当前会话的上下文，做完回来汇报。',
       choicesInlineHint: '点按钮后直接在当前会话里做。',
       choicesSubagentToggle: '切换由谁来做：子会话 / 当前会话',
-      choicesSubagentTask: '请开一个子会话来做下面这件事：用 subagent 工具把它派出去，你自己不要在当前会话里直接动手；子会话结束后把结果要点和改动过的文件告诉我。\n\n任务：{task}',
+      choicesPicked: '关于「{question}」：{reply}',
+      choicesSubagentTask: '请开一个子会话来做下面这件事：用 subagent 工具把它派出去，你自己不要在当前会话里直接动手；子会话结束后把结果要点和改动过的文件告诉我。\n\n{context}任务：{task}',
+      choicesSubagentContext: '背景：上一轮结束时待定的问题是「{question}」。',
     }
     const en = {
       title: 'Trae',
@@ -240,7 +242,9 @@ window.__ModuleLoader__.load({
       choicesSubagentHint: 'A button hands its task to a subagent: it stays out of this session\'s context and reports back when done.',
       choicesInlineHint: 'A button is done in this session, right here.',
       choicesSubagentToggle: 'Switch who does it: a subagent or this session',
-      choicesSubagentTask: 'Hand the task below to a subagent: delegate it with the subagent tool instead of doing it in this session, and tell me what it found and which files it changed once the child is done.\n\nTask: {task}',
+      choicesPicked: 'On "{question}": {reply}',
+      choicesSubagentTask: 'Hand the task below to a subagent: delegate it with the subagent tool instead of doing it in this session, and tell me what it found and which files it changed once the child is done.\n\n{context}Task: {task}',
+      choicesSubagentContext: 'Context: the question left open by your last answer was "{question}".',
     }
 
     /** Minimal uSES-compatible snapshot store — the shape slot `hooks` bind to. */
@@ -366,11 +370,17 @@ window.__ModuleLoader__.load({
         store.set({ ...store.getSnapshot(), cards: [], dismissed: [] })
       }
 
-      /** Button `choice` of card `card` pressed: every card is done. Returns that button's choice. */
+      /**
+       * Button `choice` of card `card` pressed: every card is done. Returns
+       * that button's choice with the question it answers — the message sent
+       * carries both, since the chat never saw the question (it comes from a
+       * side completion) and a reply like "改吧" means nothing without it.
+       */
       take(sessionId, card, choice) {
-        const picked = this.storeFor(sessionId).getSnapshot().cards[card]?.choices?.[choice]
+        const asked = this.storeFor(sessionId).getSnapshot().cards[card]
+        const picked = asked?.choices?.[choice]
         if (picked) this.close(sessionId)
-        return picked
+        return picked ? { ...picked, question: asked.question ?? '' } : picked
       }
     }
 
@@ -1265,25 +1275,39 @@ window.__ModuleLoader__.load({
       if (!visible) return null
       const toSubagent = delegate ?? choices.subagent === true
       // The editor applies a draft as one discrete update, so submit already reads it.
-      // A delegated task travels as the message asking for it: the host has no
-      // way to start a child of its own for an idle session.
-      const send = (text) => {
-        inputActions.setDraft(toSubagent ? t('choicesSubagentTask').replace('{task}', text) : text)
+      // The question goes out with the answer: it was asked by the side
+      // completion, so the chat itself never saw it, and "改吧" on its own
+      // leaves both this session and a subagent guessing which of the things
+      // the answer raised is meant. A delegated task travels as the message
+      // asking for it — the host has no way to start a child of its own for an
+      // idle session.
+      const send = (text, question) => {
+        const asked = (question ?? '').trim()
+        // One pass with a replacement function: a `$&` or a `{task}` inside the
+        // model's own words stays itself.
+        const fill = (key, values) => t(key)
+          .replace(/\{(\w+)\}/g, (whole, slot) => (slot in values ? values[slot] : whole))
+        const context = asked ? `${fill('choicesSubagentContext', { question: asked })}\n` : ''
+        inputActions.setDraft(toSubagent
+          ? fill('choicesSubagentTask', { context, task: text })
+          : asked ? fill('choicesPicked', { question: asked, reply: text }) : text)
         inputActions.submit()
       }
       const pick = (card, choice) => {
         const picked = props.take(card, choice)
         if (!picked) return
         reportSuggestion(sessionId, choices.id, 'accept', { card, choice })
-        send(picked.reply)
+        send(picked.reply, picked.question)
       }
-      // The user's own words are not one of the suggestions, so Cue hears nothing of them.
+      // The user's own words are not one of the suggestions, so Cue hears
+      // nothing of them; the card's question still travels with them.
       const sendOther = () => {
         const text = other?.text.trim()
         if (!text) return
+        const asked = choices.cards[other.card]?.question
         props.close()
         setOther(null)
-        send(text)
+        send(text, asked)
       }
       const onOtherKey = (event) => {
         if (event.nativeEvent?.isComposing || event.keyCode === 229) return

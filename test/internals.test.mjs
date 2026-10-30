@@ -992,6 +992,11 @@ test('suggestions: the prompt\'s worked example is two cards and survives the pa
   const { SUGGEST_SYSTEM, SUGGEST_EXAMPLE, parseSuggestions } = await import('../lib/testing.mjs')
   assert.equal(SUGGEST_EXAMPLE.length, 2, 'two separate problems, two cards')
   assert.ok(SUGGEST_SYSTEM.includes(JSON.stringify(SUGGEST_EXAMPLE)))
+  // Every example reply says what to do on its own; a bare "改吧" is ruled out.
+  assert.ok(SUGGEST_SYSTEM.includes('A bare agreement is not a reply'))
+  for (const card of SUGGEST_EXAMPLE) {
+    for (const choice of card.choices) assert.ok(choice.reply.length > choice.label.length, choice.reply)
+  }
   assert.deepEqual(parseSuggestions(JSON.stringify(SUGGEST_EXAMPLE)), SUGGEST_EXAMPLE)
 })
 
