@@ -10,8 +10,10 @@ test('config: only the PAT reference is user-facing, with a built-in default', (
   assert.equal(config.provider, 'trae')
   assert.equal(config.displayName, 'Trae')
   assert.equal(config.patEnv.get(), 'TRAE_PAT')
-  // Who does a next-step card is the settings card's to switch, so it is
-  // volatile like the PAT reference, on by default.
+  // Whether cards are offered at all, and who does one, are the settings
+  // card's to switch, so both are volatile like the PAT reference, on by default.
+  assert.equal(config.suggestions.get(), true)
+  assert.equal(plugin.Config({ suggestions: false }).suggestions.get(), false)
   assert.equal(config.suggestSubagent.get(), true)
   assert.equal(plugin.Config({ suggestSubagent: false }).suggestSubagent.get(), false)
   assert.equal(config.host, 'https://api.enterprise.trae.cn')

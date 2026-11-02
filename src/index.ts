@@ -96,8 +96,13 @@ export interface Config {
    * call; false leaves every such block in the answer as text.
    */
   recoverTextToolCalls: boolean
-  /** Offer next-step choices above the composer after each answer (yes sends one). */
-  suggestions: boolean
+  /**
+   * Offer next-step choices above the composer after each answer (yes sends
+   * one). Volatile: the settings card switches it, and the next turn follows
+   * without a restart. Off = no side completion runs at all, so a turn costs
+   * nothing extra and the composer gets nothing to show.
+   */
+  suggestions: Volatile<boolean>
   /** Model asked for suggestions; empty = the model that answered. */
   suggestModel: string
   suggestTimeoutMs: number
@@ -146,7 +151,8 @@ export const Config: Schema<Config> = Schema.object({
   loopGuardChars: Schema.natural().default(600),
   recoverTextToolCalls: Schema.boolean().default(true)
     .description('把模型写成 <invoke> 文本的工具调用恢复成真实调用（代码块里的、正文中间的一律不算）'),
-  suggestions: Schema.boolean().default(true),
+  suggestions: Schema.boolean().default(true).volatile()
+    .description('每轮回答后在输入框上方给出下一步卡片；关掉就一张也不生成，也不会多花那次侧边请求'),
   suggestModel: Schema.string().default(''),
   suggestTimeoutMs: Schema.natural().default(20_000),
   suggestSubagent: Schema.boolean().default(true).volatile()
@@ -262,7 +268,9 @@ export function apply(ctx: Context, config: Config): void {
   // GetUserInfo (the JWT does not carry it); a configured one only overrides
   // the id, never the account's privacy mode.
   const cueUserId = (config.cueUserId || process.env[CUE_USER_ID_ENV] || '').trim()
-  const cue = config.suggestions && config.reportCue
+  // Only suggestions produce Cue events, so the reporter follows `reportCue`
+  // alone: with the cards switched off nothing is ever recorded to report.
+  const cue = config.reportCue
     ? new TraeCueReporter({
       host, auth, appId: identity.appId, ideVersion: identity.ideVersion,
       ideVersionCode: identity.ideVersionCode, userAgent,
@@ -274,17 +282,17 @@ export function apply(ctx: Context, config: Config): void {
     : undefined
 
   // Next-input suggestions ride on the adapter: it reports finished turns and
-  // runs the side completion. `adapter` is assigned right below.
-  const suggestions = config.suggestions
-    ? new TraeSuggestions({
-      complete: (model, system, user, signal) => adapter.complete(model, system, user, signal),
-      model: config.suggestModel,
-      timeoutMs: config.suggestTimeoutMs,
-      subagent: () => config.suggestSubagent.get(),
-      ...cue ? { report: (events) => cue.report(events) } : {},
-      logger,
-    })
-    : undefined
+  // runs the side completion. `adapter` is assigned right below. Built either
+  // way and gated by `enabled`, so the switch works without a restart.
+  const suggestions = new TraeSuggestions({
+    complete: (model, system, user, signal) => adapter.complete(model, system, user, signal),
+    model: config.suggestModel,
+    timeoutMs: config.suggestTimeoutMs,
+    enabled: () => config.suggestions.get(),
+    subagent: () => config.suggestSubagent.get(),
+    ...cue ? { report: (events) => cue.report(events) } : {},
+    logger,
+  })
 
   const adapter: TraeAdapter = new TraeAdapter({
     displayName: config.displayName,
@@ -304,12 +312,8 @@ export function apply(ctx: Context, config: Config): void {
     resolveAttachments: () => {
       try { return anyCtx.get('attachments') as import('./adapter.ts').AttachmentStoreLike | undefined } catch { return undefined }
     },
-    ...suggestions
-      ? {
-        onTurnStart: (sessionId: string) => { suggestions.turnStarted(sessionId) },
-        onTurnEnd: turn => { suggestions.turnEnded(turn) },
-      }
-      : {},
+    onTurnStart: (sessionId: string) => { suggestions.turnStarted(sessionId) },
+    onTurnEnd: turn => { suggestions.turnEnded(turn) },
     logger,
   })
 
@@ -456,7 +460,8 @@ export function apply(ctx: Context, config: Config): void {
           const params = new URL(request.url).searchParams
           const sessionId = params.get('session') ?? ''
           const wait = Math.min(SUGGESTION_MAX_WAIT_MS, Math.max(0, Number(params.get('wait')) || 0))
-          const value = suggestions && sessionId ? await suggestions.get(sessionId, wait) : null
+          // `null` as well while the cards are switched off (see `enabled`).
+          const value = sessionId ? await suggestions.get(sessionId, wait) : null
           return Response.json({ ok: true, value })
         },
       })
@@ -483,7 +488,7 @@ export function apply(ctx: Context, config: Config): void {
             return Response.json({ ok: false, error: 'expected { session, id, action: "shown" | "accept", card, choice }' }, { status: 400 })
           }
           const pick = index(card) && index(choice) ? { card, choice } : undefined
-          const reported = suggestions ? await suggestions.record(session, id, action, pick) : false
+          const reported = await suggestions.record(session, id, action, pick)
           return Response.json({ ok: true, reported })
         },
       })
