@@ -3,6 +3,7 @@
   "version": "0.8.1",
   "description": "DeepSeek Harness plugin: use Trae enterprise models with just a Personal Access Token (direct llm_raw_chat, no trae2api/traecli).",
   "type": "module",
+  "icon": "icon.svg",
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
@@ -13,6 +14,7 @@
     "lib/index.js",
     "lib/client.js",
     "cordis.patch.yml",
+    "icon.svg",
     "README.md"
   ],
   "license": "MIT",

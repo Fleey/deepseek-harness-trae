@@ -2,6 +2,7 @@
 // SSE decoding, the repetition guard, and the text tool-call sniffer.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import * as plugin from '../lib/index.js'
 
 test('config: only the PAT reference is user-facing, with a built-in default', () => {
@@ -18,6 +19,16 @@ test('config: only the PAT reference is user-facing, with a built-in default', (
   // The model list is asked for, not shipped: upstream, then traecli's cache.
   assert.equal(config.catalogSource, 'auto')
   assert.equal(config.modelsCacheFile, '')
+})
+
+test('package: the plugin list shows its own icon, shipped with the package', () => {
+  // The host reads `icon` off package.json: a relative SVG/PNG/JPEG/WebP of at most 256 KiB.
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  assert.equal(pkg.icon, 'icon.svg')
+  assert.ok(pkg.files.includes(pkg.icon), 'packed with the plugin')
+  const icon = readFileSync(new URL(`../${pkg.icon}`, import.meta.url))
+  assert.ok(icon.length < 256 * 1024)
+  assert.match(icon.toString('utf8'), /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg" viewBox="0 0 64 64">/)
 })
 
 test('apply registers the provider route and a Models-page row', () => {
