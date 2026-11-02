@@ -867,6 +867,21 @@ test('cards: a folded round is not reported shown until it is opened', () => {
   } finally { globalThis.fetch = original }
 })
 
+test('settings: the card switches next-step cards on and off, as the host\'s suggestions', () => {
+  const forms = []
+  const plugin = loadClient(undefined, forms)
+  plugin.apply(hostCtx().ctx)
+  const [[, specs]] = forms
+  const spec = specs.find(s => s.field === 'suggestions')
+  assert.ok(spec, 'the card edits suggestions')
+  // Absent is the schema default — on — and so is a host too old to serve it.
+  assert.equal(spec.format(undefined), 'on')
+  assert.equal(spec.format(true), 'on')
+  assert.equal(spec.format(false), 'off')
+  assert.deepEqual(spec.parse('off'), { kind: 'set', value: false })
+  assert.deepEqual(spec.parse('on'), { kind: 'set', value: true })
+})
+
 test('settings: the card offers who does a next-step card by default, as the host\'s suggestSubagent', () => {
   const forms = []
   const plugin = loadClient(undefined, forms)

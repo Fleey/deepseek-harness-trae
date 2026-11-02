@@ -1052,6 +1052,31 @@ test('suggestions: the model\'s cards keep its own questions and buttons', async
   assert.deepEqual(parseSuggestions('x'.repeat(500)), [])
 })
 
+test('suggestions: a button that only agrees is dropped, and so is the card left empty', async () => {
+  const { parseSuggestions, SUGGEST_SYSTEM } = await import('../lib/testing.mjs')
+
+  // Bare assent, a pick by position and a wave-on send nothing a session can act on.
+  assert.deepEqual(parseSuggestions(JSON.stringify([
+    { question: '要改吗？', choices: [{ label: '改', reply: '好的' }, { label: '第二个', reply: '第二个' }, { label: '继续', reply: '继续吧' }] },
+    { question: 'Go?', choices: [{ label: 'Yes', reply: 'yes' }, { label: 'Do it', reply: 'Do it.' }, { label: 'B', reply: 'the second one' }] },
+  ])), [])
+
+  // The work survives, including a reply that agrees first and then names it.
+  assert.deepEqual(parseSuggestions(JSON.stringify([
+    { question: '要改吗？', choices: [{ label: '改', reply: '好的' }, { label: '改路径', reply: '把 README 里的安装路径改成 DSH NEXT.app' }] },
+    { question: 'Go?', choices: [{ label: 'Run', reply: 'continue the install notes rewrite' }] },
+  ])), [
+    { question: '要改吗？', choices: [{ label: '改路径', reply: '把 README 里的安装路径改成 DSH NEXT.app' }] },
+    { question: 'Go?', choices: [{ label: 'Run', reply: 'continue the install notes rewrite' }] },
+  ])
+  assert.deepEqual(parseSuggestions('"好的，跑一下测试"'), [{ question: '', choices: [{ label: '好的，跑一下测试', reply: '好的，跑一下测试' }] }])
+
+  // An answer that leaves nothing is told to say so, with [] as its own example.
+  assert.ok(SUGGEST_SYSTEM.includes('Output [] when:'))
+  assert.ok(SUGGEST_SYSTEM.includes('Never make a card for:'))
+  assert.match(SUGGEST_SYSTEM, /only explains, describes or reports/)
+})
+
 test('suggestions: a finished turn is waited for, a new turn drops it, a failure is just nothing', async () => {
   const { TraeSuggestions } = await import('../lib/testing.mjs')
   let release
@@ -1085,6 +1110,42 @@ test('suggestions: a finished turn is waited for, a new turn drops it, a failure
   // An empty answer suggests nothing at all.
   store.turnEnded({ sessionId: 's2', conversation: 'c-s2', model: 'GLM-5.3', options: turnOptions(), answer: '  ' })
   assert.equal(await store.get('s2', 0), null)
+})
+
+test('suggestions: switched off, no side completion runs and nothing is served', async () => {
+  const { TraeSuggestions } = await import('../lib/testing.mjs')
+  const asked = []
+  let on = false
+  const store = new TraeSuggestions({
+    complete: (model) => {
+      asked.push(model)
+      return Promise.resolve('[{"question": "Run them?", "choices": [{"label": "Run", "reply": "run the tests"}]}]')
+    },
+    model: '', timeoutMs: 5000, enabled: () => on, logger: { warn() {} },
+  })
+  const turn = { sessionId: 's1', conversation: 'c-s1', model: 'GLM-5.3', options: turnOptions(), answer: 'ok' }
+
+  // Off: the turn costs nothing extra and the composer is served nothing.
+  store.turnEnded(turn)
+  assert.deepEqual(asked, [], 'no model was asked')
+  assert.equal(await store.get('s1', 1000), null)
+
+  // Switched on from the settings card: the next finished turn has its cards.
+  on = true
+  store.turnEnded(turn)
+  assert.deepEqual(asked, ['GLM-5.3'])
+  assert.equal((await store.get('s1', 1000)).cards.length, 1)
+
+  // Switched off with a suggestion in hand: it is dropped, not kept for later.
+  on = false
+  assert.equal(await store.get('s1', 0), null)
+  on = true
+  assert.equal(await store.get('s1', 0), null, 'turning the cards back on shows no stale round')
+
+  // Absent is on, as the schema default is.
+  const plain = new TraeSuggestions({ complete: () => Promise.resolve('[]'), model: '', timeoutMs: 5000, logger: { warn() {} } })
+  plain.turnEnded(turn)
+  assert.deepEqual((await plain.get('s1', 1000)).cards, [])
 })
 
 test('suggestions: delegating to a subagent tells the suggester and the composer about it', async () => {

@@ -41,6 +41,13 @@ export interface SuggestionsOptions {
   model: string
   timeoutMs: number
   /**
+   * Whether cards are offered at all. Absent = on. A function is read each
+   * time, so the settings page switches it mid-session: off stops the side
+   * completion before it starts and hides whatever a session still held, on
+   * applies from the next finished turn.
+   */
+  enabled?: boolean | (() => boolean)
+  /**
    * A pressed button hands its task to a delegated subagent instead of doing
    * it in this session: the composer wraps the reply in that instruction and
    * says so on the cards, and the suggester is told to write replies a child
@@ -135,6 +142,18 @@ export const SUGGEST_SYSTEM = [
   `Output ONLY a JSON array of 0 to ${MAX_CARDS} cards, most likely first:`,
   '[{"question": "...", "choices": [{"label": "...", "reply": "..."}]}]',
   '',
+  'The bar for a card: real work the answer itself named, that nobody has done yet, that the user would plausibly want done now. Most answers leave none, so [] is the ordinary output, not a failure. One good card beats three padded ones; an unwanted card costs the user a close.',
+  'Output [] when:',
+  '- The answer only explains, describes or reports — a question answered, code read out, a status given — and proposes no work.',
+  '- The answer already did what it set out to do and named nothing left over.',
+  '- What is left is the user\'s to do by hand: look at a screen, read a page, decide a direction, try it themselves.',
+  '- Nothing in the answer points at the work; you would have to invent it.',
+  '',
+  'Never make a card for:',
+  '- More talk: explaining further, going deeper, saying it again shorter, listing other options.',
+  '- Work the answer already finished, or work it says it is doing next in this same turn.',
+  '- Routine hygiene the answer never raised: run the tests, write docs, refactor, commit, clean up.',
+  '',
   'Splitting into cards:',
   '- One card per separate thing the answer found, proposed or offered: each problem to fix, each change to make, each command to run, each document to write. An answer that reports two problems is two cards, even if both could be done together.',
   '- Choices on one card are only alternative ways to handle that one thing (do it this way / that way; option A, B or C of one decision).',
@@ -152,7 +171,10 @@ export const SUGGEST_SYSTEM = [
   'Example — the answer reported an outdated install path and a missing note on when config changes apply:',
   JSON.stringify(SUGGEST_EXAMPLE),
   '',
-  'No code fences, no explanation. If the answer leaves the user nothing to decide, output [].',
+  'Example — the answer explained how the token cache expires, fixed nothing and offered nothing:',
+  '[]',
+  '',
+  'No code fences, no explanation. When in doubt, output [] rather than a card the user has to close.',
 ].join('\n')
 
 /**
@@ -229,16 +251,30 @@ function cleanLine(raw: unknown): string {
   return text.length > MAX_TEXT ? '' : text
 }
 
+/**
+ * A reply that only agrees, only points at an option ("第二个") or only waves
+ * the turn on. The prompt rules these out; a model that writes one anyway has
+ * made a button that sends nothing anyone can act on, least of all a subagent
+ * that never saw the card. Matched against the whole reply, so a reply that
+ * agrees and then names the work — "好的，跑一下测试" — keeps its work.
+ */
+const EMPTY_REPLY = /^(?:好的?|行|可以|是的?|对|没问题|同意|确认|继续(?:吧)?|就这样|这样吧|都行|随你|要|需要|不用|算了|第[一二三四五六两]个|前者|后者|yes|yeah|yep|ok|okay|sure|do it|go ahead|please do|continue|proceed|both|(?:the )?(?:first|second|third|last) one)[\s。．.!！?？~～、,，;；]*$/i
+
+/** Whether a cleaned reply carries work, rather than bare assent. */
+function sendable(reply: string): boolean {
+  return reply.length > 0 && !EMPTY_REPLY.test(reply)
+}
+
 function choiceOf(item: unknown): SuggestionChoice | undefined {
   if (typeof item === 'string') {
     const text = cleanLine(item)
-    return text ? { label: text, reply: text } : undefined
+    return sendable(text) ? { label: text, reply: text } : undefined
   }
   if (!item || typeof item !== 'object') return undefined
   const { label, reply } = item as { label?: unknown; reply?: unknown }
   // Without a reply the button has nothing to send; without a label it says what it sends.
   const message = cleanLine(reply)
-  return message ? { label: cleanLine(label) || message, reply: message } : undefined
+  return sendable(message) ? { label: cleanLine(label) || message, reply: message } : undefined
 }
 
 function cardOf(item: unknown): SuggestionCard | undefined {
@@ -298,7 +334,7 @@ export class TraeSuggestions {
    * unless the model has just asked through the host's own dialog.
    */
   turnEnded(turn: FinishedTurn): void {
-    if (!turn.answer.trim() || followsAsk(turn.options.messages as readonly RequestMessage[])) return
+    if (!this.enabled() || !turn.answer.trim() || followsAsk(turn.options.messages as readonly RequestMessage[])) return
     this.drop(turn.sessionId)
     const abort = new AbortController()
     const entry: Entry = {
@@ -325,6 +361,9 @@ export class TraeSuggestions {
    * is still being generated. `null` = nothing (yet) for this session.
    */
   async get(sessionId: string, waitMs: number): Promise<Suggestion | null> {
+    // Switched off while a turn was running: drop what it left, so turning the
+    // cards back on never shows an answer the user has moved past.
+    if (!this.enabled()) { this.drop(sessionId); return null }
     const entry = this.entries.get(sessionId)
     if (!entry) return null
     if (waitMs > 0) {
@@ -378,6 +417,12 @@ export class TraeSuggestions {
       this.opts.logger.warn(`dsh-trae2api: Cue report failed (${error instanceof Error ? error.message : String(error)})`)
       return false
     }
+  }
+
+  /** Whether cards are offered at all, as configured right now. */
+  private enabled(): boolean {
+    const { enabled } = this.opts
+    return (typeof enabled === 'function' ? enabled() : enabled) !== false
   }
 
   /** Whether a pressed button goes to a subagent, as configured right now. */
