@@ -1114,6 +1114,17 @@ test('suggestions: delegating to a subagent tells the suggester and the composer
     assert.equal((await store.get('s1', 1000)).subagent, false)
   }
   assert.deepEqual(systems.map(s => s === suggestSystem(true)), [true, false, false])
+
+  // Read live: the settings card switches it, and the next round follows.
+  let live = true
+  const switched = make(() => live)
+  switched.turnEnded(turn)
+  assert.equal((await switched.get('s1', 1000)).subagent, true)
+  live = false
+  assert.equal((await switched.get('s1', 1000)).subagent, false, 'the composer hears of the change at once')
+  switched.turnEnded({ ...turn, conversation: 'c-s1-2' })
+  await switched.get('s1', 1000)
+  assert.equal(systems.at(-1), suggestSystem(false), 'the next round is written for this session')
 })
 
 test('suggestions: no cards right after the host\'s own ask dialog, but later steps of that turn still get them', async () => {

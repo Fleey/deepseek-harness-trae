@@ -106,8 +106,10 @@ export interface Config {
    * composer sends the reply wrapped in that instruction and says so on the
    * cards. Needs a delegation tool in the harness (`@deepseek-ai/dsh-subagent`
    * plus `dsh-tool-subagent`); without one the model just does it itself.
+   * Volatile: the settings card switches it, and the next round of cards
+   * follows without a restart.
    */
-  suggestSubagent: boolean
+  suggestSubagent: Volatile<boolean>
   /** Report shown / accepted suggestions to Trae's Cue statistics (report/clients). */
   reportCue: boolean
   /** Trae account user id for those reports; empty = GetUserInfo ($TRAE_USER_ID wins if set). */
@@ -147,7 +149,7 @@ export const Config: Schema<Config> = Schema.object({
   suggestions: Schema.boolean().default(true),
   suggestModel: Schema.string().default(''),
   suggestTimeoutMs: Schema.natural().default(20_000),
-  suggestSubagent: Schema.boolean().default(true)
+  suggestSubagent: Schema.boolean().default(true).volatile()
     .description('点下一步卡片时交给子会话（subagent 工具）去做，而不是在当前会话里直接动手；卡片上会写明'),
   reportCue: Schema.boolean().default(true),
   cueUserId: Schema.string().default(''),
@@ -278,7 +280,7 @@ export function apply(ctx: Context, config: Config): void {
       complete: (model, system, user, signal) => adapter.complete(model, system, user, signal),
       model: config.suggestModel,
       timeoutMs: config.suggestTimeoutMs,
-      subagent: config.suggestSubagent,
+      subagent: () => config.suggestSubagent.get(),
       ...cue ? { report: (events) => cue.report(events) } : {},
       logger,
     })

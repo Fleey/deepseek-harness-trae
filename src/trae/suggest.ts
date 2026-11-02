@@ -44,9 +44,10 @@ export interface SuggestionsOptions {
    * A pressed button hands its task to a delegated subagent instead of doing
    * it in this session: the composer wraps the reply in that instruction and
    * says so on the cards, and the suggester is told to write replies a child
-   * that cannot see this chat can act on. Absent = false.
+   * that cannot see this chat can act on. Absent = false. A function is read
+   * each time, so a setting changed from the settings page applies at once.
    */
-  subagent?: boolean
+  subagent?: boolean | (() => boolean)
   /** Report shown/accepted suggestions as Cue events (false = skipped); absent = no reporting. */
   report?: (events: CueEvent[]) => Promise<boolean>
   logger: { warn(...a: unknown[]): void }
@@ -333,7 +334,7 @@ export class TraeSuggestions {
     }
     // Replaced or dropped while waiting.
     if (this.entries.get(sessionId) !== entry) return null
-    return { cards: entry.cards, at: entry.at, id: entry.id, subagent: this.opts.subagent === true }
+    return { cards: entry.cards, at: entry.at, id: entry.id, subagent: this.delegates() }
   }
 
   /**
@@ -379,6 +380,12 @@ export class TraeSuggestions {
     }
   }
 
+  /** Whether a pressed button goes to a subagent, as configured right now. */
+  private delegates(): boolean {
+    const { subagent } = this.opts
+    return (typeof subagent === 'function' ? subagent() : subagent) === true
+  }
+
   private drop(sessionId: string): void {
     const entry = this.entries.get(sessionId)
     if (!entry) return
@@ -391,7 +398,7 @@ export class TraeSuggestions {
     const both = AbortSignal.any([signal, timeout])
     const raw = await this.opts.complete(
       this.opts.model || turn.model,
-      suggestSystem(this.opts.subagent === true),
+      suggestSystem(this.delegates()),
       suggestPrompt(turn),
       both,
     )
