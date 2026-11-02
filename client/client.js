@@ -22,9 +22,10 @@
  *
  * After each Trae answer, cards above the composer (slot
  * `conversation.input.dock`) offer the next steps the answer left open, each
- * with the model's own answers as buttons; a button sends its reply — as a
- * subagent task while `suggestSubagent` is on, which the line under the cards
- * says and can switch back to this session.
+ * with the model's own answers as buttons; a button picks its card's answer,
+ * and the picks go out together with an optional note — as subagent tasks
+ * while `suggestSubagent` is on, which the line under the cards says and can
+ * switch back to this session.
  */
 window.__ModuleLoader__.load({
   id: 'dsh-trae2api',
@@ -52,6 +53,17 @@ window.__ModuleLoader__.load({
     const CONSOLE_PASSWORD_FIELD = 'consolePassword'
     const EMAIL_FIELD = 'consoleEmail'
     const DEFAULT_CONSOLE_EMAIL_REF = 'TRAE_CONSOLE_EMAIL'
+    /** Who does what a next-step card sends, by default (host config `suggestSubagent`). */
+    const SUBAGENT_FIELD = 'suggestSubagent'
+    /**
+     * The boolean as the two choices the card offers. An absent value is the
+     * schema default, on — the same as a host too old to serve the field.
+     */
+    const SUBAGENT_SPEC = {
+      field: SUBAGENT_FIELD,
+      format: value => (value === false ? 'inline' : 'subagent'),
+      parse: text => ({ kind: 'set', value: text !== 'inline' }),
+    }
     /** Host route serving the remaining quota (see QUOTA_ROUTE in src/index.ts). */
     const QUOTA_ROUTE = '/api/dsh-trae2api/quota'
     /** How often a visible chip re-reads the quota. */
@@ -157,12 +169,24 @@ window.__ModuleLoader__.load({
       choicesSend: '发送',
       choicesSubagentOn: '子会话处理',
       choicesSubagentOff: '当前会话处理',
-      choicesSubagentHint: '点按钮后交给子会话去做，不占当前会话的上下文，做完回来汇报。',
-      choicesInlineHint: '点按钮后直接在当前会话里做。',
+      choicesSubagentHint: '点按钮选中，选好后一起发送；交给子会话去做，不占当前会话的上下文，做完回来汇报。',
+      choicesInlineHint: '点按钮选中，选好后一起发送，在当前会话里做。',
       choicesSubagentToggle: '切换由谁来做：子会话 / 当前会话',
       choicesPicked: '关于「{question}」：{reply}',
       choicesSubagentTask: '请开一个子会话来做下面这件事：用 subagent 工具把它派出去，你自己不要在当前会话里直接动手；子会话结束后把结果要点和改动过的文件告诉我。\n\n{context}任务：{task}',
+      choicesSubagentTasks: '请为下面每件事各开一个子会话来做：每件事用 subagent 工具单独派出去，互不依赖的可以同时派；你自己不要在当前会话里直接动手。子会话都结束后，把每件事的结果要点和改动过的文件告诉我。\n\n{tasks}',
+      choicesSubagentItem: '任务：{task}',
       choicesSubagentContext: '背景：上一轮结束时待定的问题是「{question}」。',
+      choicesPickedCount: '已选 {n}/{total}',
+      choicesExtraPlaceholder: '补充几句（可选），回车发送',
+      choicesExtra: '补充：{text}',
+      choicesSubagentExtra: '补充（派活时一并交代给子会话）：{text}',
+      choicesDefault: '下一步卡片默认由谁来做',
+      choicesDefaultHint: '从下一步卡片发出去的任务默认交给谁。卡片下面那行还能临时切换，只对当前这一轮有效。保存后下一轮卡片就按新的来。',
+      choicesFold: '折叠',
+      choicesFoldHint: '把下一步卡片折叠成一行，之后几轮也保持折叠',
+      choicesUnfold: '展开',
+      choicesFoldedCount: '{n} 条',
     }
     const en = {
       title: 'Trae',
@@ -239,12 +263,24 @@ window.__ModuleLoader__.load({
       choicesSend: 'Send',
       choicesSubagentOn: 'In a subagent',
       choicesSubagentOff: 'In this session',
-      choicesSubagentHint: 'A button hands its task to a subagent: it stays out of this session\'s context and reports back when done.',
-      choicesInlineHint: 'A button is done in this session, right here.',
+      choicesSubagentHint: 'Pick answers, then send them together: each task goes to a subagent, stays out of this session\'s context and reports back when done.',
+      choicesInlineHint: 'Pick answers, then send them together; they are done in this session, right here.',
       choicesSubagentToggle: 'Switch who does it: a subagent or this session',
       choicesPicked: 'On "{question}": {reply}',
       choicesSubagentTask: 'Hand the task below to a subagent: delegate it with the subagent tool instead of doing it in this session, and tell me what it found and which files it changed once the child is done.\n\n{context}Task: {task}',
+      choicesSubagentTasks: 'Hand each task below to its own subagent: delegate each with the subagent tool (independent ones may run at the same time) instead of doing them in this session, and tell me what each found and which files it changed once they are done.\n\n{tasks}',
+      choicesSubagentItem: 'Task: {task}',
       choicesSubagentContext: 'Context: the question left open by your last answer was "{question}".',
+      choicesPickedCount: '{n}/{total} picked',
+      choicesExtraPlaceholder: 'Add a note (optional) — Enter to send',
+      choicesExtra: 'Also: {text}',
+      choicesSubagentExtra: 'Also (pass this on when delegating): {text}',
+      choicesDefault: 'Who does a next-step card by default',
+      choicesDefaultHint: 'Where the tasks sent from next-step cards go by default. The line under the cards can still switch a single round. Saved, it applies from the next round of cards.',
+      choicesFold: 'Collapse',
+      choicesFoldHint: 'Fold the next-step cards into one line; later rounds stay folded too',
+      choicesUnfold: 'Expand',
+      choicesFoldedCount: '{n} cards',
     }
 
     /** Minimal uSES-compatible snapshot store — the shape slot `hooks` bind to. */
@@ -308,6 +344,13 @@ window.__ModuleLoader__.load({
     /** A session without cards: before its first answer, while a turn runs, after a pick. */
     const NO_CHOICES = Object.freeze({ id: '', cards: [], dismissed: [], subagent: false })
 
+    /** Where the cards' folded / open state outlives the page. */
+    const FOLDED_KEY = `${PACKAGE}:choices-folded`
+
+    function readFolded() {
+      try { return window.localStorage?.getItem(FOLDED_KEY) === '1' } catch { return false }
+    }
+
     /**
      * Next-step cards per session, the browser end of src/trae/suggest.ts.
      * A session's snapshot is `{ id, cards, dismissed, subagent }`: the
@@ -316,10 +359,20 @@ window.__ModuleLoader__.load({
      * for a pressed button to go to a subagent (config `suggestSubagent`).
      * Kept for the page's lifetime, so switching back to a session shows what
      * it had.
+     *
+     * Whether the cards are folded to one line is not a property of one round
+     * but the user's choice: one store for every session, kept across reloads.
      */
     class SuggestionController {
       constructor() {
         this.stores = new Map()
+        this.folded = createStore(readFolded())
+      }
+
+      /** Fold every session's cards to one line, or open them again. */
+      fold(folded) {
+        this.folded.set(folded)
+        try { window.localStorage?.setItem(FOLDED_KEY, folded ? '1' : '0') } catch {}
       }
 
       storeFor(sessionId) {
@@ -368,19 +421,6 @@ window.__ModuleLoader__.load({
       close(sessionId) {
         const store = this.storeFor(sessionId)
         store.set({ ...store.getSnapshot(), cards: [], dismissed: [] })
-      }
-
-      /**
-       * Button `choice` of card `card` pressed: every card is done. Returns
-       * that button's choice with the question it answers — the message sent
-       * carries both, since the chat never saw the question (it comes from a
-       * side completion) and a reply like "改吧" means nothing without it.
-       */
-      take(sessionId, card, choice) {
-        const asked = this.storeFor(sessionId).getSnapshot().cards[card]
-        const picked = asked?.choices?.[choice]
-        if (picked) this.close(sessionId)
-        return picked ? { ...picked, question: asked.question ?? '' } : picked
       }
     }
 
@@ -446,7 +486,7 @@ window.__ModuleLoader__.load({
         this.statusGeneration = 0
         this.form = new P.SettingsFormModel(
           scope,
-          [],
+          [SUBAGENT_SPEC],
           [
             { field: TOKEN_FIELD, write: text => this.writeToken(text) },
             { field: EMAIL_FIELD, write: text => this.writeSecret('consoleEmailCredential', this.consoleEmailRef(), text) },
@@ -470,6 +510,7 @@ window.__ModuleLoader__.load({
           consolePassword: this.form.field(CONSOLE_PASSWORD_FIELD),
           consoleConfigured: this.consoleCredential.configured,
           consoleWritable: this.consoleCredential.writable,
+          delegate: this.form.field(SUBAGENT_FIELD),
           credentialError: this.credentialError,
           status: this.status,
         }
@@ -1173,18 +1214,25 @@ window.__ModuleLoader__.load({
 .trae-choice-question{margin:0;font-size:14px;font-weight:500;line-height:22px;overflow-wrap:anywhere}
 .trae-choice-tag{margin-left:2px;padding:0 6px;border-radius:999px;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary);font-size:10px;line-height:15px}
 .trae-choice-foot{display:flex;align-items:center;flex-wrap:wrap;gap:4px 8px;padding:0 4px;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px}
-.trae-choice-who{flex:none;height:20px;padding:0 8px 0 6px;border:.5px solid var(--dsw-alias-border-l4);border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px;line-height:16px;cursor:pointer;display:inline-flex;align-items:center;gap:4px}
-.trae-choice-who:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.trae-choice-who,.trae-choice-tuck{flex:none;height:20px;padding:0 8px 0 6px;border:.5px solid var(--dsw-alias-border-l4);border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px;line-height:16px;cursor:pointer;display:inline-flex;align-items:center;gap:4px}
+.trae-choice-who:hover,.trae-choice-tuck:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 .trae-choice-who[aria-pressed="true"]{border-color:transparent;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
-.trae-choice-who:focus-visible{outline:2px solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:2px}
+.trae-choice-who:focus-visible,.trae-choice-tuck:focus-visible{outline:2px solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:2px}
 .trae-choice-note{min-width:0;flex:1}
+.trae-choice-fold{width:100%;border:none;font:inherit;text-align:left;cursor:pointer;flex-direction:row;align-items:center;gap:10px;padding:8px 12px 8px 16px}
+.trae-choice-fold:focus-visible{outline:2px solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:2px}
+.trae-choice-fold .trae-choice-eyebrow{flex:none;margin:0}
+.trae-choice-peek{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary);font-size:13px;line-height:20px}
+.trae-choice-unfold{flex:none;display:inline-flex;align-items:center;gap:4px;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px}
+.trae-choice-fold:hover .trae-choice-unfold,.trae-choice-fold:hover .trae-choice-peek{color:var(--dsw-alias-label-primary)}
 .trae-choice-close{flex:none;width:24px;height:24px;margin:-2px -2px 0 0;padding:0;border:none;border-radius:999px;background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer;display:grid;place-items:center}
 .trae-choice-close:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 .trae-choice-actions{display:flex;flex-wrap:wrap;gap:8px}
 .trae-choice-btn{height:30px;max-width:100%;padding:0 12px;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-md,8px);background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;line-height:20px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;transition:background-color .12s,border-color .12s,color .12s}
 .trae-choice-btn:hover{background:var(--dsw-alias-interactive-bg-hover)}
-.trae-choice-btn[data-primary]{border-color:transparent;background:var(--dsw-alias-button-primary-fill);color:var(--dsw-alias-label-primary-foreground)}
-.trae-choice-btn[data-primary]:hover{background:var(--dsw-alias-button-primary-hover)}
+.trae-choice-btn[data-primary]{border-color:var(--dsw-alias-border-l2);font-weight:600}
+.trae-choice-btn[aria-pressed="true"]{border-color:transparent;background:var(--dsw-alias-button-primary-fill);color:var(--dsw-alias-label-primary-foreground)}
+.trae-choice-btn[aria-pressed="true"]:hover{background:var(--dsw-alias-button-primary-hover)}
 .trae-choice-btn[data-other]{border:1px dashed var(--dsw-alias-border-l4);color:var(--dsw-alias-label-secondary)}
 .trae-choice-btn[data-other][aria-expanded="true"]{border-style:solid;border-color:var(--dsw-alias-border-l2);background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 .trae-choice-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -1196,6 +1244,8 @@ window.__ModuleLoader__.load({
 .trae-choice-send{flex:none;width:28px;height:28px;padding:0;border:none;border-radius:999px;background:var(--dsw-alias-button-primary-fill);color:var(--dsw-alias-label-primary-foreground);cursor:pointer;display:grid;place-items:center}
 .trae-choice-send:hover:not(:disabled){background:var(--dsw-alias-button-primary-hover)}
 .trae-choice-send:disabled{opacity:.35;cursor:default}
+.trae-choice-compose{gap:8px;padding:10px 12px 12px 16px}
+.trae-choice-compose .trae-choice-eyebrow{margin:0}
 @keyframes trae-choice-in{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 @media (prefers-reduced-motion:reduce){.trae-choice{animation:none}.trae-choice-btn,.trae-choice-other{transition:none}}
 `
@@ -1212,6 +1262,9 @@ window.__ModuleLoader__.load({
     const ICON_CLOSE = 'M4.5 4.5l7 7M11.5 4.5l-7 7'
     const ICON_PEN = 'M10.5 3l2.5 2.5L6 12.5H3.5V10z'
     const ICON_SEND = 'M8 12.5v-9M4 7.5l4-4 4 4'
+    const ICON_CHECK = 'M3.5 8.5l3 3 6-7'
+    const ICON_FOLD = 'M4 6l4 4 4-4'
+    const ICON_UNFOLD = 'M4 10l4-4 4 4'
     /** A line branching off: the task going to a child session. */
     const ICON_BRANCH = 'M5 2.5v6a3 3 0 0 0 3 3h3M11 9l2 2.5-2 2.5'
     /** Two sheets: copy. */
@@ -1226,16 +1279,22 @@ window.__ModuleLoader__.load({
     /**
      * Next-step cards above the composer, beside the host's todo and queue
      * docks: one card per decision the last Trae answer left open, each with
-     * the model's own answers as buttons (its recommendation first, filled).
-     * A button sends its reply as the user's next message; "something else"
-     * opens a box on the card to write one's own; × closes that card without
-     * sending anything. The cards step aside while the user types in the
-     * composer, and go once a turn runs.
+     * the model's own answers as buttons (its recommendation first, in bold).
+     * A button picks that answer for its card — one per card, a second click
+     * takes it back — and "something else" picks the user's own words, typed
+     * in a box on the card. Once anything is picked, a box under the cards
+     * counts the picks, takes an optional note and sends every answer as one
+     * message. × closes a card without answering it. The cards step aside
+     * while the user types in the composer, and go once a turn runs.
      *
-     * With the host's `suggestSubagent` on, what a button sends is that reply
-     * wrapped in "delegate this to a subagent": the one line under the cards
-     * says so, and switches the round back to this session when the user would
-     * rather watch it happen here.
+     * With the host's `suggestSubagent` on, what goes out is those answers
+     * wrapped in "delegate this to a subagent" (one subagent per task): the
+     * one line under the cards says so, and switches the round back to this
+     * session when the user would rather watch it happen here.
+     *
+     * The same line folds the whole round into one row — its count and first
+     * question — that opens again on a click. Folding is the user's choice
+     * rather than the round's, so later rounds arrive folded until opened.
      */
     function SuggestionCards(props) {
       const { t, sessionId, inputActions } = props
@@ -1243,8 +1302,12 @@ window.__ModuleLoader__.load({
       const draft = props.useInput(s => s.draft ?? '')
       const phase = props.useInput(s => s.phase)
       const choices = props.useTraeChoices(s => s)
-      // The card whose "something else" box is open, and what is typed in it.
-      const [other, setOther] = React.useState(null)
+      const folded = props.useTraeChoicesFolded(s => s) === true
+      // Each card's answer so far, by card index: `{ choice }` for a button,
+      // `{ text }` for the user's own words (its box is open while it is).
+      const [picks, setPicks] = React.useState({})
+      // The note sent along with the answers.
+      const [extra, setExtra] = React.useState('')
       // Who does the task: the host's answer for this round until it is switched.
       const [delegate, setDelegate] = React.useState(null)
 
@@ -1258,66 +1321,105 @@ window.__ModuleLoader__.load({
         return props.load(ended ? SUGGESTION_WAIT_MS : 0)
       }, [running, sessionId])
 
-      // A new round of cards starts with every box closed and the host's own
+      // A new round of cards starts with nothing picked and the host's own
       // answer for who does the work.
-      React.useEffect(() => { setOther(null); setDelegate(null) }, [choices.id])
+      React.useEffect(() => { setPicks({}); setExtra(''); setDelegate(null) }, [choices.id])
 
       const open = choices.cards
         .map((card, index) => ({ card, index }))
         .filter(({ index }) => !choices.dismissed.includes(index))
       const visible = open.length > 0 && !running && draft === '' && (phase === undefined || phase === 'plain')
 
-      // Tell the host they were actually on screen; it counts each suggestion once.
+      // Tell the host they were actually on screen; it counts each suggestion
+      // once. Folded, the buttons are not on screen, so that waits for a click.
       React.useEffect(() => {
-        if (visible) reportSuggestion(sessionId, choices.id, 'shown')
-      }, [visible, choices.id])
+        if (visible && !folded) reportSuggestion(sessionId, choices.id, 'shown')
+      }, [visible, folded, choices.id])
 
       if (!visible) return null
+      if (folded) {
+        const first = open[0].card
+        const count = open.length > 1 ? ` · ${t('choicesFoldedCount').replace('{n}', String(open.length))}` : ''
+        return h('div', { className: 'trae-choices', 'data-trae-choices': '', 'data-folded': '' },
+          h('button', {
+            type: 'button', className: 'trae-choice trae-choice-fold',
+            'aria-expanded': false, title: t('choicesUnfold'),
+            onClick: () => { props.fold(false) },
+          },
+          h('span', { className: 'trae-choice-eyebrow' }, icon(ICON_SPARK, 12, true), `${t('choicesEyebrow')}${count}`),
+          h('span', { className: 'trae-choice-peek' }, first.question || first.choices[0]?.label || ''),
+          h('span', { className: 'trae-choice-unfold' }, t('choicesUnfold'), icon(ICON_UNFOLD, 12)),
+          ))
+      }
       const toSubagent = delegate ?? choices.subagent === true
-      // The editor applies a draft as one discrete update, so submit already reads it.
-      // The question goes out with the answer: it was asked by the side
-      // completion, so the chat itself never saw it, and "改吧" on its own
-      // leaves both this session and a subagent guessing which of the things
-      // the answer raised is meant. A delegated task travels as the message
-      // asking for it — the host has no way to start a child of its own for an
-      // idle session.
-      const send = (text, question) => {
-        const asked = (question ?? '').trim()
-        // One pass with a replacement function: a `$&` or a `{task}` inside the
-        // model's own words stays itself.
-        const fill = (key, values) => t(key)
-          .replace(/\{(\w+)\}/g, (whole, slot) => (slot in values ? values[slot] : whole))
-        const context = asked ? `${fill('choicesSubagentContext', { question: asked })}\n` : ''
-        inputActions.setDraft(toSubagent
-          ? fill('choicesSubagentTask', { context, task: text })
-          : asked ? fill('choicesPicked', { question: asked, reply: text }) : text)
+      // One pass with a replacement function: a `$&` or a `{task}` inside the
+      // model's own words stays itself.
+      const fill = (key, values) => t(key)
+        .replace(/\{(\w+)\}/g, (whole, slot) => (slot in values ? values[slot] : whole))
+      // What would go out now, card by card; an empty box answers nothing.
+      const answers = open.flatMap(({ card, index }) => {
+        const pick = picks[index]
+        if (!pick) return []
+        const reply = pick.choice !== undefined ? card.choices[pick.choice]?.reply : pick.text.trim()
+        return reply ? [{ card: index, choice: pick.choice, question: (card.question ?? '').trim(), reply }] : []
+      })
+      const setPick = (card, pick) => {
+        setPicks((current) => {
+          const next = { ...current }
+          if (pick) next[card] = pick
+          else delete next[card]
+          return next
+        })
+      }
+      // Every answer goes out with its question: the questions were asked by
+      // the side completion, so the chat itself never saw them, and "改吧" on
+      // its own leaves both this session and a subagent guessing which of the
+      // things the answer raised is meant. Delegated tasks travel as the
+      // message asking for them — the host has no way to start a child of its
+      // own for an idle session. The editor applies a draft as one discrete
+      // update, so submit already reads it.
+      const compose = (note) => {
+        const context = asked => (asked ? fill('choicesSubagentContext', { question: asked }) : '')
+        let text
+        if (!toSubagent) {
+          text = answers
+            .map(({ question, reply }) => (question ? fill('choicesPicked', { question, reply }) : reply))
+            .join('\n')
+        } else if (answers.length === 1) {
+          const [{ question, reply }] = answers
+          text = fill('choicesSubagentTask', { context: question ? `${context(question)}\n` : '', task: reply })
+        } else {
+          const tasks = answers.map(({ question, reply }, at) => {
+            const item = fill('choicesSubagentItem', { task: reply })
+            return `${at + 1}. ${question ? `${context(question)}\n   ${item}` : item}`
+          })
+          text = fill('choicesSubagentTasks', { tasks: tasks.join('\n\n') })
+        }
+        return note ? `${text}\n\n${fill(toSubagent ? 'choicesSubagentExtra' : 'choicesExtra', { text: note })}` : text
+      }
+      // Cue hears of one accepted button per round, the first one picked in
+      // card order; the user's own words are no suggestion of Trae's.
+      const send = () => {
+        if (answers.length === 0) return
+        const accepted = answers.find(answer => answer.choice !== undefined)
+        if (accepted) reportSuggestion(sessionId, choices.id, 'accept', { card: accepted.card, choice: accepted.choice })
+        const text = compose(extra.trim())
+        props.close()
+        setPicks({})
+        setExtra('')
+        inputActions.setDraft(text)
         inputActions.submit()
       }
-      const pick = (card, choice) => {
-        const picked = props.take(card, choice)
-        if (!picked) return
-        reportSuggestion(sessionId, choices.id, 'accept', { card, choice })
-        send(picked.reply, picked.question)
-      }
-      // The user's own words are not one of the suggestions, so Cue hears
-      // nothing of them; the card's question still travels with them.
-      const sendOther = () => {
-        const text = other?.text.trim()
-        if (!text) return
-        const asked = choices.cards[other.card]?.question
-        props.close()
-        setOther(null)
-        send(text, asked)
-      }
-      const onOtherKey = (event) => {
+      const onKey = (onEscape) => (event) => {
         if (event.nativeEvent?.isComposing || event.keyCode === 229) return
-        if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendOther() }
-        else if (event.key === 'Escape') { event.preventDefault(); setOther(null) }
+        if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); send() }
+        else if (event.key === 'Escape' && onEscape) { event.preventDefault(); onEscape() }
       }
 
       return h('div', { className: 'trae-choices', 'data-trae-choices': '' },
         open.map(({ card, index }, position) => {
-          const editing = other?.card === index
+          const pick = picks[index]
+          const editing = pick?.text !== undefined
           return h('div', { key: `${choices.id}:${index}`, className: 'trae-choice' },
             h('div', { className: 'trae-choice-head' },
               h('div', { className: 'trae-choice-heading' },
@@ -1331,20 +1433,24 @@ window.__ModuleLoader__.load({
               h('button', {
                 type: 'button', className: 'trae-choice-close',
                 'aria-label': t('choicesDismiss'), title: t('choicesDismiss'),
-                onClick: () => { props.dismiss(index) },
+                onClick: () => { setPick(index, null); props.dismiss(index) },
               }, icon(ICON_CLOSE)),
             ),
             h('div', { className: 'trae-choice-actions' },
-              ...card.choices.map((choice, at) => h('button', {
-                key: at, type: 'button', className: 'trae-choice-btn',
-                'data-primary': at === 0 ? '' : undefined,
-                title: choice.reply,
-                onClick: () => { pick(index, at) },
-              }, h('span', { className: 'trae-choice-label' }, choice.label))),
+              ...card.choices.map((choice, at) => {
+                const picked = pick?.choice === at
+                return h('button', {
+                  key: at, type: 'button', className: 'trae-choice-btn',
+                  'data-primary': at === 0 ? '' : undefined,
+                  'aria-pressed': picked,
+                  title: choice.reply,
+                  onClick: () => { setPick(index, picked ? null : { choice: at }) },
+                }, picked ? icon(ICON_CHECK, 13) : null, h('span', { className: 'trae-choice-label' }, choice.label))
+              }),
               h('button', {
                 key: 'other', type: 'button', className: 'trae-choice-btn',
                 'data-other': '', 'aria-expanded': editing,
-                onClick: () => { setOther(editing ? null : { card: index, text: '' }) },
+                onClick: () => { setPick(index, editing ? null : { text: '' }) },
               }, icon(ICON_PEN, 13), h('span', { className: 'trae-choice-label' }, t('choicesOther'))),
             ),
             editing
@@ -1352,25 +1458,45 @@ window.__ModuleLoader__.load({
                 h('textarea', {
                   className: 'trae-choice-input', rows: 1, autoFocus: true,
                   placeholder: t('choicesOtherPlaceholder'), 'aria-label': t('choicesOther'),
-                  value: other.text,
+                  value: pick.text,
                   onChange: (event) => {
                     fitHeight(event.target)
-                    setOther({ card: index, text: event.target.value })
+                    setPick(index, { text: event.target.value })
                   },
-                  onKeyDown: onOtherKey,
+                  onKeyDown: onKey(() => { setPick(index, null) }),
                 }),
-                h('button', {
-                  type: 'button', className: 'trae-choice-send',
-                  disabled: !other.text.trim(),
-                  'aria-label': t('choicesSend'), title: t('choicesSend'),
-                  onClick: sendOther,
-                }, icon(ICON_SEND)),
               )
               : null,
           )
         }),
-        // One line for the whole round: who does what a button sends, and the
-        // switch to the other one.
+        // Everything picked goes out together, with the user's note if any.
+        answers.length > 0
+          ? h('div', { className: 'trae-choice trae-choice-compose' },
+            h('div', { className: 'trae-choice-eyebrow' },
+              icon(ICON_CHECK, 12),
+              fill('choicesPickedCount', { n: String(answers.length), total: String(open.length) }),
+            ),
+            h('div', { className: 'trae-choice-other' },
+              h('textarea', {
+                className: 'trae-choice-input', rows: 1,
+                placeholder: t('choicesExtraPlaceholder'), 'aria-label': t('choicesExtraPlaceholder'),
+                value: extra,
+                onChange: (event) => {
+                  fitHeight(event.target)
+                  setExtra(event.target.value)
+                },
+                onKeyDown: onKey(null),
+              }),
+              h('button', {
+                type: 'button', className: 'trae-choice-send',
+                'aria-label': t('choicesSend'), title: t('choicesSend'),
+                onClick: send,
+              }, icon(ICON_SEND)),
+            ),
+          )
+          : null,
+        // One line for the whole round: who does what is sent, the switch to
+        // the other one, and folding the round away.
         h('div', { className: 'trae-choice-foot', 'data-subagent': toSubagent ? '' : undefined },
           h('button', {
             type: 'button', className: 'trae-choice-who',
@@ -1378,6 +1504,11 @@ window.__ModuleLoader__.load({
             onClick: () => { setDelegate(!toSubagent) },
           }, icon(ICON_BRANCH, 12), h('span', null, t(toSubagent ? 'choicesSubagentOn' : 'choicesSubagentOff'))),
           h('span', { className: 'trae-choice-note' }, t(toSubagent ? 'choicesSubagentHint' : 'choicesInlineHint')),
+          h('button', {
+            type: 'button', className: 'trae-choice-tuck',
+            'aria-expanded': true, title: t('choicesFoldHint'),
+            onClick: () => { props.fold(true) },
+          }, icon(ICON_FOLD, 12), h('span', null, t('choicesFold'))),
         ),
       )
     }
@@ -1552,6 +1683,7 @@ window.__ModuleLoader__.load({
             : null,
           h(StatusBlock, { t, status: state.status, checkStatus: props.checkStatus }),
           h(QuotaBlock, { t, quota, refresh: props.refreshQuota }),
+          h(DelegateChoice, { t, field: state.delegate, disabled: !state.writable, edit: props.edit }),
           h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'flex-end' } },
             state.failed
               ? h('p', {
@@ -1573,6 +1705,34 @@ window.__ModuleLoader__.load({
             }, state.saving ? t('saving') : t('save')),
           ),
         ),
+      )
+    }
+
+    /**
+     * Who does what a next-step card sends, unless the line under the cards
+     * switches that round: staged like the card's other fields, written by its
+     * Save, and picked up by the host without a restart (the field is volatile).
+     */
+    function DelegateChoice(props) {
+      const { t, field } = props
+      return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, marginTop: 4 } },
+        h('span', { style: { fontWeight: 600 } }, t('choicesDefault')),
+        h('div', null,
+          h(P.SegmentedControl, {
+            id: 'dsh-trae2api-delegate',
+            label: t('choicesDefault'),
+            value: field.text,
+            disabled: props.disabled,
+            options: [
+              { value: 'subagent', label: t('choicesSubagentOn') },
+              { value: 'inline', label: t('choicesSubagentOff') },
+            ],
+            onChange: (value) => { props.edit(SUBAGENT_FIELD, value) },
+          }),
+        ),
+        h('p', {
+          style: { margin: 0, color: 'var(--dsw-alias-label-secondary)', fontSize: 'var(--dsw-font-xs-13, 13px)' },
+        }, t('choicesDefaultHint')),
       )
     }
 
@@ -1757,12 +1917,12 @@ window.__ModuleLoader__.load({
           order: 30,
           locale: NS,
           inject: sessionId => ({
-            hooks: { traeChoices: choices.storeFor(sessionId) },
+            hooks: { traeChoices: choices.storeFor(sessionId), traeChoicesFolded: choices.folded },
             load: waitMs => choices.load(sessionId, waitMs),
             clear: () => { choices.clear(sessionId) },
             dismiss: (card) => { choices.dismiss(sessionId, card) },
             close: () => { choices.close(sessionId) },
-            take: (card, choice) => choices.take(sessionId, card, choice),
+            fold: (folded) => { choices.fold(folded) },
           }),
         }, SuggestionCards))
         ctx.effect(
