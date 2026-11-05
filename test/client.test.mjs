@@ -159,7 +159,8 @@ function renderChip(value) {
       left: segment.children[0].props.style.width,
       color: segment.children[0].props.style.background,
     })),
-    lines: node.props.label.children[0].split('\n'),
+    lines: node.props.label.split('\n'),
+    portal: node.props.portal,
   }
 }
 
@@ -234,6 +235,9 @@ test('chip: one figure for the total, one bar segment per allowance', () => {
   assert.equal(one.label, 'Trae 剩余 89%')
   assert.equal(one.color, 'var(--dsw-alias-label-secondary)')
   assert.equal(one.segments.length, 1)
+  // The bubble mounts under the body, outside the composer row the host
+  // re-measures on every mutation in its subtree.
+  assert.equal(one.portal, true)
 
   // A pack with no quota of this kind (limit 0) has no share to fill, so it
   // draws no segment rather than a stray empty one.
