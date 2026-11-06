@@ -28,6 +28,10 @@ export interface TraeSession {
   expiresAt: number
   /** Account e-mail decoded from the JWT, for the status line. */
   email?: string
+  /** Display name from the JWT claims, when it carries one (share byline). */
+  name?: string
+  /** Key names (never values) of the JWT's `data` claim, for finding the name field. */
+  claimKeys?: string[]
 }
 
 type Json = Record<string, unknown>
@@ -71,7 +75,14 @@ function sessionFromToken(token: string, expiryHint?: unknown): TraeSession {
   const claims = decodeJwt(token)
   const data = isObject(claims?.data) ? claims.data : undefined
   const expiresAt = parseExpiry(expiryHint) ?? parseExpiry(claims?.exp) ?? Date.now() + 60 * 60_000
-  return { token, expiresAt, ...typeof data?.email === 'string' ? { email: data.email } : {} }
+  const name = data ? pick(data, ['username', 'user_name', 'UserName', 'Username', 'screen_name', 'ScreenName', 'name', 'Name', 'nickname', 'NickName']) : undefined
+  return {
+    token,
+    expiresAt,
+    ...typeof data?.email === 'string' ? { email: data.email } : {},
+    ...typeof name === 'string' && name.trim() ? { name: name.trim() } : {},
+    ...data ? { claimKeys: Object.keys(data) } : {},
+  }
 }
 
 /** Find the token object inside whatever envelope the gateway wrapped it in. */

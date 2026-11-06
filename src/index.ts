@@ -25,7 +25,10 @@ import { TraeCueReporter } from './trae/cue.ts'
 import { isCnHost, traeAppName, traeDebugLine, TRAE_APP_VERSION } from './trae/debug.ts'
 import { TraeUserInfo } from './trae/user.ts'
 import { TraeQuota } from './trae/quota.ts'
-import { artifactUrl, SHARE_ORIGIN, ShareError, shareUrl, TraeShare } from './trae/share.ts'
+import { mirrorAndShare } from './trae/mirror.ts'
+import { TranscriptStore, transcriptMessage, transcriptOf, userTurns } from './trae/transcript.ts'
+import { conversationTurns, localShareBody } from './trae/local-share.ts'
+import { artifactUrl, latestTurns, SHARE_API_ORIGIN, ShareError, shareOriginFor, shareUrl, TraeShare } from './trae/share.ts'
 import { TraeSuggestions } from './trae/suggest.ts'
 import { TOB_CONSOLE_HOST, TobConsole } from './trae/tob.ts'
 
@@ -33,8 +36,13 @@ export const name = 'dsh-trae2api'
 export const inject = ['llm']
 
 const CLIENT_VERSION = '0.206.1-tob'
-/** Default origin the share API is spoken on (CN consumer site). */
-const SHARE_HOST = SHARE_ORIGIN
+/**
+ * Default origin the share API is spoken on: `trae-api-cn.mchost.guru`, the
+ * write host TRAE SOLO CN's own bootConfig names (`remote.trae.normal`, report
+ * v2). Same consumer namespace as work.trae.cn; links are still built on
+ * `share.traecontent.cn` (`shareOriginFor`).
+ */
+const SHARE_HOST = SHARE_API_ORIGIN
 /** Host route the browser half reads the remaining quota from. */
 export const QUOTA_ROUTE = '/api/dsh-trae2api/quota'
 /** Host route serving the model catalog and its origin; `?refresh` re-asks upstream. */
@@ -57,6 +65,10 @@ export const SUGGESTION_EVENT_ROUTE = '/api/dsh-trae2api/suggestion/event'
  * `POST {action:'disable', id}`        → unpublish.
  * `GET  ?sessions=1`                   → the account's real chat sessions, the
  *                                        only source of a `chat_session_id`.
+ * `GET  ?transcript=<dsh session id>`  → what "share this session" would send:
+ *                                        row and question counts, no text.
+ * `POST {session, mode}`               → share the dsh session on screen via the
+ *                                        mirror, on the consumer site.
  */
 export const SHARE_ROUTE = '/api/dsh-trae2api/share'
 /** Environment fallback for `cueUserId`. */
@@ -69,15 +81,26 @@ export interface Config {
   patEnv: Volatile<string>
   host: string
   /**
-   * Origin the share API is spoken on. Empty = the CN consumer host
-   * (`share.traecontent.cn`), which is the only one that answers a
-   * `share_session_id` minted by the consumer site.
+   * Origin the share API is spoken on. Empty = `work.trae.cn`, the origin the
+   * Trae front end falls back to (`resolveCnOrigin()`); `share.traecontent.cn`
+   * serves the same routes. The link itself is always built on
+   * `share.traecontent.cn`.
    *
-   * Measured: the two deployments keep **separate share namespaces** — a
-   * consumer share id is `200` on `share.traecontent.cn` / `work.trae.cn` and
-   * `404 992700` on `api.enterprise.trae.cn`, while the enterprise host still
-   * serves the write endpoints (401 without a JWT). So a link read here is not
-   * automatically the link the enterprise account would mint, and vice versa.
+   * This is not just a deployment detail — it picks what the link *is*. The two
+   * deployments keep **separate share namespaces**, measured both ways:
+   *
+   *   minted on work.trae.cn          → share.traecontent.cn 200, enterprise 404 992700
+   *   minted on api.enterprise.trae.cn → enterprise 200,       share.traecontent.cn 404 992700
+   *
+   * and only the consumer site's page opens without a login: the enterprise
+   * console renders a sign-in form for `/share/<id>` even though its data API
+   * answers anonymously. So a link meant for someone outside the tenant has to
+   * be minted here.
+   *
+   * An enterprise PAT writes a consumer session without complaint (measured:
+   * createSession + sendMessage + createShare all 200 on work.trae.cn). Which
+   * seat pays for those turns is not something this API states, so minting
+   * across deployments is the user's call, not a silent default.
    */
   shareHost: string
   /** Host serving the quota (额度) API; empty = ask CheckLogin, fall back to api.trae.cn. */
@@ -155,7 +178,7 @@ export const Config: Schema<Config> = Schema.object({
     .description('Trae 个人访问令牌（PAT）在凭据库里的名字'),
   host: Schema.string().default(TRAE_HOST),
   shareHost: Schema.string().default(SHARE_HOST)
-    .description('分享接口所在的站点；空 = share.traecontent.cn。企业版与消费版是两个独立的分享命名空间，互不可见'),
+    .description('分享接口所在的站点；空 = trae-api-cn.mchost.guru（TRAE SOLO CN 客户端的写接口，链接拼在 share.traecontent.cn 上）。企业版与消费版是两个独立的分享命名空间，互不可见'),
   payHost: Schema.string().default(''),
   consoleHost: Schema.string().default(TOB_CONSOLE_HOST),
   consoleEmail: Schema.string().default(''),
@@ -313,6 +336,7 @@ export function apply(ctx: Context, config: Config): void {
   // Next-input suggestions ride on the adapter: it reports finished turns and
   // runs the side completion. `adapter` is assigned right below. Built either
   // way and gated by `enabled`, so the switch works without a restart.
+  const transcripts = new TranscriptStore()
   const suggestions = new TraeSuggestions({
     complete: (model, system, user, signal) => adapter.complete(model, system, user, signal),
     model: config.suggestModel,
@@ -342,7 +366,22 @@ export function apply(ctx: Context, config: Config): void {
       try { return anyCtx.get('attachments') as import('./adapter.ts').AttachmentStoreLike | undefined } catch { return undefined }
     },
     onTurnStart: (sessionId: string) => { suggestions.turnStarted(sessionId) },
-    onTurnEnd: turn => { suggestions.turnEnded(turn) },
+    onTurnEnd: (turn) => {
+      // What "share this session" mirrors: the plugin cannot read the
+      // harness's own transcript, so it keeps the one each finished turn
+      // shows it.
+      try {
+        transcripts.set(
+          turn.sessionId,
+          transcriptOf(turn.options.messages as never, turn.answer),
+          conversationTurns(turn.options.messages as never, turn.answer, {
+            ...turn.reasoning ? { reasoning: turn.reasoning } : {},
+            model: turn.model,
+          }),
+        )
+      } catch { /* never fail a turn */ }
+      suggestions.turnEnded(turn)
+    },
     logger,
   })
 
@@ -367,15 +406,50 @@ export function apply(ctx: Context, config: Config): void {
     userAgent,
     logger,
   })
+  /**
+   * The same API on the model host (the enterprise deployment). The PAT's JWT
+   * belongs to an enterprise seat, whose chat sessions may well live there and
+   * not on the consumer site; the session list asks both, the consumer one
+   * first, and a mint goes to whichever host the picked session came from.
+   */
+  const shareClients = new Map<string, TraeShare>([[share.host, share]])
+  if (!shareClients.has(host)) {
+    shareClients.set(host, new TraeShare({ host, auth, userAgent, logger }))
+  }
+
+  /**
+   * The share byline. The client sends `currentUser.username.trim()` (report
+   * v2 shows a real name there); this plugin has no `currentUser`, so it asks
+   * GetUserInfo and the JWT's claims, in that order. Best effort: a missing
+   * name leaves the byline blank and never costs the link. When neither has
+   * one, the key names (not values) both offered are logged once, so the
+   * right field can be pinned down.
+   */
+  let bylineMissLogged = false
+  const creatorNameFor = async (input: { creatorName?: unknown; anonymous?: unknown }): Promise<string> => {
+    if (typeof input.creatorName === 'string' && input.creatorName.trim()) return input.creatorName.trim()
+    if (input.anonymous === true) return ''
+    let user: Awaited<ReturnType<typeof userInfo.get>> | undefined
+    try { user = await userInfo.get() } catch { /* fall through to the JWT */ }
+    if (user?.username) return user.username
+    let session: Awaited<ReturnType<typeof auth.get>> | undefined
+    try { session = await auth.get() } catch { /* blank byline */ }
+    if (session?.name) return session.name
+    if (!bylineMissLogged) {
+      bylineMissLogged = true
+      logger.info(`dsh-trae2api: share byline has no name; GetUserInfo UserInfo keys [${(user?.infoKeys ?? []).join(', ')}], JWT data keys [${(session?.claimKeys ?? []).join(', ')}]`)
+    }
+    return ''
+  }
 
   // A PAT saved from the UI changes no config field; drop the cached JWT.
   ctx.on('credentials/reference-updated' as never, ((ref: string) => {
-    if (ref === config.patEnv.get()) { auth.reset(); quota.reset(); userInfo.reset(); catalog.reset(); share.reset() }
+    if (ref === config.patEnv.get()) { auth.reset(); quota.reset(); userInfo.reset(); catalog.reset(); for (const c of shareClients.values()) c.reset() }
     // The console password is its own credential; a new one invalidates the
     // cached console session, not the JWT.
     if (ref === config.consolePasswordEnv.get() || ref === config.consoleEmailEnv.get()) { tob.reset(); quota.reset() }
   }) as never)
-  ctx.on('loader/volatile-update' as never, (() => { auth.reset(); quota.reset(); userInfo.reset(); catalog.reset(); share.reset() }) as never)
+  ctx.on('loader/volatile-update' as never, (() => { auth.reset(); quota.reset(); userInfo.reset(); catalog.reset(); for (const c of shareClients.values()) c.reset() }) as never)
 
   // One catalog refresh per plugin start, without waiting for the first turn:
   // reloading the plugin is how a user asks for a fresh model list. A failure
@@ -551,27 +625,114 @@ export function apply(ctx: Context, config: Config): void {
               // needs. Anything else: one share by id, read anonymously.
               if (url.searchParams.has('sessions')) {
                 const pageSize = Math.min(100, Math.max(1, Number(url.searchParams.get('page_size')) || 20))
-                const { items } = await share.sessions(pageSize)
+                // Ask each host in turn and stop at the first with sessions.
+                // What every host answered goes back too (and to the log), so
+                // an empty list says where it looked and what came back
+                // instead of a bare "no sessions".
+                const probes: { host: string; count?: number; keys?: string[]; error?: string; code?: number }[] = []
+                const found: { host: string; session: Record<string, unknown> }[] = []
+                for (const client of shareClients.values()) {
+                  try {
+                    const answer = await client.sessions(pageSize)
+                    probes.push({ host: answer.host, count: answer.items.length, keys: answer.keys })
+                    for (const session of answer.items) found.push({ host: answer.host, session })
+                    if (answer.items.length) break
+                  } catch (error) {
+                    probes.push({
+                      host: client.host,
+                      error: error instanceof Error ? error.message : String(error),
+                      ...error instanceof ShareError ? { code: error.code } : {},
+                    })
+                  }
+                }
+                for (const { host: from, session } of found.slice(0, 10)) {
+                  logger.info(`dsh-trae2api: share session on ${from}: ${JSON.stringify(Object.fromEntries(
+                    Object.entries(session).filter(([, v]) => typeof v !== 'object' || v === null).map(([k, v]) => [k, typeof v === 'string' ? v.slice(0, 60) : v]),
+                  ))}`)
+                }
+                logger.info(`dsh-trae2api: share sessions ${probes.map(p => p.error
+                  ? `${p.host} error ${p.code ?? ''} ${p.error}`
+                  : `${p.host} ${p.count} item(s), data keys [${(p.keys ?? []).join(', ')}]`).join('; ')}`)
+                if (found.length === 0 && probes.every(p => p.error)) {
+                  return Response.json({ ok: false, error: probes.map(p => `${p.host}: ${p.error}`).join('；'), probes }, { status: 502 })
+                }
+                const str = (s: Record<string, unknown>, ...keys: string[]): string | undefined => {
+                  for (const key of keys) if (typeof s[key] === 'string' && s[key]) return s[key] as string
+                  return undefined
+                }
                 return Response.json({
                   ok: true,
-                  value: items.map(s => ({
-                    chatSessionId: String(s.chat_session_id ?? s.chatSessionId ?? ''),
-                    name: typeof s.name === 'string' ? s.name : undefined,
-                    status: typeof s.status === 'string' ? s.status : undefined,
-                    mode: typeof s.mode === 'string' ? s.mode : undefined,
+                  value: found.map(({ host: from, session: s }) => ({
+                    chatSessionId: str(s, 'chat_session_id', 'chatSessionId', 'session_id', 'sessionId', 'id') ?? '',
+                    name: str(s, 'name', 'title', 'session_name', 'sessionName'),
+                    status: str(s, 'status'),
+                    mode: str(s, 'mode'),
                     updatedAt: s.updated_at ?? s.updatedAt ?? undefined,
-                  })),
+                    host: from,
+                  })).filter(s => s.chatSessionId),
+                  probes,
+                })
+              }
+              // `?mine=1`: the shares this account minted, on every host this
+              // plugin speaks to, with the link each one opens at.
+              if (url.searchParams.has('mine')) {
+                const probes: { host: string; count?: number; keys?: string[]; error?: string }[] = []
+                const items: Record<string, unknown>[] = []
+                for (const client of shareClients.values()) {
+                  try {
+                    const answer = await client.list()
+                    probes.push({ host: answer.host, count: answer.items.length, keys: answer.keys })
+                    for (const item of answer.items) {
+                      items.push({
+                        shareSessionId: item.shareSessionId,
+                        url: shareUrl(item.shareSessionId, shareOriginFor(answer.host)),
+                        title: item.title,
+                        status: item.status,
+                        shareType: item.shareType,
+                        createdAt: item.createdAt,
+                        expiresAt: item.expiresAt,
+                        host: answer.host,
+                      })
+                    }
+                  } catch (error) {
+                    probes.push({ host: client.host, error: error instanceof Error ? error.message : String(error) })
+                  }
+                }
+                logger.info(`dsh-trae2api: my shares ${probes.map(p => p.error ? `${p.host} error ${p.error}` : `${p.host} ${p.count} item(s), data keys [${(p.keys ?? []).join(', ')}]`).join('; ')}`)
+                if (items.length === 0 && probes.every(p => p.error)) {
+                  return Response.json({ ok: false, error: probes.map(p => `${p.host}: ${p.error}`).join('；'), probes }, { status: 502 })
+                }
+                return Response.json({ ok: true, value: items, probes })
+              }
+              // `?transcript=<session>`: the size of what sharing this session
+              // would send, so the card can state the cost before the click.
+              if (url.searchParams.has('transcript')) {
+                const kept = transcripts.get(url.searchParams.get('transcript') ?? '')
+                return Response.json({
+                  ok: true,
+                  value: kept
+                    ? {
+                      rows: kept.rows.length,
+                      questions: userTurns(kept.rows),
+                      turns: kept.turns.length,
+                      steps: kept.turns.reduce((n, turn) => n + turn.steps.length, 0),
+                      at: kept.at,
+                    }
+                    : null,
                 })
               }
               const id = url.searchParams.get('id') ?? ''
               if (!id) return Response.json({ ok: false, error: 'expected ?id=<share_session_id> or ?sessions=1' }, { status: 400 })
               const session = await share.get(id, { force: url.searchParams.has('refresh') })
-              // The page URL follows the type: a conversation lives at /share/,
-              // an HTML artifact at /artifact/ (the front end redirects between
-              // them too).
+              // The page URL follows BOTH the type and the namespace: a
+              // conversation lives at /share/, an HTML artifact at /artifact/,
+              // and the origin is whichever front end serves the API host that
+              // answered — an enterprise id opens on the console site, not on
+              // the consumer one (shareOriginFor).
+              const pageOrigin = shareOriginFor(session.host ?? share.host)
               const pageUrl = session.shareType === 'artifact' && session.artifactPath
-                ? artifactUrl(id)
-                : shareUrl(id)
+                ? artifactUrl(id, pageOrigin)
+                : shareUrl(id, pageOrigin)
               return Response.json({
                 ok: true,
                 value: {
@@ -593,39 +754,269 @@ export function apply(ctx: Context, config: Config): void {
               })
             }
             let input: {
-              action?: unknown; id?: unknown
+              action?: unknown; id?: unknown; host?: unknown; session?: unknown
               chatSessionId?: unknown; turnIds?: unknown
               anonymous?: unknown; creatorName?: unknown; skipAudit?: unknown
+              turns?: unknown; maxTurns?: unknown; mode?: unknown
             }
             try { input = await request.json() as typeof input } catch {
               return Response.json({ ok: false, error: 'invalid JSON' }, { status: 400 })
             }
-            const action = typeof input.action === 'string' ? input.action : 'create'
-            if (action === 'disable') {
+            let action = typeof input.action === 'string' ? input.action : 'create'
+            // The host the picked session was listed on; only a host this
+            // plugin already speaks to is accepted, never one from the body.
+            let writer = (typeof input.host === 'string' && shareClients.get(input.host.replace(/\/+$/, ''))) || share
+            // Lifecycle (report v2 §3.2): `disable` closes a link (anonymous
+            // reads become 403 992701), `enable` reopens it, `delete` revokes it
+            // for good (410 992702). Only the account that minted it may.
+            if (action === 'disable' || action === 'enable' || action === 'delete') {
               if (typeof input.id !== 'string' || !input.id) {
-                return Response.json({ ok: false, error: 'expected { action:"disable", id }' }, { status: 400 })
+                return Response.json({ ok: false, error: `expected { action:"${action}", id }` }, { status: 400 })
               }
-              return Response.json({ ok: true, value: await share.setStatus(input.id, 'disabled') })
+              const value = action === 'delete'
+                ? await writer.remove(input.id)
+                : await writer.setStatus(input.id, action === 'enable' ? 'active' : 'disabled')
+              logger.info(`dsh-trae2api: share ${input.id} on ${writer.host}: ${action}`)
+              return Response.json({ ok: true, value })
+            }
+            // `{ action: 'mirror', turns: [{role, text}], maxTurns }`: replay a
+            // conversation into the chat service and mint a link from it.
+            //
+            // This is the only route that makes the link the user actually
+            // wants: llm_raw_chat leaves no chat-service ids behind, so sharing
+            // a dsh session means building an equivalent one upstream first.
+            //
+            // It costs a model call per user turn and says so rather than
+            // hiding it: `maxTurns` has no default, so the caller must decide
+            // how much to spend before a single turn is sent.
+            // `{ session: <dsh session id>, mode }`: share the session on screen.
+            //
+            // Measured: the chat service has never heard of a dsh session —
+            // its upstream conversation id answers 991200 "chat session not
+            // found", because llm_raw_chat leaves nothing behind. So the
+            // session is always shared through the mirror, on the consumer
+            // site (work.trae.cn -> share.traecontent.cn, no login wall), from
+            // the transcript the plugin kept of its last finished Trae turn:
+            //
+            //  - `mode: 'transcript'` (default): the whole transcript as one
+            //    message. One model call, and the page shows what was really
+            //    said, answers included.
+            //  - `mode: 'replay'`: each question sent again, one model call
+            //    each; the answers on the page are Trae's new ones, not the
+            //    session's own. `maxTurns` is required, as for any mirror.
+            //
+            // `turns` in the body still overrides the kept transcript.
+            if (typeof input.session === 'string' && input.session && input.chatSessionId === undefined) {
+              const kept = transcripts.get(input.session)
+              const rows = Array.isArray(input.turns) && input.turns.length > 0
+                ? input.turns as { role: 'user' | 'assistant'; text: string }[]
+                : kept?.rows
+              if (!rows || rows.length === 0) {
+                return Response.json({
+                  ok: false,
+                  code: 'NO_TRANSCRIPT',
+                  error: '插件还没看到这条会话的对话内容：要在插件启动后用 Trae 模型跑完一轮，才能分享。发一轮再点。',
+                }, { status: 400 })
+              }
+              // Default: the session as a Trae local conversation — every turn
+              // its own bubbles, each answer with its steps, no model call
+              // (local-share.ts). `transcript` / `replay` go through the mirror.
+              // Turns in the body are a conversation to replay (the mirror box);
+              // without them the kept session is shared as it happened.
+              const mode = input.mode === 'replay' || input.mode === 'transcript' || input.mode === 'local'
+                ? input.mode
+                : Array.isArray(input.turns) && input.turns.length > 0 ? 'replay' : 'local'
+              if (mode === 'local') {
+                if (!kept || kept.turns.length === 0) {
+                  return Response.json({ ok: false, code: 'NO_TRANSCRIPT', error: '插件还没看到这条会话的对话内容：要在插件启动后用 Trae 模型跑完一轮，才能分享。发一轮再点。' }, { status: 400 })
+                }
+                const creatorName = await creatorNameFor(input)
+                const built = localShareBody(kept.turns, {
+                  sessionId: input.session,
+                  creatorName,
+                  anonymous: input.anonymous === true,
+                  turnTimes: kept.times,
+                  updatedAt: kept.at,
+                })
+                const bytes = Buffer.byteLength(JSON.stringify(built.body))
+                try {
+                  const link = await share.createLocal(built.body)
+                  logger.info(`dsh-trae2api: share current session ${input.session} as local conversation on ${share.host} (${bytes} bytes): ${built.turns} turn(s)${built.dropped ? `, ${built.dropped} older dropped` : ''} -> ${link.shareSessionId} (${link.status ?? '?'})`)
+                  return Response.json({
+                    ok: true,
+                    value: {
+                      url: link.url, link, title: link.title,
+                      turns: built.turns, dropped: built.dropped, modelCalls: 0, host: share.host,
+                    },
+                  })
+                } catch (error) {
+                  logger.info(`dsh-trae2api: share current session ${input.session} as local conversation refused (${bytes} bytes): ${error instanceof Error ? error.message : String(error)}`)
+                  throw error
+                }
+              }
+              if (mode === 'transcript') {
+                const message = transcriptMessage(rows)
+                input.turns = [{ role: 'user', text: message.text }]
+                input.maxTurns = 1
+              } else {
+                input.turns = rows
+              }
+              // The consumer site, whatever the body says: it is the one whose
+              // share page opens without a login.
+              input.host = share.host
+              action = 'mirror'
+              logger.info(`dsh-trae2api: share current session ${input.session} via mirror (${mode}, ${rows.length} row(s), ${userTurns(rows)} question(s))`)
+            }
+            if (action === 'mirror') {
+              if (!Array.isArray(input.turns)) {
+                return Response.json({ ok: false, error: 'expected { action:"mirror", turns: [{ role, text }], maxTurns }' }, { status: 400 })
+              }
+              const turns: { role: 'user' | 'assistant'; text: string }[] = []
+              for (const entry of input.turns) {
+                if (typeof entry !== 'object' || entry === null) continue
+                const row = entry as Record<string, unknown>
+                const role = row.role
+                const text = row.text
+                if ((role !== 'user' && role !== 'assistant') || typeof text !== 'string' || !text) continue
+                turns.push({ role, text })
+              }
+              if (turns.filter(t => t.role === 'user').length === 0) {
+                return Response.json({ ok: false, error: 'turns 里没有 user 回合可镜像' }, { status: 400 })
+              }
+              // No default on purpose: each user turn is one real model call.
+              const maxTurns = Number(input.maxTurns)
+              if (!Number.isInteger(maxTurns) || maxTurns <= 0) {
+                return Response.json({
+                  ok: false,
+                  error: 'expected maxTurns: a positive integer (each user turn is one model call)',
+                  userTurns: turns.filter(t => t.role === 'user').length,
+                }, { status: 400 })
+              }
+              // Mirrored conversations are only worth minting on the site the
+              // link can actually be opened from — the consumer one, whose
+              // /share/ page has no login wall. An explicit `host` from the
+              // body is still honoured when this plugin already speaks it.
+              const mirrorHost = (typeof input.host === 'string' && shareClients.get(input.host.replace(/\/+$/, ''))?.host)
+                || share.host
+              try {
+                const byline = await creatorNameFor(input)
+                const mirrored = await mirrorAndShare(turns, {
+                  auth,
+                  host: mirrorHost,
+                  userAgent,
+                  maxTurns,
+                  ...byline ? { creatorName: byline } : {},
+                  ...input.anonymous === true ? { anonymous: true } : {},
+                  logger,
+                })
+                logger.info(
+                  `dsh-trae2api: mirrored ${mirrored.modelCalls} turn(s) into ${mirrored.chatSessionId}`
+                  + ` on ${mirrorHost} -> ${mirrored.link.shareSessionId}${mirrored.partial ? ' (partial)' : ''}`,
+                )
+                return Response.json({
+                  ok: true,
+                  value: {
+                    chatSessionId: mirrored.chatSessionId,
+                    // Prefer the URL the mirror built (it already resolves the
+                    // origin from the host that minted it); `link` carries the
+                    // rest of what a share is.
+                    url: mirrored.url,
+                    link: mirrored.link,
+                    answers: mirrored.answers,
+                    // True when a turn did not settle: the link still exists and
+                    // covers the turns that did, which is why this is a value
+                    // and not an error.
+                    partial: mirrored.partial,
+                    modelCalls: mirrored.modelCalls,
+                    host: mirrorHost,
+                  },
+                })
+              } catch (error) {
+                const code = error instanceof ShareError ? error.code : undefined
+                return Response.json({
+                  ok: false,
+                  error: error instanceof Error ? error.message : String(error),
+                  ...code !== undefined ? { code } : {},
+                }, { status: error instanceof ShareError && error.status ? error.status : 502 })
+              }
             }
             if (action !== 'create') {
-              return Response.json({ ok: false, error: 'expected action: "create" | "disable"' }, { status: 400 })
+              return Response.json({ ok: false, error: 'expected action: "create" | "disable" | "mirror"' }, { status: 400 })
             }
             if (typeof input.chatSessionId !== 'string' || !input.chatSessionId) {
-              return Response.json({ ok: false, error: 'expected { chatSessionId } — see ?sessions=1 for the ids' }, { status: 400 })
+              return Response.json({ ok: false, error: 'expected { chatSessionId } or { session } — see ?sessions=1 for the ids' }, { status: 400 })
             }
-            // `turnIds` omitted = every turn that session has, which is what the
-            // front end's "select all" sends anyway.
+            const chatSessionId = input.chatSessionId
+            const tag = `chat session ${chatSessionId}`
+            // `turnIds` omitted = "select all": every turn the session has, cut
+            // to the most recent 50 the front end allows in one share.
+            let allTurns: string[] | undefined
+            if (!Array.isArray(input.turnIds)) {
+              try { allTurns = await writer.turnsOf(chatSessionId) } catch (error) {
+                logger.info(`dsh-trae2api: share ${tag} on ${writer.host}: reading turns failed: ${error instanceof Error ? error.message : String(error)}`)
+                // Measured 2026-11-06: the chat service answers an
+                // llm_raw_chat conversation id with 991200 "chat session not
+                // found" — it never saw this conversation, so there is
+                // nothing it could share.
+                throw error
+              }
+            }
             const turnIds = Array.isArray(input.turnIds)
               ? input.turnIds.filter((t): t is string => typeof t === 'string' && t !== '')
-              : await share.turnsOf(input.chatSessionId)
-            const link = await share.create({
-              chatSessionId: input.chatSessionId,
-              turnIds,
-              anonymous: input.anonymous === true,
-              ...typeof input.creatorName === 'string' ? { creatorName: input.creatorName } : {},
-              skipAudit: input.skipAudit === true,
+              : latestTurns(allTurns!)
+            // The front end sends `currentUser.username.trim()`; an empty name
+            // leaves the share page's byline blank. Best effort: a failed
+            // GetUserInfo must not cost the link.
+            const creatorName = await creatorNameFor(input)
+            if (turnIds.length === 0) {
+              logger.info(`dsh-trae2api: share ${tag} on ${writer.host}: no turns`)
+              return Response.json({
+                ok: false,
+                error: '这条会话里没有可分享的轮次（没有带 turn_id 的回答）',
+              }, { status: 400 })
+            }
+            let link
+            try {
+              link = await writer.create({
+                chatSessionId,
+                turnIds,
+                anonymous: input.anonymous === true,
+                creatorName,
+                skipAudit: input.skipAudit === true,
+              })
+            } catch (error) {
+              logger.info(`dsh-trae2api: share ${tag} on ${writer.host}: create failed: ${error instanceof Error ? error.message : String(error)}`)
+              throw error
+            }
+            // Read the new link back the way a recipient would (anonymously,
+            // on the consumer site). A share minted in the enterprise
+            // namespace is not visible there, and saying so beats handing
+            // out a link that opens to "not found".
+            let reachable: boolean | undefined
+            let readableOnWriter: boolean | undefined
+            if (link.status === 'passed') {
+              try { await share.get(link.shareSessionId, { force: true }); reachable = true } catch (error) {
+                if (error instanceof ShareError && error.code === 992700) reachable = false
+              }
+              // Not on the consumer site: is it at least readable where it was
+              // minted? That tells a namespace split from a share that is not
+              // there at all.
+              if (reachable === false && writer !== share) {
+                try { await writer.get(link.shareSessionId, { force: true }); readableOnWriter = true } catch { readableOnWriter = false }
+              }
+            }
+            logger.info(`dsh-trae2api: share ${tag} on ${writer.host}: minted ${link.shareSessionId} status ${link.status ?? '?'} turns ${turnIds.length} reachable ${reachable ?? '?'} readable-on-writer ${readableOnWriter ?? '?'}`)
+            return Response.json({
+              ok: true,
+              value: {
+                ...link,
+                host: writer.host,
+                turnCount: turnIds.length,
+                ...allTurns ? { totalTurns: allTurns.length } : {},
+                ...reachable !== undefined ? { reachable } : {},
+                ...readableOnWriter !== undefined ? { readableOnWriter } : {},
+              },
             })
-            return Response.json({ ok: true, value: link })
           } catch (error) {
             const code = error instanceof ShareError ? error.code : undefined
             const status = error instanceof ShareError && error.status ? error.status : 502
