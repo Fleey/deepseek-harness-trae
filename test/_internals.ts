@@ -17,3 +17,8 @@ export { parseTobQuota, TobConsole, TOB_LOGIN_PATH, TOB_QUOTA_PATH, TOB_USAGE_PA
 export { TraeSuggestions, suggestPrompt, parseSuggestions, followsAsk, suggestSystem, SUGGEST_SYSTEM, SUGGEST_SUBAGENT_RULES, SUGGEST_EXAMPLE, MAX_CARDS, MAX_CHOICES } from '../src/trae/suggest.ts'
 export { TraeCueReporter, REPORT_PATH } from '../src/trae/cue.ts'
 export { parseUserInfo, TraeUserInfo, USER_INFO_PATH } from '../src/trae/user.ts'
+export {
+  TraeShare, ShareError, parseSession, parseMessages, parseEntries, turnIdsOf,
+  shareUrl, artifactUrl, SHARE_ORIGIN, SHARE_PATH, SESSIONS_PATH, TURN_LIMIT,
+  AUDIT_ATTEMPTS, AUDIT_INTERVAL_MS, AUDIT_TIMEOUT_MS, SHARE_CODES,
+} from '../src/trae/share.ts'
