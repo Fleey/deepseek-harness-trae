@@ -599,6 +599,99 @@ export class TraeShare {
   }
 
   /**
+   * 把一个打好的 artifact 包发成网页链接（报告 v3 §6，客户端 `V` / `et` /
+   * `er` / `ea`）：presign → PUT zip → createLocalArtifactShare。
+   * `(localSessionId, artifactPath)` 是服务端的幂等键：同一个键再发一次是更新
+   * 内容，链接不变。
+   */
+  async shareArtifact(input: {
+    localSessionId: string
+    artifactPath: string
+    zip: Uint8Array
+    contentHash: string
+    signal?: AbortSignal
+  }): Promise<ShareLink & { title?: string; createdAt?: string }> {
+    const token = await this.token()
+    const presign = await this.call('POST', `${SHARE_PATH}/local_artifact/presign-upload`, {
+      token,
+      body: {
+        local_session_id: input.localSessionId,
+        artifact_path: input.artifactPath,
+        content_length: input.zip.byteLength,
+        content_hash: input.contentHash,
+      },
+      ...input.signal ? { signal: input.signal } : {},
+    })
+    if (presign.status === 401) throw new ShareError(describe(1001, 'PAT 缺失或失效'), 1001, 401)
+    if (!isObject(presign.body)) throw new ShareError(`上传凭证响应不是 JSON（HTTP ${presign.status}）：${presign.text.slice(0, 200)}`, -1, presign.status)
+    const presignCode = Number(field(presign.body, 'code') ?? 0)
+    if (presignCode !== 0) throw new ShareError(describe(presignCode, field(presign.body, 'message')), presignCode, presign.status)
+    const grant = field(presign.body, 'data')
+    const uploadUrl = isObject(grant) ? field(grant, 'upload_url', 'uploadUrl') : undefined
+    const resourceUri = isObject(grant) ? field(grant, 'resource_uri', 'resourceUri') : undefined
+    if (typeof uploadUrl !== 'string' || typeof resourceUri !== 'string') throw new ShareError('上传凭证里没有 upload_url / resource_uri', 0, presign.status)
+    // `upload_headers` is a JSON string of extra headers the signed URL expects.
+    let extra: Record<string, string> = {}
+    const rawHeaders = isObject(grant) ? field(grant, 'upload_headers', 'uploadHeaders') : undefined
+    try {
+      const parsed = typeof rawHeaders === 'string' ? JSON.parse(rawHeaders) as unknown : rawHeaders
+      if (isObject(parsed)) extra = Object.fromEntries(Object.entries(parsed).filter(([, v]) => typeof v === 'string')) as Record<string, string>
+    } catch { /* none */ }
+    let put: Response
+    try {
+      put = await fetch(uploadUrl, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/zip', ...extra },
+        body: new Blob([new Uint8Array(input.zip)], { type: 'application/zip' }),
+        signal: input.signal ? AbortSignal.any([input.signal, AbortSignal.timeout(120_000)]) : AbortSignal.timeout(120_000),
+      })
+    } catch (error) {
+      throw new ShareError(`上传失败（${error instanceof Error ? error.message : String(error)}）`, -1)
+    }
+    if (!put.ok) throw new ShareError(`上传失败：HTTP ${put.status} ${(await put.text()).slice(0, 200)}`, -1, put.status)
+
+    const { status, body, text } = await this.call('POST', `${SHARE_PATH}/local_artifact`, {
+      token,
+      body: {
+        local_session_id: input.localSessionId,
+        artifact_path: input.artifactPath,
+        resource_uri: resourceUri,
+        content_hash: input.contentHash,
+      },
+      // The server unpacks and audits the package before answering.
+      timeoutMs: 60_000,
+      ...input.signal ? { signal: input.signal } : {},
+    })
+    if (status === 401) throw new ShareError(describe(1001, 'PAT 缺失或失效'), 1001, 401)
+    if (!isObject(body)) throw new ShareError(`文件分享响应不是 JSON（HTTP ${status}）：${text.slice(0, 200)}`, -1, status)
+    const code = Number(field(body, 'code') ?? 0)
+    if (code !== 0) throw new ShareError(describe(code, field(body, 'message')), code, status)
+    const data = field(body, 'data')
+    const id = isObject(data) ? field(data, 'share_session_id', 'shareSessionId') : undefined
+    if (typeof id !== 'string' || !id) throw new ShareError('文件分享响应里没有 share_session_id', 0, status)
+    const initial = isObject(data) ? field(data, 'status') : undefined
+    if (initial === 'audit_failed' || initial === 'failed') throw new ShareError(describe(993401, 'share audit failed'), 993401, status)
+    let auditPolls = 0
+    let final = typeof initial === 'string' ? initial : undefined
+    if (initial === 'auditing') {
+      auditPolls = await this.awaitAudit(id, input.signal)
+      final = 'active'
+    }
+    const expiresAt = isObject(data) ? field(data, 'expires_at', 'expiresAt') : undefined
+    const createdAt = isObject(data) ? field(data, 'created_at', 'createdAt') : undefined
+    const title = isObject(data) ? field(data, 'title') : undefined
+    return {
+      shareSessionId: id,
+      url: artifactUrl(id, shareOriginFor(this.base())),
+      ...final ? { status: final } : {},
+      ...typeof expiresAt === 'string' ? { expiresAt } : {},
+      ...typeof createdAt === 'string' ? { createdAt } : {},
+      ...typeof title === 'string' ? { title } : {},
+      auditPolls,
+    }
+  }
+
+  /**
    * 审核轮询，对齐前端 `P()`（报告 v2 §1.3）：最多 15 次、间隔 1s、单次
    * timeout 5s、整体 120s。
    *

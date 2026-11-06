@@ -76,12 +76,23 @@ export interface ConversationTurn {
 
 /**
  * Lines the harness writes into a user message for the model's benefit, not
- * the user's: a model switch notice and the turn's sampled clock. They would
- * read as part of the question on a share page.
+ * the user's: a model switch notice and the three lines of the time-context
+ * snapshot (`packages/context/time-context/src/index.ts` `renderText`):
+ *
+ *   Time sampled while preparing turn N, step M: <timestamp>
+ *   Browser time zone for this request: <zone>. <instruction>
+ *   Elapsed since the preceding model-visible message|step context: <duration>
+ *
+ * They would read as part of the question — and, being the first line of the
+ * first message, as the title of a share. `isContextMessage` already drops the
+ * message whole; this is the second line of defence for a request whose
+ * `source` did not survive, and for a user message the model switch annotated.
  */
 const HARNESS_NOTES = [
   /^\[model changed:[^\]]*\]\s*$/,
   /^Time sampled while preparing turn \d+, step \d+: .*$/,
+  /^Browser time zone for this request: .*$/,
+  /^Elapsed since the preceding (?:model-visible message|step context): .*$/,
 ]
 
 function stripNotes(text: string): string {
@@ -91,6 +102,12 @@ function stripNotes(text: string): string {
     .join('\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
+}
+
+/** A user-role message the harness wrote (`source.kind` other than `user`). */
+export function isContextMessage(message: RequestMessage): boolean {
+  const kind = (message as { source?: { kind?: unknown } }).source?.kind
+  return message.role === 'user' && typeof kind === 'string' && kind !== 'user'
 }
 
 function blocks(message: RequestMessage): readonly ContentBlock[] {
@@ -135,6 +152,11 @@ export function conversationTurns(
   for (const message of messages) {
     const content = blocks(message)
     if (message.role === 'user') {
+      // The harness sends its own context as user messages too — the runtime
+      // snapshot, the sampled clock and time zone, … — each with a `source`
+      // whose kind is not `user`. Those are for the model, not part of what
+      // was asked.
+      if (isContextMessage(message)) continue
       const text = stripNotes(textOf(content))
       if (!text) continue
       current = { user: text, steps: [], answer: '' }

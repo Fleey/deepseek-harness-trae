@@ -700,3 +700,74 @@ test('share route: my shares are listed with their links, and closed, reopened o
     assert.equal((await post({ action: 'delete' })).status, 400)
   } finally { globalThis.fetch = original }
 })
+
+test('share route: files a session wrote are offered, and one is shared as a page', async () => {
+  const { mkdtempSync, writeFileSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const dir = mkdtempSync(join(tmpdir(), 'trae-files-'))
+  const report = join(dir, 'report.md')
+  writeFileSync(report, '# Weekly\n\nAll good.\n')
+  const routes = new Map()
+  const adapters = {}
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    effect() {}, on() {},
+    get: (name) => name === 'credentials' ? { resolve: async () => ({ value: 'eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQxMDI0NDQ4MDB9.c2ln' }) } : undefined,
+    inject: (deps, cb) => {
+      if (deps.includes('connection')) cb({ connection: { fetch: { register: (route) => { routes.set(route.path, route) } } } })
+    },
+    fiber: { entry: { options: { id: 'trae2api' } } },
+    llm: { registerAdapter: (r, a) => { for (const k of r) adapters[k] = a }, registerConfigurableProviders() {} },
+  }
+  plugin.apply(ctx, plugin.Config({ catalogSource: 'builtin', suggestions: false }))
+  const route = routes.get(plugin.SHARE_ROUTE)
+  const original = globalThis.fetch
+  const seen = []
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url)
+    seen.push(`${init.method ?? 'GET'} ${u}`)
+    if (u.endsWith('/api/ide/v2/llm_raw_chat')) return new Response('event: output\ndata: {"response":"Wrote it."}\n\n', { status: 200 })
+    if (u.endsWith('/local_artifact/presign-upload')) return Response.json({ code: 0, data: { upload_url: 'https://tos.invalid/put', resource_uri: 'local-artifact://v1/x' } })
+    if (u.startsWith('https://tos.invalid/')) return new Response('', { status: 200 })
+    if (u.endsWith('/share/local_artifact')) return Response.json({ code: 0, data: { share_session_id: 'ART0000000000A', status: 'active' } })
+    return Response.json({ code: 0 })
+  }
+  try {
+    for await (const _ of adapters.trae.stream({
+      model: 'GLM-5.3', sessionId: 's1', tools: [{ name: 'write', description: '', parameters: {} }],
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'write the report' }] },
+        { role: 'assistant', source: { kind: 'model', provider: 'trae', model: 'GLM-5.3' }, content: [
+          { type: 'tool-call', id: 'w1', name: 'write', arguments: JSON.stringify({ file_path: report, content: '…' }) },
+          { type: 'tool-call', id: 'w2', name: 'write', arguments: JSON.stringify({ file_path: join(dir, 'gone.html'), content: '…' }) },
+          { type: 'tool-call', id: 'w3', name: 'write', arguments: JSON.stringify({ file_path: join(dir, 'data.json'), content: '{}' }) },
+        ] },
+        { role: 'tool', toolCallId: 'w1', content: [{ type: 'text', text: 'ok' }] },
+      ],
+    })) { /* consume */ }
+    const files = await (await route.fetch(new Request(`http://127.0.0.1${plugin.SHARE_ROUTE}?files=s1`))).json()
+    // Only the Markdown / HTML still on disk.
+    assert.deepEqual(files.value.map(f => [f.path, f.kind]), [[report, 'markdown']])
+
+    seen.length = 0
+    const res = await route.fetch(new Request(`http://127.0.0.1${plugin.SHARE_ROUTE}`, {
+      method: 'POST', body: JSON.stringify({ action: 'artifact', session: 's1', path: report }),
+    }))
+    const body = await res.json()
+    assert.equal(body.ok, true, JSON.stringify(body))
+    assert.equal(body.value.url, 'https://share.traecontent.cn/artifact/ART0000000000A')
+    assert.equal(body.value.kind, 'markdown')
+    assert.deepEqual(seen.map(line => line.split(' ')[0]), ['POST', 'PUT', 'POST'])
+    // The list now says it is shared, so the button offers an update.
+    const again = await (await route.fetch(new Request(`http://127.0.0.1${plugin.SHARE_ROUTE}?files=s1`))).json()
+    assert.equal(again.value[0].shared.url, 'https://share.traecontent.cn/artifact/ART0000000000A')
+    // A file of the wrong kind is refused before anything is sent.
+    seen.length = 0
+    const refused = await route.fetch(new Request(`http://127.0.0.1${plugin.SHARE_ROUTE}`, {
+      method: 'POST', body: JSON.stringify({ action: 'artifact', path: join(dir, 'data.json') }),
+    }))
+    assert.equal(refused.status, 400)
+    assert.deepEqual(seen, [])
+  } finally { globalThis.fetch = original }
+})

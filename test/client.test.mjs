@@ -6,7 +6,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 
 /** Slot kinds as the host declares them (dsh-client-ui-conversation / settings). */
-const LIST_SLOTS = new Set(['conversation.input.right', 'conversation.input.dock', 'conversation.composer.dock'])
+const LIST_SLOTS = new Set(['conversation.input.right', 'conversation.input.dock', 'conversation.composer.dock', 'conversation.chat.turnTail', 'deliverables.file.actions'])
 const KEYED_SLOTS = new Set(['plugins.bundle.config', 'settings.models.provider-card'])
 
 function loadClient(react = { createElement: () => null }, forms = []) {
@@ -87,6 +87,10 @@ test('client: every slot registration passes the host registry rules', () => {
   const byName = Object.fromEntries(registered.map(r => [r.name, r]))
   const ids = name => registered.filter(r => r.name === name).map(r => r.id)
   assert.equal(byName['conversation.input.dock'].id, 'trae-choices')
+  // Share buttons ride the host's own file cards: one entry after the turn's
+  // cards, one in the delivered-file card's action slot.
+  assert.equal(byName['conversation.chat.turnTail'].id, 'trae-file-share')
+  assert.equal(byName['deliverables.file.actions'].id, 'trae-file-share')
   assert.equal(byName['conversation.input.overlay'], undefined, 'no Tab ghost text any more')
   // Three entries beside the model picker: the quota chip, the "switching
   // reopens the upstream conversation" notice, and the invisible watcher that
