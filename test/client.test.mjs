@@ -94,25 +94,32 @@ test('client: every slot registration passes the host registry rules', () => {
   assert.deepEqual(ids('conversation.input.right'), ['trae-quota', 'trae-session-watch', 'trae-switch'])
   // The session ids are a tab of their own, not a composer reading.
   assert.equal(byName['conversation.composer.dock'], undefined)
-  // The View tab row is global, so the tab is not on it until a session on
-  // screen says it is running Trae.
-  assert.deepEqual(liveIds('conversation.view'), [])
+  // Two View tabs, and they answer different questions. The share tab is
+  // registered outright: reading a share needs no PAT, so it must not be
+  // hidden behind "this session is on a Trae model" — that gate belongs to the
+  // ids tab alone.
+  assert.deepEqual(liveIds('conversation.view'), ['trae-share'])
+  const shareTab = entry('conversation.view', 'trae-share')
+  assert.equal(shareTab.order, 101)
+  assert.equal(shareTab.label(), '分享链接')
+  // The ids tab is not on the row until a session on screen says it is on Trae.
   const watch = entry('conversation.input.right', 'trae-session-watch').inject('s1')
   watch.watch(true)
-  assert.deepEqual(liveIds('conversation.view'), ['trae-session'])
-  const tab = entry('conversation.view')
+  assert.deepEqual(liveIds('conversation.view'), ['trae-share', 'trae-session'])
+  const tab = entry('conversation.view', 'trae-session')
   // After the shipped views, with a label that follows the active locale.
   assert.equal(tab.order, 100)
   assert.equal(tab.label(), '会话 ID')
   // A second Trae session does not register it twice, and the tab stays while
   // either of them is still on screen.
   entry('conversation.input.right', 'trae-session-watch').inject('s2').watch(true)
-  assert.deepEqual(liveIds('conversation.view'), ['trae-session'])
+  assert.deepEqual(liveIds('conversation.view'), ['trae-share', 'trae-session'])
   watch.unwatch()
-  assert.deepEqual(liveIds('conversation.view'), ['trae-session'])
-  // Switching the last one to another provider takes the tab off the row.
+  assert.deepEqual(liveIds('conversation.view'), ['trae-share', 'trae-session'])
+  // Switching the last one to another provider takes the ids tab off the row,
+  // and leaves the share tab, which never depended on it.
   entry('conversation.input.right', 'trae-session-watch').inject('s2').watch(false)
-  assert.deepEqual(liveIds('conversation.view'), [])
+  assert.deepEqual(liveIds('conversation.view'), ['trae-share'])
   // Nothing in the right sidebar or the session header any more.
   assert.equal(byName['sidebar.right.pane.tab'], undefined)
   assert.equal(byName['conversation.session.header.utilities'], undefined)
