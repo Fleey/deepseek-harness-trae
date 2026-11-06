@@ -25,6 +25,7 @@ import { TraeCueReporter } from './trae/cue.ts'
 import { isCnHost, traeAppName, traeDebugLine, TRAE_APP_VERSION } from './trae/debug.ts'
 import { TraeUserInfo } from './trae/user.ts'
 import { TraeQuota } from './trae/quota.ts'
+import { artifactUrl, SHARE_ORIGIN, ShareError, shareUrl, TraeShare } from './trae/share.ts'
 import { TraeSuggestions } from './trae/suggest.ts'
 import { TOB_CONSOLE_HOST, TobConsole } from './trae/tob.ts'
 
@@ -32,6 +33,8 @@ export const name = 'dsh-trae2api'
 export const inject = ['llm']
 
 const CLIENT_VERSION = '0.206.1-tob'
+/** Default origin the share API is spoken on (CN consumer site). */
+const SHARE_HOST = SHARE_ORIGIN
 /** Host route the browser half reads the remaining quota from. */
 export const QUOTA_ROUTE = '/api/dsh-trae2api/quota'
 /** Host route serving the model catalog and its origin; `?refresh` re-asks upstream. */
@@ -44,6 +47,18 @@ export const SUGGESTION_ROUTE = '/api/dsh-trae2api/suggestion'
 const SUGGESTION_MAX_WAIT_MS = 30_000
 /** Host route the browser half reports choices being shown / one being accepted to. */
 export const SUGGESTION_EVENT_ROUTE = '/api/dsh-trae2api/suggestion/event'
+/**
+ * Host route the browser half reads / mints a share link through.
+ *
+ * `GET  ?id=<share_session_id>`        → that share (no PAT needed: the share API
+ *                                        is anonymous for readers, which is why a
+ *                                        leaked link is a full disclosure).
+ * `POST {chatSessionId, turnIds[]…}`   → mint one; answers the front-end URL.
+ * `POST {action:'disable', id}`        → unpublish.
+ * `GET  ?sessions=1`                   → the account's real chat sessions, the
+ *                                        only source of a `chat_session_id`.
+ */
+export const SHARE_ROUTE = '/api/dsh-trae2api/share'
 /** Environment fallback for `cueUserId`. */
 const CUE_USER_ID_ENV = 'TRAE_USER_ID'
 
@@ -53,6 +68,18 @@ export interface Config {
   /** Credential reference holding the Trae PAT (set from the UI). */
   patEnv: Volatile<string>
   host: string
+  /**
+   * Origin the share API is spoken on. Empty = the CN consumer host
+   * (`share.traecontent.cn`), which is the only one that answers a
+   * `share_session_id` minted by the consumer site.
+   *
+   * Measured: the two deployments keep **separate share namespaces** — a
+   * consumer share id is `200` on `share.traecontent.cn` / `work.trae.cn` and
+   * `404 992700` on `api.enterprise.trae.cn`, while the enterprise host still
+   * serves the write endpoints (401 without a JWT). So a link read here is not
+   * automatically the link the enterprise account would mint, and vice versa.
+   */
+  shareHost: string
   /** Host serving the quota (额度) API; empty = ask CheckLogin, fall back to api.trae.cn. */
   payHost: string
   /** Enterprise console origin, where a ToB seat's real figures live. */
@@ -127,6 +154,8 @@ export const Config: Schema<Config> = Schema.object({
   patEnv: Schema.string().role('credential-ref').default('TRAE_PAT').volatile()
     .description('Trae 个人访问令牌（PAT）在凭据库里的名字'),
   host: Schema.string().default(TRAE_HOST),
+  shareHost: Schema.string().default(SHARE_HOST)
+    .description('分享接口所在的站点；空 = share.traecontent.cn。企业版与消费版是两个独立的分享命名空间，互不可见'),
   payHost: Schema.string().default(''),
   consoleHost: Schema.string().default(TOB_CONSOLE_HOST),
   consoleEmail: Schema.string().default(''),
@@ -326,14 +355,27 @@ export function apply(ctx: Context, config: Config): void {
     tob,
   })
 
+  /**
+   * Share links. Reads run against `shareHost` and need no PAT at all; minting
+   * needs the same JWT the turns use, but is aimed at the same origin, because
+   * a share id only exists inside the deployment that minted it (see
+   * `shareHost` on Config).
+   */
+  const share = new TraeShare({
+    host: (config.shareHost.trim() || SHARE_HOST).replace(/\/+$/, ''),
+    auth,
+    userAgent,
+    logger,
+  })
+
   // A PAT saved from the UI changes no config field; drop the cached JWT.
   ctx.on('credentials/reference-updated' as never, ((ref: string) => {
-    if (ref === config.patEnv.get()) { auth.reset(); quota.reset(); userInfo.reset(); catalog.reset() }
+    if (ref === config.patEnv.get()) { auth.reset(); quota.reset(); userInfo.reset(); catalog.reset(); share.reset() }
     // The console password is its own credential; a new one invalidates the
     // cached console session, not the JWT.
     if (ref === config.consolePasswordEnv.get() || ref === config.consoleEmailEnv.get()) { tob.reset(); quota.reset() }
   }) as never)
-  ctx.on('loader/volatile-update' as never, (() => { auth.reset(); quota.reset(); userInfo.reset(); catalog.reset() }) as never)
+  ctx.on('loader/volatile-update' as never, (() => { auth.reset(); quota.reset(); userInfo.reset(); catalog.reset(); share.reset() }) as never)
 
   // One catalog refresh per plugin start, without waiting for the first turn:
   // reloading the plugin is how a user asks for a fresh model list. A failure
@@ -493,6 +535,109 @@ export function apply(ctx: Context, config: Config): void {
         },
       })
     } catch (error) { logger.warn('dsh-trae2api: suggestion event route unavailable', error) }
+    // Share links: read one (anonymous), mint one (PAT), unpublish one (PAT),
+    // or list the account's real chat sessions so the card can offer the ids
+    // `createShare` actually takes.
+    try {
+      child.connection.fetch.register({
+        path: SHARE_ROUTE,
+        methods: ['GET', 'POST'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          const url = new URL(request.url)
+          try {
+            if (request.method === 'GET') {
+              // `?sessions=1`: the account's own sessions, with the ids a mint
+              // needs. Anything else: one share by id, read anonymously.
+              if (url.searchParams.has('sessions')) {
+                const pageSize = Math.min(100, Math.max(1, Number(url.searchParams.get('page_size')) || 20))
+                const { items } = await share.sessions(pageSize)
+                return Response.json({
+                  ok: true,
+                  value: items.map(s => ({
+                    chatSessionId: String(s.chat_session_id ?? s.chatSessionId ?? ''),
+                    name: typeof s.name === 'string' ? s.name : undefined,
+                    status: typeof s.status === 'string' ? s.status : undefined,
+                    mode: typeof s.mode === 'string' ? s.mode : undefined,
+                    updatedAt: s.updated_at ?? s.updatedAt ?? undefined,
+                  })),
+                })
+              }
+              const id = url.searchParams.get('id') ?? ''
+              if (!id) return Response.json({ ok: false, error: 'expected ?id=<share_session_id> or ?sessions=1' }, { status: 400 })
+              const session = await share.get(id, { force: url.searchParams.has('refresh') })
+              // The page URL follows the type: a conversation lives at /share/,
+              // an HTML artifact at /artifact/ (the front end redirects between
+              // them too).
+              const pageUrl = session.shareType === 'artifact' && session.artifactPath
+                ? artifactUrl(id)
+                : shareUrl(id)
+              return Response.json({
+                ok: true,
+                value: {
+                  shareSessionId: session.shareSessionId,
+                  url: pageUrl,
+                  title: session.title,
+                  status: session.status,
+                  shareType: session.shareType,
+                  artifactPath: session.artifactPath,
+                  creatorName: session.creatorName,
+                  anonymous: session.anonymous,
+                  createdAt: session.createdAt,
+                  expiresAt: session.expiresAt,
+                  // Pre-signed TOS links. The CDN refuses them without
+                  // `Referer: https://share.traecontent.cn/`, so the card must
+                  // not hand them to a plain <a download>.
+                  entries: session.entries,
+                },
+              })
+            }
+            let input: {
+              action?: unknown; id?: unknown
+              chatSessionId?: unknown; turnIds?: unknown
+              anonymous?: unknown; creatorName?: unknown; skipAudit?: unknown
+            }
+            try { input = await request.json() as typeof input } catch {
+              return Response.json({ ok: false, error: 'invalid JSON' }, { status: 400 })
+            }
+            const action = typeof input.action === 'string' ? input.action : 'create'
+            if (action === 'disable') {
+              if (typeof input.id !== 'string' || !input.id) {
+                return Response.json({ ok: false, error: 'expected { action:"disable", id }' }, { status: 400 })
+              }
+              return Response.json({ ok: true, value: await share.setStatus(input.id, 'disabled') })
+            }
+            if (action !== 'create') {
+              return Response.json({ ok: false, error: 'expected action: "create" | "disable"' }, { status: 400 })
+            }
+            if (typeof input.chatSessionId !== 'string' || !input.chatSessionId) {
+              return Response.json({ ok: false, error: 'expected { chatSessionId } — see ?sessions=1 for the ids' }, { status: 400 })
+            }
+            // `turnIds` omitted = every turn that session has, which is what the
+            // front end's "select all" sends anyway.
+            const turnIds = Array.isArray(input.turnIds)
+              ? input.turnIds.filter((t): t is string => typeof t === 'string' && t !== '')
+              : await share.turnsOf(input.chatSessionId)
+            const link = await share.create({
+              chatSessionId: input.chatSessionId,
+              turnIds,
+              anonymous: input.anonymous === true,
+              ...typeof input.creatorName === 'string' ? { creatorName: input.creatorName } : {},
+              skipAudit: input.skipAudit === true,
+            })
+            return Response.json({ ok: true, value: link })
+          } catch (error) {
+            const code = error instanceof ShareError ? error.code : undefined
+            const status = error instanceof ShareError && error.status ? error.status : 502
+            return Response.json({
+              ok: false,
+              error: error instanceof Error ? error.message : String(error),
+              ...code !== undefined ? { code } : {},
+            }, { status })
+          }
+        },
+      })
+    } catch (error) { logger.warn('dsh-trae2api: share route unavailable', error) }
   })
 
   // Released automatically on unload.
