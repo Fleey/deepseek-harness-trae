@@ -124,10 +124,10 @@ v0.3 起插件自己直连 Trae 的 `llm_raw_chat` 接口（和 trae2api 的 dir
 
 ### 用 tgz 安装（发给别人）
 
-`dsh-trae2api-0.12.0.tgz` 是预构建好的包，不需要构建权限：
+`dsh-trae2api-0.12.1.tgz` 是预构建好的包，不需要构建权限：
 
 ```sh
-dsh plugin --profile desktop add ./dsh-trae2api-0.12.0.tgz
+dsh plugin --profile desktop add ./dsh-trae2api-0.12.1.tgz
 ```
 
 装完同样去 **设置 → 模型 → Trae** 填 PAT。tgz 方式下插件自带全部代码，和项目目录无关。
@@ -256,6 +256,8 @@ python3 -I tools/probe_catalog.py
 
 - **分享这条会话**：点「生成分享链接」，把这条会话发成一条 `https://share.traecontent.cn/share/<id>?enter_from=pc` 链接。
   每轮对话单独显示，回答里带思考、工具调用和工具输出，和 TRAE SOLO 自己分享出去的页面一个样子；**不调用模型**。
+- **分享生成的文件**：这条会话写出的 Markdown / HTML 文件（`write` / `edit` / `present` 工具里出现过、现在还在磁盘上的），
+  点「分享」发成 `https://share.traecontent.cn/artifact/<id>` 网页链接；也可以手填文件的绝对路径。见下文「分享文件」。
 - **我的分享**：这个账号铸过的链接，打开标签就读一次。每条显示状态（公开中 / 审核中 / 已关闭）、创建和到期时间，
   可以打开、复制、关闭（对方打开会提示已关闭）、重新公开、删除（撤销，不能恢复，要点两次）。
 - **会话 ID**：见下一节。
@@ -288,6 +290,27 @@ Authorization: Cloud-IDE-JWT <PAT 换来的 JWT>
 
 浏览器端经 `/api/dsh-trae2api/share` 路由走宿主的登录态隔离：`?transcript=<会话 ID>` 读插件记下了多少轮，
 `?mine=1` 列自己的分享，`POST {session}` 生成，`POST {action:'disable'|'enable'|'delete', id}` 管理。
+
+### 分享文件（Markdown / HTML → 网页）
+
+和 TRAE SOLO 分享 HTML 报告用的是同一套接口（报告 v3 §6）：
+
+```
+1. POST /api/remote/v1/share/local_artifact/presign-upload  { local_session_id, artifact_path, content_length, content_hash }
+2. PUT  <upload_url>   body = package.zip
+3. POST /api/remote/v1/share/local_artifact                 { local_session_id, artifact_path, resource_uri, content_hash }
+→ https://share.traecontent.cn/artifact/<share_session_id>
+```
+
+- **打包什么**：入口文件，加上它（以及它引用的 CSS / HTML）用相对路径引用到的文件——只限入口所在目录之内；
+  不越出这个目录（`..`）、不带隐藏文件（`.git` 之类）、不带压缩包（服务端拒收嵌套 zip），最多 200 个文件、50 MB。
+  引用不到的资源跳过，页面上就是断图，和在别处打开一样。
+- **Markdown** 先用 `marked` 排成一个带样式的网页（标题取第一个 `#`，跟随浅色 / 深色），再按上面的规则打包，图片一起带上。
+- **同一个文件再分享一次是更新**：服务端以 `(local_session_id, artifact_path)` 为键，内容替换、链接不变。
+- zip 是插件自己写的（不压缩，UTF-8 文件名），不依赖额外的包。
+
+> 分享页把 HTML 放在 `share.traecontent.cn` 同源的 iframe 里执行（`allow-scripts allow-same-origin`，报告 v3 §7），
+> 页面里的脚本照常运行。只分享自己生成、自己看过的文件。
 
 ## 会话 ID（查看 / 复制）
 
