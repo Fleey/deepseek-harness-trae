@@ -20,6 +20,13 @@ export interface TraeUser {
   userId: string
   /** Privacy mode is on: the IDE reports nothing for this account. */
   privacyMode: boolean
+  /**
+   * The account's display name, when the answer carries one. The share front
+   * end sends `currentUser.username.trim()` as `creator_name`.
+   */
+  username?: string
+  /** Key names (never values) of `UserInfo`, for finding the name field. */
+  infoKeys?: string[]
 }
 
 type Json = Record<string, unknown>
@@ -45,9 +52,14 @@ export function parseUserInfo(body: unknown): TraeUser {
   const info = isObject(data) ? at(data, 'UserInfo', 'userInfo', 'user_info') : undefined
   const id = isObject(info) ? at(info, 'UserID', 'UserId', 'userId', 'user_id') : undefined
   if ((typeof id !== 'string' || !id.trim()) && typeof id !== 'number') throw new Error('GetUserInfo: no UserInfo.UserID in the answer')
+  const name = isObject(info)
+    ? at(info, 'Username', 'UserName', 'username', 'ScreenName', 'screen_name', 'Name', 'name', 'NickName', 'Nickname', 'nickname')
+    : undefined
   return {
     userId: String(id).trim(),
     privacyMode: truthy(isObject(data) ? at(data, 'PrivacyMode', 'privacyMode', 'privacy_mode') : undefined),
+    ...typeof name === 'string' && name.trim() ? { username: name.trim() } : {},
+    ...isObject(info) ? { infoKeys: Object.keys(info) } : {},
   }
 }
 

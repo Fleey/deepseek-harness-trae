@@ -706,7 +706,10 @@ export class TraeAdapter extends LlmAdapter {
       // session reports the turn over and the composer asks for it.
       if (mainLoop && reason.kind === 'stop' && text.trim()) {
         try {
-          this.opts.onTurnEnd?.({ sessionId: String(options.sessionId), conversation: session, model: route.id, options, answer: text })
+          this.opts.onTurnEnd?.({
+            sessionId: String(options.sessionId), conversation: session, model: route.id, options, answer: text,
+            ...reasoningText.trim() ? { reasoning: reasoningText } : {},
+          })
         } catch { /* a suggestion must never fail the turn */ }
       }
       yield { type: 'finish', reason }

@@ -32,6 +32,8 @@ export interface FinishedTurn {
   options: GenerateOptions
   /** The final answer's visible text. */
   answer: string
+  /** The final step's reasoning text, when the model streamed any. */
+  reasoning?: string
 }
 
 export interface SuggestionsOptions {

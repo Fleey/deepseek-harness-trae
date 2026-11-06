@@ -1412,8 +1412,9 @@ test('cue: report/clients gets multipart `body` with env_metadata and stringifie
 
 test('user info: GetUserInfo with x-cloudide-token, UserID as a string, PrivacyMode gate, once per JWT', async () => {
   const { parseUserInfo, TraeUserInfo, USER_INFO_PATH } = await import('../lib/testing.mjs')
-  assert.deepEqual(parseUserInfo({ code: 0, message: '', Data: { UserInfo: { UserID: '312308224', TenantID: '9' }, PrivacyMode: false } }), { userId: '312308224', privacyMode: false })
-  assert.deepEqual(parseUserInfo({ code: 0, Data: { UserInfo: { UserID: 7 }, PrivacyMode: 1 } }), { userId: '7', privacyMode: true })
+  // `infoKeys` lists field names only, for pinning down the byline field.
+  assert.deepEqual(parseUserInfo({ code: 0, message: '', Data: { UserInfo: { UserID: '312308224', TenantID: '9' }, PrivacyMode: false } }), { userId: '312308224', privacyMode: false, infoKeys: ['UserID', 'TenantID'] })
+  assert.deepEqual(parseUserInfo({ code: 0, Data: { UserInfo: { UserID: 7 }, PrivacyMode: 1 } }), { userId: '7', privacyMode: true, infoKeys: ['UserID'] })
   assert.throws(() => parseUserInfo({ code: 401, message: 'not login' }), /401 not login/)
   assert.throws(() => parseUserInfo({ code: 0, Data: { UserInfo: {} } }), /no UserInfo\.UserID/)
 

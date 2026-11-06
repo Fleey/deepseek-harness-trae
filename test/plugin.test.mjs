@@ -417,3 +417,286 @@ test('suggestion events reach report/clients by default, with the GetUserInfo us
   }))).json()
   assert.equal(noPick.ok, false)
 })
+
+test('share route: sessions come from either host, and "this session" is shared turn by turn, steps included, with no model call', async () => {
+  const routes = new Map()
+  const adapters = {}
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    effect() {}, on() {},
+    get: (name) => name === 'credentials' ? { resolve: async () => ({ value: 'eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQxMDI0NDQ4MDB9.c2ln' }) } : undefined,
+    inject: (deps, cb) => {
+      if (deps.includes('connection')) cb({ connection: { fetch: { register: (route) => { routes.set(route.path, route) } } } })
+    },
+    fiber: { entry: { options: { id: 'trae2api' } } },
+    llm: { registerAdapter: (r, a) => { for (const k of r) adapters[k] = a }, registerConfigurableProviders() {} },
+  }
+  plugin.apply(ctx, plugin.Config({ catalogSource: 'builtin', suggestions: false }))
+  const route = routes.get(plugin.SHARE_ROUTE)
+  const original = globalThis.fetch
+  const seen = []
+  let posted
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url)
+    const method = init.method ?? 'GET'
+    seen.push(`${method} ${u}`)
+    if (u.endsWith('/api/ide/v2/llm_raw_chat')) {
+      return new Response('event: output\ndata: {"response":"Fixed: it was a typo."}\n\n', { status: 200 })
+    }
+    if (u.endsWith('/GetUserInfo')) return Response.json({ code: 0, Data: { UserInfo: { UserID: '1', ScreenName: 'Someone' } } })
+    if (method === 'GET' && u.startsWith('https://trae-api-cn.mchost.guru/api/remote/v1/chat_sessions?')) return Response.json({ code: 0, data: { items: [], total: 0 } })
+    if (method === 'GET' && u.startsWith('https://api.enterprise.trae.cn/api/remote/v1/chat_sessions?')) {
+      return Response.json({ code: 0, data: { items: [{ chat_session_id: '6ae1a91d0000000000000001', title: 'solo' }], total: 1 } })
+    }
+    if (method === 'POST' && u === 'https://trae-api-cn.mchost.guru/api/remote/v1/share/local_conversation') {
+      posted = JSON.parse(init.body)
+      return Response.json({ code: 0, data: { share_session_id: 'LOCAL000000001', status: 'active', title: posted.title } })
+    }
+    return Response.json({ code: 0 })
+  }
+  try {
+    const list = await (await route.fetch(new Request(`http://127.0.0.1${plugin.SHARE_ROUTE}?sessions=1`))).json()
+    assert.equal(list.ok, true)
+    assert.deepEqual(list.value.map(s => [s.chatSessionId, s.name, s.host]), [['6ae1a91d0000000000000001', 'solo', 'https://api.enterprise.trae.cn']])
+
+    // Before a finished Trae turn the plugin has seen nothing to share.
+    const early = await route.fetch(new Request(`http://127.0.0.1${plugin.SHARE_ROUTE}`, {
+      method: 'POST', body: JSON.stringify({ action: 'mirror', session: 's1' }),
+    }))
+    assert.equal(early.status, 400)
+    assert.equal((await early.json()).code, 'NO_TRANSCRIPT')
+
+    for await (const _ of adapters.trae.stream({
+      model: 'GLM-5.3', sessionId: 's1',
+      tools: [{ name: 'bash', description: '', parameters: {} }],
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'What is 2+2?' }] },
+        { role: 'assistant', source: { kind: 'model', provider: 'trae', model: 'GLM-5.3' }, content: [{ type: 'text', text: '4.' }] },
+        { role: 'user', content: [{ type: 'text', text: 'Fix the build\nTime sampled while preparing turn 2, step 1: 2026-11-06T10:17:12+08:00[Asia/Shanghai]' }] },
+        { role: 'assistant', source: { kind: 'model', provider: 'trae', model: 'GLM-5.3' }, content: [
+          { type: 'reasoning', text: 'Need to see the error.' },
+          { type: 'text', text: 'Running the build.' },
+          { type: 'tool-call', id: 'c1', name: 'bash', arguments: '{"command":"npm run build"}' },
+        ] },
+        { role: 'tool', toolCallId: 'c1', source: { kind: 'tool', callId: 'c1' }, content: [{ type: 'text', text: 'error TS2304' }], isError: true },
+      ],
+    })) { /* consume */ }
+    const preview = (await (await route.fetch(new Request(`http://127.0.0.1${plugin.SHARE_ROUTE}?transcript=s1`))).json()).value
+    assert.equal(preview.turns, 2)
+    assert.equal(preview.steps, 1)
+
+    seen.length = 0
+    const current = await route.fetch(new Request(`http://127.0.0.1${plugin.SHARE_ROUTE}`, {
+      method: 'POST', body: JSON.stringify({ action: 'mirror', session: 's1' }),
+    }))
+    const body = await current.json()
+    assert.equal(body.ok, true, JSON.stringify(body))
+    // One upload, no chat session, no model call.
+    assert.deepEqual(seen.filter(line => !line.includes('GetUserInfo')), ['POST https://trae-api-cn.mchost.guru/api/remote/v1/share/local_conversation'])
+    assert.equal(body.value.modelCalls, 0)
+    assert.equal(body.value.url, 'https://share.traecontent.cn/share/LOCAL000000001?enter_from=pc')
+    // Report v3: the read-only chat times would get the body refused, and
+    // the server orders by created_at, so every stamp is strictly later.
+    for (const m of posted.messages) {
+      assert.equal('chat_start_time' in m, false)
+      assert.equal('chat_end_time' in m, false)
+      assert.equal(typeof m.message_index, 'number')
+    }
+    const times = posted.messages.map(m => Date.parse(m.created_at))
+    for (let i = 1; i < times.length; i++) assert.ok(times[i] > times[i - 1], `created_at ${i} must be later`)
+    // Two turns, each its own pair of bubbles.
+    assert.equal(posted.env, 'local')
+    assert.equal(posted.creator_name, 'Someone')
+    assert.equal(posted.title, 'What is 2+2?')
+    assert.deepEqual(posted.messages.map(m => m.role), ['user', 'assistant', 'user', 'assistant'])
+    assert.equal(posted.messages[3].reply_to_message_id, posted.messages[2].message_id)
+    // The harness's own notes are not part of the question.
+    assert.deepEqual(JSON.parse(posted.messages[2].content), [{ text_content: 'Fix the build', type: 'text' }])
+    // The second answer carries its step: the shell call, its thought and
+    // reasoning, its failed output — then the answer as `finish`.
+    const steps = JSON.parse(posted.messages[3].content).messages.map(m => m.plan_item)
+    assert.deepEqual(steps.map(p => p.tool_call_info.name), ['Shell', 'finish'])
+    assert.equal(steps[0].thought, 'Running the build.')
+    assert.equal(steps[0].reasoning_content, 'Need to see the error.')
+    assert.equal(steps[0].tool_call_info.params.command, 'npm run build')
+    assert.equal(steps[0].tool_call_info.result.status, 'error')
+    assert.equal(steps[0].tool_call_info.result.data.stdout, 'error TS2304')
+    assert.equal(steps[1].tool_call_info.params.summary, 'Fixed: it was a typo.')
+    const first = JSON.parse(posted.messages[1].content).messages.map(m => m.plan_item)
+    assert.equal(first[0].tool_call_info.params.summary, '4.')
+  } finally { globalThis.fetch = original }
+})
+
+test('share route: mirror replays a conversation and refuses to guess the spend', async () => {
+  const routes = new Map()
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    effect() {}, on() {},
+    get: (name) => name === 'credentials' ? { resolve: async () => ({ value: 'eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQxMDI0NDQ4MDB9.c2ln' }) } : undefined,
+    inject: (deps, cb) => {
+      if (deps.includes('connection')) cb({ connection: { fetch: { register: (route) => { routes.set(route.path, route) } } } })
+    },
+    fiber: { entry: { options: { id: 'trae2api' } } },
+    llm: { registerAdapter() {}, registerConfigurableProviders() {} },
+  }
+  plugin.apply(ctx, plugin.Config({ catalogSource: 'builtin', suggestions: false }))
+  const route = routes.get(plugin.SHARE_ROUTE)
+  const original = globalThis.fetch
+  const seen = []
+  const USER = { message_id: 'u-1', role: 'user', status: 'completed', turn_id: 't-1', content: '[{"type":"text","text_content":"hi"}]' }
+  const AI = {
+    message_id: 'a-1', role: 'assistant', status: 'completed', turn_id: 't-1', reply_to_message_id: 'u-1',
+    content: JSON.stringify({ messages: [{ plan_item: { tool_call_info: { name: 'finish', params: { summary: 'ok' } } } }] }),
+  }
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url)
+    seen.push(`${init.method ?? 'GET'} ${u}`)
+    if (u.endsWith('/api/remote/v1/chat_sessions')) return Response.json({ code: 0, data: { chat_session_id: 'cs-m' } })
+    if (u.endsWith('/messages') && init.method === 'POST') return Response.json({ code: 0, data: { message_id: 'u-1' } })
+    if (u.includes('/chat_sessions/cs-m/messages')) return Response.json({ code: 0, data: { items: [USER, AI] } })
+    if (u.endsWith('/api/remote/v1/share')) {
+      return Response.json({ code: 0, data: { share_session_id: 'SH1', status: 'active', expires_at: null } })
+    }
+    return Response.json({ code: 0, data: {} })
+  }
+  const post = (body) => route.fetch(new Request(`http://127.0.0.1${plugin.SHARE_ROUTE}`, {
+    method: 'POST', body: JSON.stringify(body),
+  }))
+  try {
+    // `maxTurns` is required: every user turn is a real model call, so the
+    // route will not pick a number on the caller's behalf.
+    const noCap = await post({ action: 'mirror', turns: [{ role: 'user', text: 'hi' }] })
+    assert.equal(noCap.status, 400)
+    assert.match((await noCap.json()).error, /maxTurns/)
+
+    const noTurns = await post({ action: 'mirror', turns: [], maxTurns: 1 })
+    assert.equal(noTurns.status, 400)
+
+    const ok = await post({
+      action: 'mirror',
+      turns: [{ role: 'user', text: 'hi' }],
+      maxTurns: 1,
+    })
+    const body = await ok.json()
+    assert.equal(body.ok, true)
+    assert.equal(body.value.chatSessionId, 'cs-m')
+    assert.equal(body.value.partial, false)
+    assert.equal(body.value.modelCalls, 1)
+    assert.deepEqual(body.value.answers, ['ok'])
+    assert.equal(body.value.link.shareSessionId, 'SH1')
+    // The link goes out on the consumer origin, which is the one whose page
+    // opens without a login.
+    assert.match(body.value.url, /^https:\/\/share\.traecontent\.cn\/share\/SH1/)
+    assert.ok(seen.some(line => line.startsWith('POST ') && line.includes('/api/remote/v1/share')))
+  } finally { globalThis.fetch = original }
+})
+
+test('share route: { session, turns } is promoted to the mirror instead of the id route', async () => {
+  const routes = new Map()
+  const adapters = {}
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    effect() {}, on() {},
+    get: (name) => name === 'credentials' ? { resolve: async () => ({ value: 'eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQxMDI0NDQ4MDB9.c2ln' }) } : undefined,
+    inject: (deps, cb) => {
+      if (deps.includes('connection')) cb({ connection: { fetch: { register: (route) => { routes.set(route.path, route) } } } })
+    },
+    fiber: { entry: { options: { id: 'trae2api' } } },
+    llm: { registerAdapter: (r, a) => { for (const k of r) adapters[k] = a }, registerConfigurableProviders() {} },
+  }
+  plugin.apply(ctx, plugin.Config({ catalogSource: 'builtin', suggestions: false }))
+  const route = routes.get(plugin.SHARE_ROUTE)
+  const original = globalThis.fetch
+  const seen = []
+  const USER = { message_id: 'u-1', role: 'user', status: 'completed', turn_id: 't-1', content: '[{"type":"text","text_content":"hi"}]' }
+  const AI = {
+    message_id: 'a-1', role: 'assistant', status: 'completed', turn_id: 't-1', reply_to_message_id: 'u-1',
+    content: JSON.stringify({ messages: [{ plan_item: { tool_call_info: { name: 'finish', params: { summary: 'pong' } } } }] }),
+  }
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url)
+    seen.push(`${init.method ?? 'GET'} ${u}`)
+    if (u.includes('/api/ide/v2/llm_raw_chat')) return new Response('event: output\ndata: {"response":"ok"}\n\n', { status: 200 })
+    if (u.endsWith('/api/remote/v1/chat_sessions')) return Response.json({ code: 0, data: { chat_session_id: 'cs-m' } })
+    if (u.endsWith('/messages') && init.method === 'POST') return Response.json({ code: 0, data: { message_id: 'u-1' } })
+    if (u.includes('/chat_sessions/cs-m/messages')) return Response.json({ code: 0, data: { items: [USER, AI] } })
+    if (u.endsWith('/api/remote/v1/share')) return Response.json({ code: 0, data: { share_session_id: 'SH2', status: 'active' } })
+    // Reading the new link back is part of the flow: a share the consumer site
+    // cannot see is reported rather than handed out.
+    if (u.includes('/api/remote/v1/share/')) {
+      return Response.json({ code: 0, data: { share_session_id: 'SH2', title: 't', status: 'active', share_type: 'all' } })
+    }
+    return Response.json({ code: 0, data: {} })
+  }
+  try {
+    // Give the session an upstream conversation id first, so the id route
+    // *would* have something to try — the promotion must still happen.
+    for await (const _ of adapters.trae.stream({
+      model: 'GLM-5.3', sessionId: 's-mirror', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    })) { /* consume */ }
+    seen.length = 0
+
+    const res = await route.fetch(new Request(`http://127.0.0.1${plugin.SHARE_ROUTE}`, {
+      method: 'POST',
+      body: JSON.stringify({ action: 'create', session: 's-mirror', turns: [{ role: 'user', text: 'ping' }], maxTurns: 1 }),
+    }))
+    const body = await res.json()
+    assert.equal(res.status, 200)
+    assert.equal(body.ok, true)
+    // It mirrored: a chat session was created and a share minted from its turn.
+    assert.equal(body.value.chatSessionId, 'cs-m')
+    assert.deepEqual(body.value.answers, ['pong'])
+    assert.match(body.value.url, /^https:\/\/share\.traecontent\.cn\/share\/SH2/)
+    assert.ok(seen.some(line => line.startsWith('POST ') && line.includes('/api/remote/v1/chat_sessions')))
+    // The id route would have read turns from the *upstream conversation* id;
+    // that must not happen when turns were supplied. Reads against the session
+    // the mirror just created are expected — that is how a turn is settled.
+    assert.equal(seen.some(line => line.startsWith('GET') && line.includes('/chat_sessions/') && !line.includes('cs-m')), false)
+  } finally { globalThis.fetch = original }
+})
+
+test('share route: my shares are listed with their links, and closed, reopened or deleted on the consumer write host', async () => {
+  const routes = new Map()
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    effect() {}, on() {},
+    get: (name) => name === 'credentials' ? { resolve: async () => ({ value: 'eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQxMDI0NDQ4MDB9.c2ln' }) } : undefined,
+    inject: (deps, cb) => {
+      if (deps.includes('connection')) cb({ connection: { fetch: { register: (route) => { routes.set(route.path, route) } } } })
+    },
+    fiber: { entry: { options: { id: 'trae2api' } } },
+    llm: { registerAdapter() {}, registerConfigurableProviders() {} },
+  }
+  plugin.apply(ctx, plugin.Config({ catalogSource: 'builtin', suggestions: false }))
+  const route = routes.get(plugin.SHARE_ROUTE)
+  const original = globalThis.fetch
+  const seen = []
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url)
+    const method = init.method ?? 'GET'
+    seen.push(`${method} ${u}${init.body ? ` ${init.body}` : ''}`)
+    if (method === 'GET' && u === 'https://trae-api-cn.mchost.guru/api/remote/v1/share?page_size=50') {
+      return Response.json({ code: 0, data: { items: [{ share_session_id: '5J6XE.KMG5R8.S', title: 't', status: 'active', expires_at: '2027-11-06T14:00:15+08:00' }] } })
+    }
+    if (method === 'GET' && u.startsWith('https://api.enterprise.trae.cn/api/remote/v1/share?')) return Response.json({ code: 0, data: { items: [] } })
+    return Response.json({ code: 0, data: {} })
+  }
+  try {
+    const mine = await (await route.fetch(new Request(`http://127.0.0.1${plugin.SHARE_ROUTE}?mine=1`))).json()
+    assert.equal(mine.ok, true)
+    assert.deepEqual(mine.value.map(s => [s.shareSessionId, s.url, s.host]), [
+      ['5J6XE.KMG5R8.S', 'https://share.traecontent.cn/share/5J6XE.KMG5R8.S?enter_from=pc', 'https://trae-api-cn.mchost.guru'],
+    ])
+    const post = body => route.fetch(new Request(`http://127.0.0.1${plugin.SHARE_ROUTE}`, { method: 'POST', body: JSON.stringify(body) }))
+    seen.length = 0
+    assert.equal((await post({ action: 'disable', id: '5J6XE.KMG5R8.S' })).status, 200)
+    assert.equal((await post({ action: 'enable', id: '5J6XE.KMG5R8.S' })).status, 200)
+    assert.equal((await post({ action: 'delete', id: '5J6XE.KMG5R8.S' })).status, 200)
+    assert.deepEqual(seen, [
+      'PATCH https://trae-api-cn.mchost.guru/api/remote/v1/share/5J6XE.KMG5R8.S/status {"status":"disabled"}',
+      'PATCH https://trae-api-cn.mchost.guru/api/remote/v1/share/5J6XE.KMG5R8.S/status {"status":"active"}',
+      'DELETE https://trae-api-cn.mchost.guru/api/remote/v1/share/5J6XE.KMG5R8.S',
+    ])
+    assert.equal((await post({ action: 'delete' })).status, 400)
+  } finally { globalThis.fetch = original }
+})
