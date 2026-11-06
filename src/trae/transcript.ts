@@ -16,7 +16,7 @@
  */
 
 import type { ContentBlock, RequestMessage } from '@deepseek-ai/dsh-llm'
-import type { ConversationTurn } from './local-share.ts'
+import { isContextMessage, type ConversationTurn } from './local-share.ts'
 
 export interface TranscriptRow {
   role: 'user' | 'assistant'
@@ -44,6 +44,7 @@ export function transcriptOf(messages: readonly RequestMessage[], answer = ''): 
   }
   for (const message of messages) {
     if (message.role !== 'user' && message.role !== 'assistant') continue
+    if (isContextMessage(message)) continue
     push(message.role, textOf((message as { content?: readonly ContentBlock[] }).content))
   }
   push('assistant', answer.trim())

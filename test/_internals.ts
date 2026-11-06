@@ -25,3 +25,4 @@ export {
 export { mirrorConversation, mirrorAndShare, textOfContent } from '../src/trae/mirror.ts'
 export { transcriptOf, transcriptMessage, userTurns, TranscriptStore } from '../src/trae/transcript.ts'
 export { conversationTurns, localShareBody, traeTool, objectId, LOCAL_SHARE_TURNS } from '../src/trae/local-share.ts'
+export { packArtifact, zipStore, crc32, references, markdownPage, artifactKind, ArtifactError } from '../src/trae/artifact.ts'

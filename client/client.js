@@ -188,6 +188,20 @@ window.__ModuleLoader__.load({
       shareCopyFailed: '复制失败',
       shareExpires: '有效至 {date}',
       shareCreated: '{date} 创建',
+      shareFilesTitle: '分享生成的文件',
+      shareFilesLead: '把这条会话写出的 Markdown / HTML 发成网页链接。同一目录里被引用的图片、样式会一起打包，Markdown 会排版成网页。同一个文件再分享一次，链接不变、内容更新。',
+      shareFilesEmpty: '这条会话还没写出 .md / .html 文件。也可以在下面填文件的绝对路径。',
+      shareFileAction: '分享',
+      shareFileUpdate: '更新',
+      shareFileBusy: '上传中…',
+      shareFileOther: '其他文件',
+      shareFilePlaceholder: '/绝对路径/report.html 或 notes.md',
+      shareFileCount: '{n} 个文件',
+      shareFileCardAction: '分享',
+      shareFileCardTitle: '发成网页链接（拿到链接的人不用登录就能打开）',
+      shareFileCardBusy: '分享中…',
+      shareFileCardRetry: '重试分享',
+      shareFileInline: '分享为网页',
       shareMineTitle: '我的分享',
       shareMineRefresh: '刷新',
       shareMineLoading: '读取中…',
@@ -320,6 +334,20 @@ window.__ModuleLoader__.load({
       shareCopyFailed: 'Copy failed',
       shareExpires: 'Valid until {date}',
       shareCreated: 'Created {date}',
+      shareFilesTitle: 'Share a file it produced',
+      shareFilesLead: 'Publish a Markdown or HTML file this session wrote as a web page. Images and styles it references in its own folder go along; Markdown is laid out as a page. Sharing the same file again keeps the link and updates the page.',
+      shareFilesEmpty: 'This session has not written a .md / .html file yet. You can also enter a file\'s absolute path below.',
+      shareFileAction: 'Share',
+      shareFileUpdate: 'Update',
+      shareFileBusy: 'Uploading…',
+      shareFileOther: 'Another file',
+      shareFilePlaceholder: '/absolute/path/report.html or notes.md',
+      shareFileCount: '{n} file(s)',
+      shareFileCardAction: 'Share',
+      shareFileCardTitle: 'Publish as a web page link (anyone with the link can open it)',
+      shareFileCardBusy: 'Sharing…',
+      shareFileCardRetry: 'Retry share',
+      shareFileInline: 'Share as a page',
       shareMineTitle: 'My shares',
       shareMineRefresh: 'Refresh',
       shareMineLoading: 'Loading…',
@@ -1161,6 +1189,179 @@ window.__ModuleLoader__.load({
      * where this plugin already has a per-session seat that mounts for every
      * session, Trae or not.
      */
+    // ---- sharing a file from the conversation itself ------------------------
+    //
+    // The host closes a turn with its own file cards (dsh-client-ui-deliverables):
+    // "edited TEST.md" for a file the turn wrote, and a card per file `present`
+    // delivered. A Markdown / HTML file on one of those cards gets a "Share"
+    // button that publishes it as a page (src/trae/artifact.ts), right where the
+    // file is shown. All entry points share one state per (session, file), so
+    // the button, the Trae tab and a second card naming the same file agree.
+
+    /** `${sessionId}\u0000${path}` -> { phase: 'busy' | 'done' | 'error', url?, error? } */
+    const fileShares = createStore({})
+    /** `${sessionId}:${seq}:${index}` of a delivered file -> its absolute path. */
+    const deliveredPaths = createStore({})
+    const SHAREABLE = /\.(?:md|markdown|html?)$/i
+
+    function shareKey(sessionId, path) { return `${sessionId}\u0000${path}` }
+
+    function shareFileNow(sessionId, path) {
+      const key = shareKey(sessionId, path)
+      if (fileShares.getSnapshot()[key]?.phase === 'busy') return
+      fileShares.set({ ...fileShares.getSnapshot(), [key]: { phase: 'busy' } })
+      fetch(SHARE_ROUTE.slice(1), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify({ action: 'artifact', path, ...sessionId ? { session: sessionId } : {} }),
+      })
+        .then(async (response) => {
+          const body = await response.json().catch(() => null)
+          if (!body?.ok) throw new Error(body?.error ?? `HTTP ${response.status}`)
+          fileShares.set({ ...fileShares.getSnapshot(), [key]: { phase: 'done', url: body.value.url } })
+        })
+        .catch((cause) => {
+          fileShares.set({ ...fileShares.getSnapshot(), [key]: { phase: 'error', error: String(cause?.message ?? cause) } })
+        })
+    }
+
+    /** A path as the host shows it, made absolute against the session's folder. */
+    function absolutePath(cwd, path) {
+      if (typeof path !== 'string' || !path) return ''
+      if (path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path)) return path
+      if (!cwd) return ''
+      return `${cwd.replace(/[/\\]+$/, '')}/${path.replace(/^(?:\.?[/\\])+/, '')}`
+    }
+
+    /** The share control for one file: Share → Sharing… → Open · Copy link (or Retry). */
+    function FileShareButton(props) {
+      const { t, sessionId, path } = props
+      const state = props.useFileShares(all => all[shareKey(sessionId, path)])
+      const [copied, setCopied] = React.useState('')
+      React.useEffect(() => {
+        if (!copied) return undefined
+        const timer = setTimeout(() => { setCopied('') }, COPIED_MS)
+        return () => { clearTimeout(timer) }
+      }, [copied])
+      const stop = event => { event.stopPropagation() }
+      if (state?.phase === 'done') {
+        return h('span', { className: 'trae-fs', onClick: stop, onMouseDown: stop },
+          h('a', {
+            className: 'trae-fs-btn', href: state.url, target: '_blank', rel: 'noreferrer noopener',
+            title: state.url, 'aria-label': `${t('shareOpen')} ${state.url}`,
+          }, icon(ICON_OPEN, 12), h('span', null, t('shareOpen'))),
+          h('button', {
+            type: 'button', className: 'trae-fs-btn', 'data-strong': 'true', title: state.url,
+            onClick: () => { void copyText(state.url).then((ok) => { setCopied(ok ? 'ok' : 'failed') }) },
+          }, icon(copied === 'ok' ? ICON_CHECK : ICON_COPY, 12),
+          h('span', null, copied === 'ok' ? t('shareCopied') : copied === 'failed' ? t('shareCopyFailed') : t('shareCopy'))),
+        )
+      }
+      return h('span', { className: 'trae-fs', onClick: stop, onMouseDown: stop },
+        h('button', {
+          type: 'button', className: 'trae-fs-btn', 'data-error': state?.phase === 'error' ? 'true' : undefined,
+          disabled: state?.phase === 'busy',
+          title: state?.phase === 'error' ? state.error : t('shareFileCardTitle'),
+          'aria-label': `${t('shareFileCardTitle')}: ${path}`,
+          onClick: () => { shareFileNow(sessionId, path) },
+        }, icon(ICON_SHARE, 12), h('span', null,
+          state?.phase === 'busy' ? t('shareFileCardBusy') : state?.phase === 'error' ? t('shareFileCardRetry') : t('shareFileCardAction'))),
+      )
+    }
+
+    /**
+     * One closing turn's Markdown / HTML files, from the host's own per-turn
+     * fold (`turn.data.get('deliverables')`: files written successfully, files
+     * delivered). Delivered files get their button through the cards' action
+     * slot (DeliveredShareAction); a single "edited <file>" card gets one
+     * placed on the card itself; whatever has no card to sit on is listed in a
+     * line of its own under the cards.
+     */
+    function TurnFileShare(props) {
+      const { t, sessionId } = props
+      const anchor = React.useRef(null)
+      const cwd = typeof props.useSessions === 'function' ? props.useSessions(state => state?.byId?.[sessionId]?.cwd) : undefined
+      const data = props.turn?.data?.get?.('deliverables')
+      const delivered = []
+      for (const file of data?.presented ?? []) {
+        const path = absolutePath(cwd, file.path)
+        if (path && SHAREABLE.test(path)) delivered.push({ ...file, path })
+      }
+      const written = []
+      for (const file of data?.produced ?? []) {
+        const path = absolutePath(cwd, file.path)
+        if (path && SHAREABLE.test(path) && !written.includes(path) && !delivered.some(d => d.path === path)) written.push(path)
+      }
+      // Tell the delivered cards' action slot which file each one is.
+      React.useEffect(() => {
+        if (delivered.length === 0) return
+        const next = { ...deliveredPaths.getSnapshot() }
+        let changed = false
+        for (const file of delivered) {
+          const key = `${sessionId}:${file.seq}:${file.index}`
+          if (next[key] !== file.path) { next[key] = file.path; changed = true }
+        }
+        if (changed) deliveredPaths.set(next)
+      })
+      // The single-file "edited" card, once the host has rendered it.
+      const [host, setHost] = React.useState(null)
+      React.useLayoutEffect(() => {
+        if (written.length === 0 || !createPortal) return undefined
+        const tail = anchor.current?.closest('[data-turn-tail]')
+        if (!tail) return undefined
+        let placed = null
+        const attach = () => {
+          const card = tail.querySelector('[data-changed-files][data-single]')
+          const described = card?.querySelector('button[aria-describedby]')
+          const pathId = described?.getAttribute('aria-describedby')
+          const cardPath = pathId ? document.getElementById(pathId)?.textContent?.trim() : undefined
+          if (!card || !cardPath || !written.includes(cardPath)) return
+          if (placed?.isConnected && placed.parentElement === card) return
+          if (getComputedStyle(card).position === 'static') card.style.position = 'relative'
+          const span = document.createElement('span')
+          span.className = 'trae-fs-slot'
+          span.dataset.path = cardPath
+          card.appendChild(span)
+          placed = span
+          setHost({ element: span, path: cardPath })
+        }
+        attach()
+        const observer = new MutationObserver(attach)
+        observer.observe(tail, { childList: true, subtree: true })
+        return () => { observer.disconnect(); placed?.remove(); setHost(null) }
+      }, [written.join('\n')])
+
+      if (written.length === 0) return delivered.length > 0 ? h('span', { ref: anchor, hidden: true }) : null
+      const loose = written.filter(path => path !== host?.path)
+      return h(React.Fragment, null,
+        host && createPortal(h(FileShareButton, { t, sessionId, path: host.path, useFileShares: props.useFileShares }), host.element),
+        loose.length > 0
+          ? h('div', { ref: anchor, className: 'trae-fs-row' },
+            h('span', { className: 'trae-fs-label' }, icon(ICON_SHARE, 12), t('shareFileInline')),
+            ...loose.map(path => h('span', { key: path, className: 'trae-fs-item' },
+              h('span', { className: 'trae-fs-name', title: path }, path.split('/').pop()),
+              h(FileShareButton, { t, sessionId, path, useFileShares: props.useFileShares }),
+            )),
+          )
+          : h('span', { ref: anchor, hidden: true }),
+      )
+    }
+
+    /** The share button on a delivered (`present`) file card, through the card's own action slot. */
+    function DeliveredShareAction(props) {
+      const { t, actionUrl } = props
+      let key = ''
+      let sessionId = ''
+      try {
+        const query = new URLSearchParams(String(actionUrl ?? '').split('?')[1] ?? '')
+        sessionId = query.get('sessionId') ?? ''
+        key = `${sessionId}:${query.get('seq')}:${query.get('index')}`
+      } catch { /* not ours to read */ }
+      const path = props.useDeliveredPaths(all => all[key])
+      if (!path || !SHAREABLE.test(path)) return null
+      return h(FileShareButton, { t, sessionId, path, useFileShares: props.useFileShares })
+    }
+
     function SessionWatch(props) {
       const provider = props.useTraeModel(snapshot => snapshot?.current?.provider)
       // Two effects on purpose: the first follows the picked model, and the
@@ -1332,7 +1533,7 @@ window.__ModuleLoader__.load({
 .trae-chip{flex:none;height:26px;padding:0 10px 0 8px;border:.5px solid var(--dsw-alias-border-l3);border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;line-height:16px;text-decoration:none;cursor:pointer;display:inline-flex;align-items:center;gap:5px}
 .trae-chip:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 .trae-chip[data-strong]{border-color:transparent;background:var(--dsw-alias-label-primary);color:var(--dsw-alias-bg-base)}
-.trae-chip[data-strong]:hover{background:var(--dsw-alias-label-primary);opacity:.88}
+.trae-chip[data-strong]:hover:not(:disabled){background:var(--dsw-alias-label-primary);color:var(--dsw-alias-bg-base);opacity:.88}
 .trae-icon-btn{flex:none;width:28px;height:28px;padding:0;border:none;border-radius:var(--dsw-radius-sm,6px);background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer;display:grid;place-items:center;text-decoration:none}
 .trae-icon-btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 .trae-icon-btn[data-danger]:hover:not(:disabled){color:var(--dsw-alias-state-error-primary)}
@@ -1350,6 +1551,36 @@ window.__ModuleLoader__.load({
 .trae-ticket-foot::after{right:-8px;clip-path:inset(0 50% 0 0)}
 .trae-ticket-meta{flex:1 1 150px;min-width:0;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;font-variant-numeric:tabular-nums}
 .trae-list{display:flex;flex-direction:column;margin:0 -4px;padding:0;list-style:none}
+.trae-file{display:flex;flex-direction:column;gap:8px;padding:10px 4px;border-top:.5px solid var(--dsw-alias-border-l4)}
+.trae-file:first-child{border-top:none;padding-top:2px}
+.trae-file-main{display:flex;align-items:center;gap:10px;min-width:0}
+.trae-kind{flex:none;min-width:38px;height:20px;padding:0 6px;border-radius:5px;background:var(--trae-tint);color:var(--dsw-alias-label-secondary);font-family:var(--dsw-font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:10px;font-weight:600;line-height:20px;text-align:center;letter-spacing:.04em}
+.trae-kind[data-kind=html]{color:var(--dsw-alias-state-business-primary)}
+.trae-file-text{flex:1;min-width:0;display:flex;flex-direction:column}
+.trae-file-name{font-size:13px;font-weight:500;line-height:20px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.trae-file-meta{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.trae-other{display:flex;flex-direction:column;gap:6px;padding-top:10px;border-top:.5px solid var(--dsw-alias-border-l4)}
+.trae-list + .trae-other{margin-top:-2px}
+.trae-card-lead + .trae-other{border-top:none;padding-top:0}
+.trae-other-label{color:var(--dsw-alias-label-secondary);font-size:12px;font-weight:500}
+.trae-other-row{display:flex;align-items:center;gap:8px}
+.trae-input{flex:1;min-width:0;height:30px;padding:0 10px;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-md,8px);background:transparent;color:var(--dsw-alias-label-primary);font-family:var(--dsw-font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:12px;outline:none}
+.trae-input:focus{border-color:var(--dsw-alias-state-business-primary)}
+.trae-input::placeholder{color:var(--dsw-alias-label-caption,var(--dsw-alias-label-tertiary))}
+.trae-chip:disabled{opacity:.4;cursor:default}
+.trae-fs{display:inline-flex;align-items:center;gap:6px;font-size:12px;line-height:16px}
+.trae-fs-btn{flex:none;height:26px;padding:0 10px 0 8px;border:.5px solid var(--dsw-alias-border-l3);border-radius:999px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;text-decoration:none;cursor:pointer;display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+.trae-fs-btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.trae-fs-btn:disabled{opacity:.55;cursor:default}
+.trae-fs-btn[data-strong]{border-color:transparent;background:var(--dsw-alias-label-primary);color:var(--dsw-alias-bg-base)}
+.trae-fs-btn[data-strong]:hover:not(:disabled){background:var(--dsw-alias-label-primary);color:var(--dsw-alias-bg-base);opacity:.88}
+.trae-fs-btn[data-error]{border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary) 45%,transparent);color:var(--dsw-alias-state-error-primary)}
+.trae-fs-btn:focus-visible{outline:2px solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:2px}
+.trae-fs-slot{position:absolute;top:50%;right:16px;transform:translateY(-50%);z-index:1;display:inline-flex}
+.trae-fs-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;margin-top:8px;padding:8px 12px;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-lg,12px);color:var(--dsw-alias-label-secondary);font-size:12px}
+.trae-fs-label{display:inline-flex;align-items:center;gap:5px;color:var(--dsw-alias-label-tertiary)}
+.trae-fs-item{display:inline-flex;align-items:center;gap:8px;min-width:0}
+.trae-fs-name{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-primary);font-weight:500}
 .trae-item{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:2px 12px;padding:10px 4px;border-top:.5px solid var(--dsw-alias-border-l4)}
 .trae-item:first-child{border-top:none;padding-top:2px}
 .trae-item-title{display:flex;align-items:center;gap:8px;min-width:0;font-size:13px;font-weight:500;line-height:20px}
@@ -1465,6 +1696,14 @@ window.__ModuleLoader__.load({
       return withTime ? `${day} ${pad(date.getHours())}:${pad(date.getMinutes())}` : day
     }
 
+    /** Bytes as people read them. */
+    function sizeLabel(bytes) {
+      if (!Number.isFinite(bytes)) return ''
+      if (bytes < 1024) return `${bytes} B`
+      if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+      return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+    }
+
     /** A link split for the ticket: the part everyone's links share, and the id that is this one's. */
     function splitLink(url) {
       try {
@@ -1509,6 +1748,10 @@ window.__ModuleLoader__.load({
       const [mineError, setMineError] = React.useState('')
       const [confirmDelete, setConfirmDelete] = React.useState('')
       const [copied, setCopied] = React.useState('')
+      // Files the session produced, and per file the link / error of its last share.
+      const [files, setFiles] = React.useState(null)
+      const [fileResults, setFileResults] = React.useState({})
+      const [otherPath, setOtherPath] = React.useState('')
 
       React.useEffect(() => {
         if (!copied) return undefined
@@ -1545,6 +1788,33 @@ window.__ModuleLoader__.load({
           .finally(() => { setBusy(current => current === 'mine' ? '' : current) })
       }
       React.useEffect(() => { loadMine() }, [])
+
+      React.useEffect(() => {
+        if (!sessionId || busy) return undefined
+        const abort = new AbortController()
+        fetch(`${SHARE_ROUTE.slice(1)}?files=${encodeURIComponent(sessionId)}`, {
+          headers: { accept: 'application/json' }, signal: abort.signal,
+        })
+          .then(response => response.ok ? response.json() : null)
+          .then((body) => { if (!abort.signal.aborted) setFiles(body?.ok ? body.value : []) })
+          .catch(() => {})
+        return () => { abort.abort() }
+      }, [sessionId, conversation, busy])
+
+      const shareFile = (path) => {
+        const target = String(path ?? '').trim()
+        if (!target) return
+        setBusy(`file:${target}`)
+        setFileResults(current => ({ ...current, [target]: undefined }))
+        shareRoute({ action: 'artifact', path: target, ...sessionId ? { session: sessionId } : {} })
+          .then((value) => {
+            setFileResults(current => ({ ...current, [target]: { value } }))
+            if (value?.source && value.source !== target) setFileResults(current => ({ ...current, [value.source]: { value } }))
+            loadMine()
+          })
+          .catch((cause) => { setFileResults(current => ({ ...current, [target]: { error: String(cause?.message ?? cause) } })) })
+          .finally(() => { setBusy('') })
+      }
 
       const create = (mode) => {
         if (!sessionId || !kept) return
@@ -1594,14 +1864,15 @@ window.__ModuleLoader__.load({
           h('div', { className: 'trae-ticket-foot' },
             h('span', { className: 'trae-ticket-meta' }, [
               value.turns ? t('shareStatTurns').replace('{n}', String(value.turns)) : '',
+              value.files ? t('shareFileCount').replace('{n}', String(value.files)) : '',
               value.modelCalls ? t('shareCallsNote').replace('{n}', String(value.modelCalls)) : '',
               expires ? t('shareExpires').replace('{date}', shortDate(expires, false)) : '',
             ].filter(Boolean).join(' · ')),
             openButton(value.url, 'trae-chip'),
             h('button', {
               type: 'button', className: 'trae-chip', 'data-strong': 'true',
-              onClick: () => { copy('new', value.url) },
-            }, icon(ICON_COPY, 12), h('span', null, copyLabel('new'))),
+              onClick: () => { copy(`new:${value.url}`, value.url) },
+            }, icon(ICON_COPY, 12), h('span', null, copyLabel(`new:${value.url}`))),
           ),
         )
       }
@@ -1637,6 +1908,30 @@ window.__ModuleLoader__.load({
                 h(React.Fragment, { key: 'delete' }, iconButton(t('shareDelete'), ICON_TRASH, () => { setConfirmDelete(id) }, { 'data-danger': 'true' })),
               ],
           ),
+        )
+      }
+
+      const fileRow = (file) => {
+        const name = file.path.split('/').pop()
+        const folder = file.path.slice(0, file.path.length - name.length)
+        const result = fileResults[file.path]
+        const shared = result?.value ?? file.shared
+        const working = busy === `file:${file.path}`
+        return h('li', { key: file.path, className: 'trae-file' },
+          h('div', { className: 'trae-file-main' },
+            h('span', { className: 'trae-kind', 'data-kind': file.kind }, file.kind === 'markdown' ? 'MD' : 'HTML'),
+            h('div', { className: 'trae-file-text' },
+              h('span', { className: 'trae-file-name', title: file.path }, name),
+              h('span', { className: 'trae-file-meta' }, [shortDate(file.modifiedAt), sizeLabel(file.size), folder].filter(Boolean).join(' · ')),
+            ),
+            h('button', {
+              type: 'button', className: 'trae-chip', 'data-strong': shared ? undefined : 'true',
+              disabled: busy !== '' && busy !== 'mine',
+              onClick: () => { shareFile(file.path) },
+            }, working ? t('shareFileBusy') : shared ? t('shareFileUpdate') : t('shareFileAction')),
+          ),
+          result?.error ? h('p', { className: 'trae-error', role: 'alert' }, result.error) : null,
+          result?.value ? ticket(result.value) : null,
         )
       }
 
@@ -1682,6 +1977,33 @@ window.__ModuleLoader__.load({
             ? h('p', { className: 'trae-card-note' }, t('shareDropped').replace('{turns}', String(result.turns)).replace('{dropped}', String(result.dropped)))
             : null,
           result ? h('p', { className: 'trae-card-note' }, t('sharePublicNote')) : null,
+        ),
+
+        // ---- files the session produced ------------------------------------------
+        h('section', { className: 'trae-card', 'aria-label': t('shareFilesTitle') },
+          h('header', { className: 'trae-card-head' }, h('h3', { className: 'trae-card-title' }, t('shareFilesTitle'))),
+          h('p', { className: 'trae-card-lead' }, files && files.length === 0 ? t('shareFilesEmpty') : t('shareFilesLead')),
+          files && files.length > 0 ? h('ul', { className: 'trae-list' }, files.map(fileRow)) : null,
+          h('div', { className: 'trae-other' },
+            h('label', { className: 'trae-other-label', htmlFor: 'trae-other-path' }, t('shareFileOther')),
+            h('div', { className: 'trae-other-row' },
+              h('input', {
+                id: 'trae-other-path', className: 'trae-input', value: otherPath, spellCheck: false,
+                placeholder: t('shareFilePlaceholder'),
+                onChange: (event) => { setOtherPath(event.target.value) },
+                onKeyDown: (event) => { if (event.key === 'Enter') shareFile(otherPath) },
+              }),
+              h('button', {
+                type: 'button', className: 'trae-chip', 'data-strong': 'true',
+                disabled: !otherPath.trim() || busy !== '' && busy !== 'mine',
+                onClick: () => { shareFile(otherPath) },
+              }, busy === `file:${otherPath.trim()}` ? t('shareFileBusy') : t('shareFileAction')),
+            ),
+            fileResults[otherPath.trim()]?.error ? h('p', { className: 'trae-error', role: 'alert' }, fileResults[otherPath.trim()].error) : null,
+            fileResults[otherPath.trim()]?.value && !files?.some(file => file.path === otherPath.trim())
+              ? ticket(fileResults[otherPath.trim()].value)
+              : null,
+          ),
         ),
 
         // ---- my shares ---------------------------------------------------------
@@ -2385,6 +2707,21 @@ window.__ModuleLoader__.load({
           return () => { style.remove() }
         }, 'dsh-trae2api: next-step card styles')
         const choices = new SuggestionController()
+        // Share buttons on the host's own file cards at the end of a turn.
+        ctx.slots.inject('conversation.chat.turnTail', () => ctx.slots.register({
+          name: 'conversation.chat.turnTail',
+          id: 'trae-file-share',
+          // After the host's file cards, which this sits on or under.
+          order: 50,
+          locale: NS,
+          inject: () => ({ hooks: { fileShares } }),
+        }, TurnFileShare))
+        ctx.slots.inject('deliverables.file.actions', () => ctx.slots.register({
+          name: 'deliverables.file.actions',
+          id: 'trae-file-share',
+          locale: NS,
+          inject: () => ({ hooks: { fileShares, deliveredPaths } }),
+        }, DeliveredShareAction))
         ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
           name: 'conversation.input.dock',
           // After the host's todo (0) and queue (20) docks, right above the input.

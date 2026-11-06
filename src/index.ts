@@ -27,7 +27,10 @@ import { TraeUserInfo } from './trae/user.ts'
 import { TraeQuota } from './trae/quota.ts'
 import { mirrorAndShare } from './trae/mirror.ts'
 import { TranscriptStore, transcriptMessage, transcriptOf, userTurns } from './trae/transcript.ts'
-import { conversationTurns, localShareBody } from './trae/local-share.ts'
+import { conversationTurns, localShareBody, objectId, type ConversationTurn } from './trae/local-share.ts'
+import { ArtifactError, artifactKind, packArtifact } from './trae/artifact.ts'
+import { stat } from 'node:fs/promises'
+import { isAbsolute, normalize } from 'node:path'
 import { artifactUrl, latestTurns, SHARE_API_ORIGIN, ShareError, shareOriginFor, shareUrl, TraeShare } from './trae/share.ts'
 import { TraeSuggestions } from './trae/suggest.ts'
 import { TOB_CONSOLE_HOST, TobConsole } from './trae/tob.ts'
@@ -337,6 +340,35 @@ export function apply(ctx: Context, config: Config): void {
   // runs the side completion. `adapter` is assigned right below. Built either
   // way and gated by `enabled`, so the switch works without a restart.
   const transcripts = new TranscriptStore()
+  /** Files shared as pages in this run: `${session}\u0000${path}` -> the link. */
+  const artifactShares = new Map<string, { url: string; shareSessionId: string; at: number }>()
+  /**
+   * Markdown / HTML files a session's tools wrote or presented, newest
+   * mention last: `write` / `edit` carry `file_path`, `present` a `files[]`
+   * list of `{ path }`. Only absolute paths count — that is how dsh's tools
+   * name files — and only the kinds `packArtifact` can share.
+   */
+  const producedFiles = (turns: readonly ConversationTurn[]): string[] => {
+    const found: string[] = []
+    const consider = (value: unknown): void => {
+      if (typeof value !== 'string' || !isAbsolute(value) || !artifactKind(value)) return
+      const path = normalize(value)
+      const at = found.indexOf(path)
+      if (at >= 0) found.splice(at, 1)
+      found.push(path)
+    }
+    for (const turn of turns) {
+      for (const step of turn.steps) {
+        const args = step.tool?.args
+        if (!args) continue
+        for (const key of ['file_path', 'path', 'filePath', 'target_file']) consider(args[key])
+        if (Array.isArray(args.files)) {
+          for (const file of args.files) consider(typeof file === 'string' ? file : (file as { path?: unknown })?.path)
+        }
+      }
+    }
+    return found
+  }
   const suggestions = new TraeSuggestions({
     complete: (model, system, user, signal) => adapter.complete(model, system, user, signal),
     model: config.suggestModel,
@@ -685,7 +717,10 @@ export function apply(ctx: Context, config: Config): void {
                     for (const item of answer.items) {
                       items.push({
                         shareSessionId: item.shareSessionId,
-                        url: shareUrl(item.shareSessionId, shareOriginFor(answer.host)),
+                        // A page share opens at /artifact/<id>; a conversation at /share/<id>.
+                        url: item.shareType === 'artifact'
+                          ? artifactUrl(item.shareSessionId, shareOriginFor(answer.host))
+                          : shareUrl(item.shareSessionId, shareOriginFor(answer.host)),
                         title: item.title,
                         status: item.status,
                         shareType: item.shareType,
@@ -703,6 +738,30 @@ export function apply(ctx: Context, config: Config): void {
                   return Response.json({ ok: false, error: probes.map(p => `${p.host}: ${p.error}`).join('；'), probes }, { status: 502 })
                 }
                 return Response.json({ ok: true, value: items, probes })
+              }
+              // `?files=<session>`: Markdown / HTML files that session produced,
+              // still on disk, newest first — what "share a file" offers.
+              if (url.searchParams.has('files')) {
+                const session = url.searchParams.get('files') ?? ''
+                const kept = transcripts.get(session)
+                const paths = kept ? producedFiles(kept.turns) : []
+                const files: Record<string, unknown>[] = []
+                for (const path of paths) {
+                  try {
+                    const info = await stat(path)
+                    if (!info.isFile()) continue
+                    const shared = artifactShares.get(`${session}\u0000${path}`)
+                    files.push({
+                      path,
+                      kind: artifactKind(path),
+                      size: info.size,
+                      modifiedAt: info.mtimeMs,
+                      ...shared ? { shared } : {},
+                    })
+                  } catch { /* gone since */ }
+                }
+                files.sort((a, b) => Number(b.modifiedAt) - Number(a.modifiedAt))
+                return Response.json({ ok: true, value: files.slice(0, 30) })
               }
               // `?transcript=<session>`: the size of what sharing this session
               // would send, so the card can state the cost before the click.
@@ -754,7 +813,7 @@ export function apply(ctx: Context, config: Config): void {
               })
             }
             let input: {
-              action?: unknown; id?: unknown; host?: unknown; session?: unknown
+              action?: unknown; id?: unknown; host?: unknown; session?: unknown; path?: unknown
               chatSessionId?: unknown; turnIds?: unknown
               anonymous?: unknown; creatorName?: unknown; skipAudit?: unknown
               turns?: unknown; maxTurns?: unknown; mode?: unknown
@@ -766,6 +825,42 @@ export function apply(ctx: Context, config: Config): void {
             // The host the picked session was listed on; only a host this
             // plugin already speaks to is accepted, never one from the body.
             let writer = (typeof input.host === 'string' && shareClients.get(input.host.replace(/\/+$/, ''))) || share
+            // `{ action: 'artifact', path, session? }`: a Markdown / HTML file as a
+            // page link (artifact.ts). Keyed by the session and the file, so
+            // sharing the same file again updates the page behind the same link.
+            if (action === 'artifact') {
+              if (typeof input.path !== 'string' || !input.path.trim()) {
+                return Response.json({ ok: false, error: 'expected { action:"artifact", path }' }, { status: 400 })
+              }
+              const session = typeof input.session === 'string' && input.session ? input.session : 'files'
+              let pack
+              try { pack = await packArtifact(input.path.trim()) } catch (error) {
+                if (error instanceof ArtifactError) return Response.json({ ok: false, error: error.message }, { status: 400 })
+                throw error
+              }
+              const link = await share.shareArtifact({
+                localSessionId: objectId(`dsh:${session}`),
+                artifactPath: pack.artifactPath,
+                zip: pack.zip,
+                contentHash: pack.contentHash,
+              })
+              artifactShares.set(`${session}\u0000${pack.source}`, { url: link.url, shareSessionId: link.shareSessionId, at: Date.now() })
+              logger.info(`dsh-trae2api: shared ${pack.kind} ${pack.source} as ${link.shareSessionId} (${pack.files.length} file(s), ${pack.zip.byteLength} bytes)`)
+              return Response.json({
+                ok: true,
+                value: {
+                  url: link.url,
+                  link,
+                  title: link.title,
+                  kind: pack.kind,
+                  source: pack.source,
+                  artifactPath: pack.artifactPath,
+                  files: pack.files.length,
+                  bytes: pack.zip.byteLength,
+                  host: share.host,
+                },
+              })
+            }
             // Lifecycle (report v2 §3.2): `disable` closes a link (anonymous
             // reads become 403 992701), `enable` reopens it, `delete` revokes it
             // for good (410 992702). Only the account that minted it may.

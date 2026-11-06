@@ -703,7 +703,10 @@ test('local share: turns open at each question, steps carry their call and resul
     { role: 'tool', toolCallId: 'a', content: [{ type: 'text', text: 'README.md' }] },
     { role: 'tool', toolCallId: 'b', content: [{ type: 'text', text: '# Title' }] },
     { role: 'assistant', source: model, content: [{ type: 'text', text: 'One file.' }] },
-    { role: 'user', content: [{ type: 'text', text: 'thanks' }] },
+    // The harness's own context, sent as user messages with a non-user source.
+    { role: 'user', source: { kind: 'time-context', form: 'snapshot', sections: [] }, content: [{ type: 'text', text: 'Browser time zone for this request: Asia/Shanghai.' }] },
+    { role: 'user', source: { kind: 'runtime-context', form: 'snapshot', sections: [] }, content: [{ type: 'text', text: 'Current runtime context.' }] },
+    { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'thanks' }] },
   ], 'You are welcome.', { reasoning: 'polite', model: 'Kimi-K3' })
   assert.equal(turns.length, 2)
   assert.equal(turns[0].user, 'list files')
@@ -741,4 +744,152 @@ test('local share: at most 50 turns go out, the latest ones, with stable ids', a
   assert.match(once.body.messages[0].message_id, /^[0-9a-f]{24}$/)
   // The same session shares under the same ids.
   assert.deepEqual(localShareBody(turns, { sessionId: 's', updatedAt: 1_700_000_000_000 }).body, once.body)
+})
+
+// ------------------------------------------------------------ artifacts
+
+test('artifact: a stored zip with UTF-8 names that unzip accepts', async () => {
+  const { zipStore, crc32 } = await import('../lib/testing.mjs')
+  const { execFileSync } = await import('node:child_process')
+  const { mkdtempSync, writeFileSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  assert.equal(crc32(Buffer.from('123456789')), 0xcbf43926)
+  const zip = zipStore([
+    { path: '报告-abc123/index.html', data: Buffer.from('<h1>hi</h1>') },
+    { path: '报告-abc123/img/a.png', data: Buffer.from([1, 2, 3]) },
+  ])
+  assert.equal(zip.readUInt32LE(0), 0x04034b50)
+  assert.equal(zip.readUInt32LE(zip.length - 22), 0x06054b50)
+  assert.equal(zip.readUInt16LE(zip.length - 12), 2)
+  const dir = mkdtempSync(join(tmpdir(), 'trae-zip-'))
+  writeFileSync(join(dir, 'p.zip'), zip)
+  // Python's zipfile honours the UTF-8 name flag and checks every CRC.
+  let names
+  try {
+    names = execFileSync('python3', ['-c', 'import sys,zipfile;z=zipfile.ZipFile(sys.argv[1]);assert z.testzip() is None;print("\\n".join(z.namelist()))', join(dir, 'p.zip')], { encoding: 'utf8' })
+  } catch (error) {
+    if (error.code === 'ENOENT') return // no python here: the header checks above stand
+    throw error
+  }
+  assert.deepEqual(names.trim().split('\n'), ['报告-abc123/index.html', '报告-abc123/img/a.png'])
+})
+
+test('artifact: references are the relative ones only', async () => {
+  const { references } = await import('../lib/testing.mjs')
+  const html = `<link href="style.css"><img src='img/a.png?v=1'><a href="https://x.dev">x</a><a href="#top">t</a>
+    <script src="//cdn/x.js"></script><img src="/root.png"><img srcset="s1.png 1x, s2.png 2x"><div style="background:url(bg.jpg)"></div>
+    <style>@import "more.css"; .a{background:url('icons/i.svg')}</style><img src="data:image/png;base64,AA">`
+  assert.deepEqual(references(html, 'html').sort(), ['bg.jpg', 'icons/i.svg', 'img/a.png', 'more.css', 's1.png', 's2.png', 'style.css'].sort())
+})
+
+test('artifact: a page packs what it references inside its own folder, and nothing outside it', async () => {
+  const { packArtifact, ArtifactError } = await import('../lib/testing.mjs')
+  const { mkdtempSync, mkdirSync, writeFileSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const base = mkdtempSync(join(tmpdir(), 'trae-art-'))
+  const site = join(base, 'report')
+  mkdirSync(join(site, 'img'), { recursive: true })
+  mkdirSync(join(site, '.git'), { recursive: true })
+  writeFileSync(join(base, 'secret.txt'), 'nope')
+  writeFileSync(join(site, '.git', 'config'), 'nope')
+  writeFileSync(join(site, 'style.css'), '.a{background:url(img/bg.png)}')
+  writeFileSync(join(site, 'img', 'bg.png'), 'png')
+  writeFileSync(join(site, 'img', 'a.png'), 'png')
+  writeFileSync(join(site, 'bundle.zip'), 'zip')
+  writeFileSync(join(site, 'index.html'), `<link rel="stylesheet" href="style.css"><img src="img/a.png"><img src="../secret.txt">
+    <a href=".git/config">c</a><a href="bundle.zip">z</a><img src="missing.png">`)
+  const pack = await packArtifact(join(site, 'index.html'))
+  const label = pack.artifactPath.split('/')[0]
+  assert.match(label, /^report-[0-9a-f]{6}$/)
+  assert.equal(pack.artifactPath, `${label}/index.html`)
+  assert.deepEqual(pack.files.map(f => f.slice(label.length + 1)).sort(), ['img/a.png', 'img/bg.png', 'index.html', 'style.css'])
+  assert.match(pack.contentHash, /^sha256:[0-9a-f]{64}$/)
+  assert.ok(!pack.zip.includes(Buffer.from('nope')))
+
+  // Markdown becomes a titled page, and its images come along.
+  writeFileSync(join(site, 'notes.md'), '# 周报\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n![chart](img/a.png)\n')
+  const md = await packArtifact(join(site, 'notes.md'))
+  assert.equal(md.kind, 'markdown')
+  assert.equal(md.artifactPath, `${label}/notes.html`)
+  assert.deepEqual(md.files.map(f => f.slice(label.length + 1)).sort(), ['img/a.png', 'notes.html'])
+  const page = md.zip.toString('utf8')
+  assert.match(page, /<title>周报<\/title>/)
+  assert.match(page, /<table>/)
+
+  for (const bad of ['relative/x.html', join(site, 'style.css'), join(site, 'nope.html')]) {
+    await assert.rejects(() => packArtifact(bad), (error) => error instanceof ArtifactError)
+  }
+})
+
+test('artifact: presign, upload, create — and the link is the /artifact/ page', async () => {
+  const calls = []
+  const original = globalThis.fetch
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url)
+    calls.push({ url: u, method: init.method ?? 'GET', headers: init.headers ?? {}, body: init.body })
+    if (u.endsWith('/local_artifact/presign-upload')) {
+      return Response.json({ code: 0, data: { upload_url: 'https://tos.invalid/put?sig=1', upload_headers: '{"x-tos-meta":"1"}', resource_uri: 'local-artifact://v1/abc' } })
+    }
+    if (u.startsWith('https://tos.invalid/')) return new Response('', { status: 200 })
+    if (u.endsWith('/share/local_artifact')) return Response.json({ code: 0, data: { share_session_id: 'WQ2WJIIRAY2P4_', status: 'active', expires_at: '2027-11-06T00:00:00+08:00' } })
+    return Response.json({ code: 0 })
+  }
+  try {
+    const auth = { get: async () => ({ token: 'JWT', expiresAt: Date.now() + 3_600_000 }) }
+    const share = new TraeShare({ host: 'https://trae-api-cn.mchost.guru', userAgent: 't', auth, ttlMs: 0 })
+    const link = await share.shareArtifact({ localSessionId: 'L', artifactPath: 'r-abc123/index.html', zip: Buffer.from('PK'), contentHash: 'sha256:00' })
+    assert.equal(link.url, 'https://share.traecontent.cn/artifact/WQ2WJIIRAY2P4_')
+    assert.deepEqual(calls.map(c => `${c.method} ${c.url}`), [
+      'POST https://trae-api-cn.mchost.guru/api/remote/v1/share/local_artifact/presign-upload',
+      'PUT https://tos.invalid/put?sig=1',
+      'POST https://trae-api-cn.mchost.guru/api/remote/v1/share/local_artifact',
+    ])
+    assert.deepEqual(JSON.parse(calls[0].body), { local_session_id: 'L', artifact_path: 'r-abc123/index.html', content_length: 2, content_hash: 'sha256:00' })
+    assert.equal(calls[1].headers['content-type'], 'application/zip')
+    assert.equal(calls[1].headers['x-tos-meta'], '1')
+    assert.equal(calls[1].headers.authorization, undefined, 'the signed URL carries no JWT')
+    assert.deepEqual(JSON.parse(calls[2].body), { local_session_id: 'L', artifact_path: 'r-abc123/index.html', resource_uri: 'local-artifact://v1/abc', content_hash: 'sha256:00' })
+  } finally { globalThis.fetch = original }
+})
+
+test('local share: the harness context messages never become turns or the title', async () => {
+  const { conversationTurns, localShareBody } = await import('../lib/testing.mjs')
+  const model = { kind: 'model', provider: 'trae', model: 'GLM-5.3' }
+  const history = [
+    // Two snapshot contexts, exactly as the harness requests them.
+    { role: 'user', source: { kind: 'runtime-context', form: 'snapshot', sections: [] }, content: [{ type: 'text', text: 'Current working directory: "/w". The runtime context names…' }] },
+    { role: 'user', source: { kind: 'time-context', form: 'snapshot', sections: [] }, content: [{ type: 'text', text: 'Time sampled while preparing turn 1, step 1: 2026-11-06T16:38:16+08:00[Asia/Shanghai]\nBrowser time zone for this request: Asia/Shanghai. Interpret otherwise-unqualified dates and times in this zone.\nElapsed since the preceding model-visible message: unavailable.' }] },
+    { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '1+3 等于什么' }] },
+    { role: 'assistant', source: model, content: [{ type: 'text', text: '4' }] },
+  ]
+  const turns = conversationTurns(history, '4')
+  assert.equal(turns.length, 1, 'context messages are not questions')
+  assert.equal(turns[0].user, '1+3 等于什么')
+  assert.doesNotMatch(turns[0].user, /Browser time zone/)
+  const body = localShareBody(turns, { sessionId: 's1', updatedAt: 1_793_948_400_000 })
+  assert.equal(body.body.title, '1+3 等于什么', 'the title is the first real question')
+  assert.equal(body.body.messages.filter(m => m.role === 'user').length, 1)
+})
+
+test('local share: a message left empty after the clock line is stripped opens no turn', async () => {
+  const { conversationTurns } = await import('../lib/testing.mjs')
+  const turns = conversationTurns([
+    { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'Time sampled while preparing turn 2, step 3: 2026-11-06T16:40:00+08:00[Asia/Shanghai]' }] },
+    { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '真问题' }] },
+    { role: 'assistant', source: { kind: 'model' }, content: [{ type: 'text', text: '答' }] },
+  ], '')
+  assert.deepEqual(turns.map(t => t.user), ['真问题'])
+})
+
+test('local share: the three time-context lines are stripped even without a source', async () => {
+  const { conversationTurns } = await import('../lib/testing.mjs')
+  // A request whose `source` did not survive: the text is all there is.
+  const turns = conversationTurns([
+    { role: 'user', content: [{ type: 'text', text: 'Time sampled while preparing turn 3, step 2: 2026-11-06T16:49:50+08:00[Asia/Shanghai]\nBrowser time zone for this request: mixed ["A","B"]. Ask the user to clarify otherwise-unqualified dates and times.\nElapsed since the preceding step context: 10m 1s.' }] },
+    { role: 'user', content: [{ type: 'text', text: '真问题' }] },
+    { role: 'assistant', source: { kind: 'model' }, content: [{ type: 'text', text: '答' }] },
+  ], '')
+  assert.deepEqual(turns.map(t => t.user), ['真问题'])
 })
