@@ -124,10 +124,10 @@ v0.3 起插件自己直连 Trae 的 `llm_raw_chat` 接口（和 trae2api 的 dir
 
 ### 用 tgz 安装（发给别人）
 
-`dsh-trae2api-0.10.1.tgz` 是预构建好的包，不需要构建权限：
+`dsh-trae2api-0.12.0.tgz` 是预构建好的包，不需要构建权限：
 
 ```sh
-dsh plugin --profile desktop add ./dsh-trae2api-0.10.1.tgz
+dsh plugin --profile desktop add ./dsh-trae2api-0.12.0.tgz
 ```
 
 装完同样去 **设置 → 模型 → Trae** 填 PAT。tgz 方式下插件自带全部代码，和项目目录无关。
@@ -149,6 +149,7 @@ dsh plugin --profile desktop add ./dsh-trae2api-0.10.1.tgz
 |---|---|---|
 | `patEnv` | `TRAE_PAT` | PAT 在凭据库里的名字 |
 | `host` | `https://api.enterprise.trae.cn` | Trae 接口地址 |
+| `shareHost` | `https://trae-api-cn.mchost.guru` | 分享接口地址（TRAE SOLO CN 客户端自己的写接口）。链接固定拼在 `share.traecontent.cn` 上；企业版与消费版是两套分享空间，互相读不到 |
 | `clientId` | `app_EMoamEEZ73f0CkXaXp7hrann` | PAT 兑换用的 OAuth client id（traecli 的） |
 | `appId` / `ideVersionCode` / `clientVersion` | 20260908 那一代 | 身份头，和模型名后缀（`__dev`）配对 |
 | `catalogSource` | `auto` | 模型目录来源：`auto` = 上游 → traecli 缓存 → 内置；也可锁成 `upstream` / `cache` / `builtin` |
@@ -249,9 +250,48 @@ python3 -I tools/probe_catalog.py
 该通道上架了几个配置、哪些可见。想验证 `catalogFunctions` 里那四个未取证的通道名，就看这段
 （换一批名字：`TRAE_FUNCTIONS=chat,solo_coder python3 -I tools/probe_catalog.py`）。
 
+## Trae 标签页：分享这条会话
+
+会话顶上那排标签（对话 / 轨迹 / 上下文 / …）里多一个「**Trae**」，只在屏幕上有 Trae 会话时出现。从上到下三块：
+
+- **分享这条会话**：点「生成分享链接」，把这条会话发成一条 `https://share.traecontent.cn/share/<id>?enter_from=pc` 链接。
+  每轮对话单独显示，回答里带思考、工具调用和工具输出，和 TRAE SOLO 自己分享出去的页面一个样子；**不调用模型**。
+- **我的分享**：这个账号铸过的链接，打开标签就读一次。每条显示状态（公开中 / 审核中 / 已关闭）、创建和到期时间，
+  可以打开、复制、关闭（对方打开会提示已关闭）、重新公开、删除（撤销，不能恢复，要点两次）。
+- **会话 ID**：见下一节。
+
+> 拿到链接的人**不用登录就能看完整对话**（分享接口对读者不校验身份），链接有效期 1 年。发出去之前想清楚；
+> 不想让人看了就在「我的分享」里关掉或删掉。
+
+### 怎么做到的
+
+`llm_raw_chat` 不在 Trae 的聊天服务里留会话，分享接口（`POST /api/remote/v1/share`）要的 `chat_session_id`
+在这里根本不存在。插件用的是 TRAE SOLO 分享**本地会话**的那个端点：客户端把整段消息带上，服务端原样保存。
+
+```
+POST https://trae-api-cn.mchost.guru/api/remote/v1/share/local_conversation
+Authorization: Cloud-IDE-JWT <PAT 换来的 JWT>
+{ local_session_id, chat_session_id, source_updated_at, title, mode: 'work',
+  anonymous, creator_name, messages: [...], resources: [], env: 'local' }
+→ { share_session_id, status, expires_at }
+```
+
+- 消息来自插件自己看到的请求：每轮 Trae 跑完，插件从这轮请求的历史和最终回答里按轮整理出提问、每一步的说明 / 推理 /
+  工具调用和输出，存在内存里（最近 64 条会话）。所以**插件启动后要先跑完一轮 Trae** 才能分享，重启插件会清空；
+  启动前的那些轮次时间都记成第一次看到它们的时刻。
+- 每一步写成聊天服务自己的 `plan_item`，回答是最后一步 `finish` 工具的 `summary`；dsh 的工具名映射到分享页认得的那几类
+  （`bash` → `Shell`、`read` → `Read`、`edit` → `Edit`、`web_search` → `WebSearch` …），认不出的保留原名。
+- 一条分享最多 50 轮，超出只带最近 50 轮并说明；每一步的字段最长 4000 字，每轮最多 120 步。
+- `chat_start_time` / `chat_end_time` 是只读字段，带上就是 `991102 invalid parameter`；`created_at` 严格递增，
+  因为服务端按它排序。
+- 「改为逐轮重放」是另一条路：把每个提问重新发给 Trae（每个提问一次模型调用，要确认），页面上的回答是 Trae 新生成的，不是原文。
+
+浏览器端经 `/api/dsh-trae2api/share` 路由走宿主的登录态隔离：`?transcript=<会话 ID>` 读插件记下了多少轮，
+`?mine=1` 列自己的分享，`POST {session}` 生成，`POST {action:'disable'|'enable'|'delete', id}` 管理。
+
 ## 会话 ID（查看 / 复制）
 
-会话顶上那排标签（对话 / 轨迹 / 上下文 / …）里多一个「**会话 ID**」，三项各占一行、各有自己的复制按钮：
+「Trae」标签页最下面的「会话 ID」卡片，三项各占一行、各有自己的复制按钮：
 
 | 行 | 内容 |
 | --- | --- |
