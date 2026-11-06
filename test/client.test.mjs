@@ -94,32 +94,27 @@ test('client: every slot registration passes the host registry rules', () => {
   assert.deepEqual(ids('conversation.input.right'), ['trae-quota', 'trae-session-watch', 'trae-switch'])
   // The session ids are a tab of their own, not a composer reading.
   assert.equal(byName['conversation.composer.dock'], undefined)
-  // Two View tabs, and they answer different questions. The share tab is
-  // registered outright: reading a share needs no PAT, so it must not be
-  // hidden behind "this session is on a Trae model" — that gate belongs to the
-  // ids tab alone.
-  assert.deepEqual(liveIds('conversation.view'), ['trae-share'])
-  const shareTab = entry('conversation.view', 'trae-share')
-  assert.equal(shareTab.order, 101)
-  assert.equal(shareTab.label(), '分享链接')
-  // The ids tab is not on the row until a session on screen says it is on Trae.
+  // One Trae View tab holding both the session ids and the share links, and
+  // it is not on the row until a session on screen says it is on Trae — the
+  // share links included, they are Trae-only too.
+  assert.deepEqual(liveIds('conversation.view'), [])
+  assert.equal(entry('conversation.view', 'trae-share'), undefined, 'no separate share tab')
   const watch = entry('conversation.input.right', 'trae-session-watch').inject('s1')
   watch.watch(true)
-  assert.deepEqual(liveIds('conversation.view'), ['trae-share', 'trae-session'])
+  assert.deepEqual(liveIds('conversation.view'), ['trae-session'])
   const tab = entry('conversation.view', 'trae-session')
   // After the shipped views, with a label that follows the active locale.
   assert.equal(tab.order, 100)
-  assert.equal(tab.label(), '会话 ID')
+  assert.equal(tab.label(), 'Trae')
   // A second Trae session does not register it twice, and the tab stays while
   // either of them is still on screen.
   entry('conversation.input.right', 'trae-session-watch').inject('s2').watch(true)
-  assert.deepEqual(liveIds('conversation.view'), ['trae-share', 'trae-session'])
+  assert.deepEqual(liveIds('conversation.view'), ['trae-session'])
   watch.unwatch()
-  assert.deepEqual(liveIds('conversation.view'), ['trae-share', 'trae-session'])
-  // Switching the last one to another provider takes the ids tab off the row,
-  // and leaves the share tab, which never depended on it.
+  assert.deepEqual(liveIds('conversation.view'), ['trae-session'])
+  // Switching the last one to another provider takes the tab off the row.
   entry('conversation.input.right', 'trae-session-watch').inject('s2').watch(false)
-  assert.deepEqual(liveIds('conversation.view'), ['trae-share'])
+  assert.deepEqual(liveIds('conversation.view'), [])
   // Nothing in the right sidebar or the session header any more.
   assert.equal(byName['sidebar.right.pane.tab'], undefined)
   assert.equal(byName['conversation.session.header.utilities'], undefined)
@@ -387,8 +382,14 @@ async function renderSessionTab(value, { provider = 'trae', sessionId = SESSION,
     render(Tab)
     for (const effect of effects) effect()
     await settle()
-    const tab = render(Tab)
-    const rows = tab.children.filter(child => child && typeof child.type === 'function').map((row) => {
+    // The tab is a full-width scroller around one chat-width column.
+    const view = render(Tab)
+    assert.equal(view.props.className, 'trae-view')
+    const tab = view.children[0]
+    assert.equal(tab.props.className, 'trae-ids')
+    // The id rows sit in their own card, under the share section.
+    const idRows = tab.children.flatMap(child => child && child.props?.className === 'trae-card' ? child.children : [child])
+    const rows = idRows.filter(child => child && child.type?.name === 'IdRow').map((row) => {
       cursor = 0
       effects = []
       const node = row.type(row.props)
@@ -408,6 +409,11 @@ async function renderSessionTab(value, { provider = 'trae', sessionId = SESSION,
     return {
       // The line a session on another provider is told, when there is one.
       note: tab.children.find(child => child?.props?.className === 'trae-id-note')?.children?.[0] ?? null,
+      // Section headings and child components in page order, so a test can
+      // say what the one Trae page holds.
+      layout: tab.children.filter(Boolean).map(child => typeof child.type === 'function'
+        ? child.type.name
+        : child.props?.className === 'trae-card' ? `card: ${child.props['aria-label']}` : child.props?.className),
       rows,
       asked,
       copied,
@@ -431,8 +437,11 @@ test('session tab: one row per id, each copied on its own, and no tab outside Tr
   // the other two move with every turn.
   assert.deepEqual(ran.copied, [SESSION])
   assert.equal(ran.asked.length, 2)
-  // On a Trae session the tab is only the rows.
+  // On a Trae session there is no note, and the ids and the share links are
+  // one page: sharing on top (what the tab is opened for), the three id rows
+  // in a card of their own underneath.
   assert.equal(ran.note, null)
+  assert.deepEqual(ran.layout, ['ShareSection', 'card: 会话 ID'])
 
   const upstreamRow = await renderSessionTab({
     session: SESSION, conversation: UPSTREAM, model: 'Kimi-K3', effort: null, at: 1, debug: SUPPORT,
